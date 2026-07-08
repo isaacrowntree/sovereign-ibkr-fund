@@ -1,0 +1,39 @@
+{
+  "name": "sovereign-ibkr-fund",
+  "version": "0.1.0",
+  "description": "Sovereign — an autonomous, multi-agent IBKR fund. A companion to bezant.",
+  "license": "(Apache-2.0 OR MIT)",
+  "private": true,
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "scheduler": "node dist/scheduler/index.js",
+    "agent:ceo": "node dist/agents/managing-partner.js --once",
+    "agent:strategist": "node dist/agents/portfolio-strategist.js --once",
+    "agent:quant": "node dist/agents/quant-analyst.js --once",
+    "agent:tax": "node dist/agents/tax-optimizer.js --once",
+    "agent:risk": "node dist/agents/risk-manager.js --once",
+    "agent:hedger": "node dist/agents/hedger.js --once",
+    "agent:exec": "node dist/agents/execution-bot.js --once",
+    "agent:scout": "node dist/agents/research-scout.js --once",
+    "agent:observer": "node dist/agents/observer.js --once",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "fetch-data": "tsx src/validation/fetch-data.ts"
+  },
+  "dependencies": {
+    "@stoqey/ib": "^1.5.0",
+    "bezant-client": "github:isaacrowntree/bezant#path:/clients/typescript",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

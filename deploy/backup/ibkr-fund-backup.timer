@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily IBKR fund ledger backup to Slack
+
+[Timer]
+# 22:00 local (after US market close). Persistent so a missed run (Pi off)
+# fires on the next boot.
+OnCalendar=*-*-* 22:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

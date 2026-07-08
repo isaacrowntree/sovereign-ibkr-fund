@@ -1,0 +1,21 @@
+node_modules/
+dist/
+.env
+.env.local
+*.log
+.DS_Store
+
+# Local state (never published) — keep state OUTSIDE the checkout via STATE_DIR
+bot-state.json
+bot-state.db
+bot-state.db-*
+trade-history.json
+*.db
+*.migrated
+*.bak-presqlite
+
+# Private portfolio override (real book) — public repo ships only sample.ts
+src/portfolios/local.ts
+
+# Backtest data
+src/validation/data/
