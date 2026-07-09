@@ -27,10 +27,10 @@
   },
   "dependencies": {
     "@stoqey/ib": "^1.5.0",
-    "bezant-client": "github:isaacrowntree/bezant#path:/clients/typescript",
     "dotenv": "^16.4.7"
   },
   "devDependencies": {
+    "bezant-client": "github:isaacrowntree/bezant#path:/clients/typescript",
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
