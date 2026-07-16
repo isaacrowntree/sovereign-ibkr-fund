@@ -1,0 +1,32 @@
+[Unit]
+Description=Daily IBKR fund summary to Slack (after the US close)
+
+[Timer]
+# Anchored in UTC, deliberately — NOT host-local like the backup timer.
+#
+# The US close (16:00 ET) is 20:00 UTC on EDT and 21:00 UTC on EST, so 21:30 UTC
+# is after the close in both halves of the year. Expressing it in UTC makes this
+# immune to BOTH countries' DST and to the Pi's own timezone.
+#
+# Host-local would be wrong here: the Pi runs AEST, where 22:00 local is ~08:00
+# ET — pre-market — so a local-time digest would summarise the PREVIOUS session.
+# (The backup timer's "22:00 local (after US market close)" comment has the same
+# problem; it matters less for a backup than for a summary.)
+#
+# Mon..Fri: no US session at the weekend, and the digest's date-keyed dedupe
+# means a weekend run would just post an empty summary.
+#
+# REQUIRES systemd >= 252 for the timezone suffix (Raspberry Pi OS bookworm
+# ships 252; bullseye ships 247 and will REJECT this line). Verify with:
+#   systemd-analyze calendar 'Mon..Fri 21:30 UTC'
+# If the Pi is older, either upgrade or set the host to UTC and drop the suffix
+# — do NOT translate to a fixed local time, because AEST/AEDT and EST/EDT shift
+# independently and no single local time is correct year-round.
+OnCalendar=Mon..Fri 21:30 UTC
+# Fires on next boot if the Pi was off. Safe to double-fire: the digest claims
+# `digest:<trading-date>` with no expiry, so a second run the same day is a
+# no-op rather than a duplicate post.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

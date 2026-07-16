@@ -1,0 +1,19 @@
+[Unit]
+Description=IBKR fund daily summary to Slack
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+# Alert webhook (same URL as the fund/watchdog/relogin — see .env.example).
+EnvironmentFile=%h/ibkr-fund/pi/digest/.env
+# Mirrors the backup unit: runs inside the paperclip container so it shares the
+# fund's cwd, and therefore the same bot-state.db. The digest reads state only —
+# no IBKR connection — so it does not need the gateway to be up.
+# -e forwards the webhook from this unit into the container.
+ExecStart=/usr/bin/docker exec -u node \
+  -e IBKR_FUND_ALERT_WEBHOOK \
+  -e NOTIFIER \
+  -e TRADING_MODE \
+  -w /paperclip/instances/default/projects/34fe08e4-d395-4266-b0f0-428b84c5170e/1e86c103-2643-4908-9780-9b26f0064728/ibkr-fund \
+  paperclip node dist/agents/daily-summary.js --once

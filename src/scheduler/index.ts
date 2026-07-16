@@ -31,15 +31,31 @@ function sec(envKey: string, def: number): number {
 }
 
 // Default cadence mirrors the production paperclip heartbeat.
+//
+// NOTE: in production paperclip is the scheduler (ENABLE_SCHEDULER=false), so
+// this array is DORMANT there — it governs only the built-in-scheduler mode.
+// Adding an agent here does not start it on the Pi.
 const SCHEDULE: AgentSchedule[] = [
   { name: 'managing-partner',     script: 'managing-partner.js',     intervalSec: sec('SCHED_CEO_SEC', 14_400) },
   { name: 'portfolio-strategist', script: 'portfolio-strategist.js', intervalSec: sec('SCHED_STRATEGIST_SEC', 14_400) },
   { name: 'quant-analyst',        script: 'quant-analyst.js',        intervalSec: sec('SCHED_QUANT_SEC', 14_400) },
   { name: 'risk-manager',         script: 'risk-manager.js',         intervalSec: sec('SCHED_RISK_SEC', 14_400) },
   { name: 'execution-bot',        script: 'execution-bot.js',        intervalSec: sec('SCHED_EXEC_SEC', 14_400) },
+  // Observer was absent entirely, despite execution-bot's fill confirmation and
+  // risk-manager's intraday drawdown both reading state.observedEvents — which
+  // only this agent writes. Left unscheduled, both silently degrade: the
+  // intraday-DD block is skipped and ordersCursorFloor stays 0. Polls far more
+  // often than the others because it advances a cursor over a bounded upstream
+  // buffer; falling behind means gaps, which are unrecoverable.
+  { name: 'observer',             script: 'observer.js',             intervalSec: sec('SCHED_OBSERVER_SEC', 300) },
   { name: 'tax-optimizer',        script: 'tax-optimizer.js',        intervalSec: sec('SCHED_TAX_SEC', 86_400) },
   { name: 'hedger',               script: 'hedger.js',               intervalSec: sec('SCHED_HEDGER_SEC', 86_400) },
   { name: 'research-scout',       script: 'research-scout.js',       intervalSec: sec('SCHED_SCOUT_SEC', 86_400) },
+  // The digest is date-keyed and idempotent, so a coarse interval here is safe;
+  // the systemd timer in deploy/digest/ is the accurate, market-close-anchored
+  // trigger. Running both is harmless ONLY while they share a bot-state.db —
+  // see deploy/digest/README-ish notes in the timer.
+  { name: 'daily-summary',        script: 'daily-summary.js',        intervalSec: sec('SCHED_DIGEST_SEC', 86_400) },
 ];
 
 const running = new Set<string>();

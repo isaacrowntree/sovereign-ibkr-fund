@@ -14,9 +14,12 @@
 import {
   reconcileCursor,
   reconcileMarketDataCursor,
+  getEventsStatus,
 } from '../observability/event-poller.js';
 import type { GapEvent, ObservedEvent } from '../observability/event-types.js';
 import { loadState, mergeState, type ObservedEventState } from '../state/store.js';
+import { notify } from '../notify/slack.js';
+import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
 
 const AGENT = 'Observer';
@@ -95,11 +98,63 @@ async function run(): Promise<RunResult> {
     lastObserverAt: new Date().toISOString(),
   });
 
+  await reportStreamHealth(gaps);
+
   log(
     `Observer poll complete — topics=${STATIC_TOPICS.length} events=${totalEvents} gaps=${gaps} errors=${errors}`,
     AGENT,
   );
   return { topicsPolled: STATIC_TOPICS.length, totalEvents, gaps, errors };
+}
+
+/**
+ * Alert when the upstream event stream is unhealthy.
+ *
+ * Wires up getEventsStatus(), which had zero callers — the status endpoint was
+ * implemented and then never asked. It matters because everything downstream
+ * trusts this stream: execution-bot confirms fills from it, and risk-manager
+ * derives intraday drawdown from it. A disconnected stream doesn't fail loudly;
+ * it just quietly stops telling you things.
+ *
+ * Best-effort. getEventsStatus THROWS on a non-200 (event-poller.ts), and an
+ * observability check must never be the reason a poll run fails.
+ */
+async function reportStreamHealth(gaps: number): Promise<void> {
+  let status;
+  try {
+    status = await getEventsStatus();
+  } catch (err) {
+    logError('could not read event stream status (continuing)', err, AGENT);
+    return;
+  }
+
+  if (status.connected && gaps === 0) return;
+
+  const reason = !status.connected ? 'disconnected' : 'gaps';
+  await notify(
+    {
+      severity: 'warn',
+      title: status.connected
+        ? `Event stream gap — ${gaps} topic${gaps === 1 ? '' : 's'} lost continuity`
+        : 'Event stream DISCONNECTED from bezant',
+      body: status.connected
+        ? 'The cursor jumped, so events between the old and new positions were never seen. Fill confirmation and ' +
+          'intraday drawdown are both derived from this stream.'
+        : 'No live event feed. Fill confirmations and intraday drawdown enrichment are blind until it reconnects.',
+      fields: [
+        { label: 'Connected', value: String(status.connected) },
+        { label: 'Last message', value: status.lastMessageAt ?? 'never' },
+        { label: 'Reconnects', value: String(status.reconnectCount) },
+        ...(gaps ? [{ label: 'Gaps this run', value: String(gaps) }] : []),
+      ],
+      agent: AGENT,
+      // Coarse: reconnectCount and uptime change constantly, so fingerprinting
+      // on them would alert every poll. This is one condition — "the stream is
+      // unhealthy" — that re-nags on its ttl until it clears.
+      dedupe: { key: 'observer:stream-health', fingerprint: reason },
+    },
+    storeHooks,
+  );
 }
 
 /** Convert a wire `ObservedEvent` to the persistent state shape. */

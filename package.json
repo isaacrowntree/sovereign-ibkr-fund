@@ -23,6 +23,7 @@
     "agent:exec": "node dist/agents/execution-bot.js --once",
     "agent:scout": "node dist/agents/research-scout.js --once",
     "agent:observer": "node dist/agents/observer.js --once",
+    "agent:digest": "node dist/agents/daily-summary.js --once",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",

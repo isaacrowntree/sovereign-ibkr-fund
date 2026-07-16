@@ -31,8 +31,9 @@ Nine single-purpose agents, each a plain `--once` process (no LLM calls — dete
 | Execution Bot | Executes queued orders through bezant (window-gated, capped) | 4h |
 | Tax Optimizer | FIFO lots, tax-loss harvesting, wash-sale tracking | daily |
 | Hedger | Options overlay (covered calls / protective puts) | daily |
-| Research Scout | Price monitoring, alerts | daily |
-| Observer | WS fill/event stream ingestion | — |
+| Research Scout | Price monitoring, significant-move detection | daily |
+| Observer | WS fill/event stream ingestion, stream-health alerts | 5m |
+| Daily Summary | Post-close digest to Slack (NAV, fills, drift, movers, advisories) | daily (21:30 UTC) |
 
 Includes a backtest engine (HRP, risk-parity, Black-Litterman, Ledoit-Wolf covariance, regime overlay, vol targeting) validated against historical data you fetch yourself.
 
@@ -63,6 +64,25 @@ The agents are just `node dist/agents/<name>.js --once`. Anything can schedule t
 - **Built-in scheduler** (default): `pnpm start` runs every agent on its cadence. Tune per agent with `SCHED_*_SEC` env vars.
 - **cron / systemd**: point timers at the `--once` scripts. Examples in [`deploy/`](deploy/).
 - **paperclip** (or any orchestrator): set `ENABLE_SCHEDULER=false` and have it invoke the `--once` scripts; it becomes the scheduler. `deploy/` has a reference adapter.
+
+## Alerting
+
+One Slack incoming webhook, one channel (`IBKR_FUND_ALERT_WEBHOOK`). Severity is carried by colour and emoji rather than by routing, so a hard stop is distinguishable from a fill while scrolling.
+
+**Real-time** — reserved for things needing a human:
+
+| | |
+|---|---|
+| 🚨 critical | Hard stop; execution blocked on a drawdown stop; **ledger diverged from IBKR after a real fill** |
+| ⚠️ warn | Drawdown warning (7%) and de-risking (15%); run halted early; validation trade failed; fill recovered after the stream misreported it; suspect NAV/prices; NAV-history reset; event stream disconnected |
+| ✅ recovery | Drawdown back to normal — the gate lifting, which self-clears |
+| ℹ️ info | One coalesced summary per execution run |
+
+**Daily digest** (`deploy/digest/`, 21:30 UTC — after the US close in both EST and EDT) carries everything advisory: NAV, cash, drawdown, VaR, the day's fills with realised P&L, worst drift, movers, harvest candidates, hedge suggestions.
+
+Alerts are deduped in SQLite (`notify_dedupe`), so a stuck condition re-nags on a schedule rather than repeating every run, and transitions (warning → de-risking → stopped → normal) each alert once. Delivery failures release the claim so the alert retries rather than being lost.
+
+The daily backup (`deploy/backup/`) reports whether the digest was sent. It authenticates with a **different** credential (a bot token), so it still lands if the webhook is revoked — a backup saying "NO DIGEST" means the alert path is dead.
 
 ## Your own portfolio
 
