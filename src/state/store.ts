@@ -290,18 +290,28 @@ export function mergeState(updates: Partial<FundState>): void {
  */
 export function appendTrade(trade: TradeRecord): void {
   const d = db();
-  if (trade.execId) {
-    const dup = d.prepare("SELECT 1 FROM trades WHERE json_extract(data,'$.execId') = ? LIMIT 1").get(trade.execId);
-    if (dup) return;
-  }
-  if (trade.orderId) {
-    const dup = d.prepare(
-      "SELECT 1 FROM trades WHERE json_extract(data,'$.orderId') = ? AND json_extract(data,'$.action') = ? " +
-        "AND json_extract(data,'$.symbol') = ? AND json_extract(data,'$.qty') = ? LIMIT 1",
-    ).get(trade.orderId, trade.action, trade.symbol, trade.qty);
-    if (dup) return;
-  }
-  d.prepare('INSERT INTO trades (ts, data) VALUES (?, ?)').run(trade.timestamp ?? null, JSON.stringify(trade));
+  // The dup-check and the insert MUST share one transaction. Left as bare
+  // autocommitting statements, two processes both saw no dup and both inserted
+  // — the guarantee documented above simply didn't hold. Reproduced at 8-out-of-8
+  // duplicates when 8 processes append the same fill through a barrier, i.e. a
+  // 100-share fill recorded as 800. tx()'s BEGIN IMMEDIATE takes the write lock
+  // on the first statement, so the check-and-insert can't interleave.
+  //
+  // Callers must NOT already hold a transaction (nested BEGIN IMMEDIATE throws).
+  tx(d, () => {
+    if (trade.execId) {
+      const dup = d.prepare("SELECT 1 FROM trades WHERE json_extract(data,'$.execId') = ? LIMIT 1").get(trade.execId);
+      if (dup) return;
+    }
+    if (trade.orderId) {
+      const dup = d.prepare(
+        "SELECT 1 FROM trades WHERE json_extract(data,'$.orderId') = ? AND json_extract(data,'$.action') = ? " +
+          "AND json_extract(data,'$.symbol') = ? AND json_extract(data,'$.qty') = ? LIMIT 1",
+      ).get(trade.orderId, trade.action, trade.symbol, trade.qty);
+      if (dup) return;
+    }
+    d.prepare('INSERT INTO trades (ts, data) VALUES (?, ?)').run(trade.timestamp ?? null, JSON.stringify(trade));
+  });
 }
 
 export function loadTradeHistory(): TradeRecord[] {

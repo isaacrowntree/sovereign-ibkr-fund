@@ -34,6 +34,7 @@ import type { WashSaleEntry } from '../tax/harvesting.js';
 import { alert, notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
 import type { ExecutionOutcome } from '../execution/executor.js';
+import { evaluateRiskGate } from '../execution/risk-gate.js';
 import { config } from '../config.js';
 import { log, logError } from '../log.js';
 
@@ -143,12 +144,23 @@ async function reportRun(outcome: ExecutionOutcome, runAt: string): Promise<void
 /**
  * Risk data older than this means the risk-manager hasn't run / has errored;
  * execution refuses to trade ungated rather than trust a stale drawdown level.
- * Set above the risk-manager's ~4h heartbeat cadence (+1h margin) so it only
- * trips when risk-manager has genuinely missed a cycle, not in the normal gap
- * between runs. The drawdown level is slow-moving and the intraday WS
- * enrichment catches sharp intraday drops, so ≤5h-old risk data is safe.
+ *
+ * Default 5h sits above the built-in scheduler's ~4h cadence (+1h margin) so it
+ * only trips once risk-manager has missed roughly a full cycle, not in the
+ * normal gap between runs.
+ *
+ * KNOWN GAP: because 5h > the 4h cadence, a SINGLE risk-manager failure still
+ * trades one round on the previous cycle's level. Closing that needs staleMs
+ * below the real cadence — and in production paperclip is the scheduler, so the
+ * real cadence isn't knowable from this repo. Tightening blind is asymmetric:
+ * too loose trades one stale round, too tight halts the fund entirely. Hence
+ * env-tunable rather than guessed — set RISK_STALE_HOURS to roughly half the
+ * confirmed cadence. See src/execution/risk-gate.ts.
  */
-const RISK_STALE_MS = 5 * 60 * 60 * 1000;
+const RISK_STALE_MS = (() => {
+  const h = parseFloat(process.env.RISK_STALE_HOURS || '');
+  return Number.isFinite(h) && h > 0 ? h * 60 * 60 * 1000 : 5 * 60 * 60 * 1000;
+})();
 
 /**
  * A run holds the queue in memory and only writes back at the end, so two
@@ -281,16 +293,23 @@ async function run(): Promise<void> {
     // missing or stale (risk-manager hasn't run / errored), do NOT trade
     // ungated; block and alert. On a hard stop, block AND clear the pending
     // queue so a pre-drawdown queue can't fire when the level later relaxes.
+    // The decision itself is pure and tested — see execution/risk-gate.ts.
     const drawdownLevel = state.drawdownLevel as string | undefined;
     const lastRiskAt = state.lastRiskAt as string | undefined;
-    const riskStale = !lastRiskAt || Date.now() - new Date(lastRiskAt).getTime() > RISK_STALE_MS;
-    if (!drawdownLevel || riskStale) {
-      log(`BLOCKED: risk data missing/stale (level=${drawdownLevel ?? 'unset'}, lastRiskAt=${lastRiskAt ?? 'never'}) — refusing to execute ungated`, AGENT);
+    const decision = evaluateRiskGate({
+      drawdownLevel,
+      lastRiskAt,
+      now: new Date(),
+      staleMs: RISK_STALE_MS,
+    });
+
+    if (!decision.allowed && decision.reason !== 'stopped') {
+      log(`BLOCKED: ${decision.detail} — refusing to execute ungated`, AGENT);
       await notify(
         {
           severity: 'warn',
           title: 'Execution blocked — risk assessment missing or stale',
-          body: 'Refusing to trade ungated. The risk-manager has not produced a fresh drawdown level.',
+          body: `Refusing to trade ungated. ${decision.detail}`,
           fields: [
             { label: 'Last risk run', value: lastRiskAt ?? 'never' },
             { label: 'Drawdown level', value: drawdownLevel ?? 'unset' },
@@ -299,13 +318,13 @@ async function run(): Promise<void> {
           // Coarse fingerprint: the timestamp changes every run, so keying on it
           // would alert every cycle. This is one condition — "risk is stale" —
           // that re-nags on the severity ttl until it clears.
-          dedupe: { key: 'exec:risk-stale', fingerprint: drawdownLevel ? 'stale' : 'missing' },
+          dedupe: { key: 'exec:risk-stale', fingerprint: decision.reason },
         },
         storeHooks,
       );
       return;
     }
-    if (drawdownLevel === 'stopped') {
+    if (!decision.allowed) {
       log('BLOCKED: Drawdown level is STOPPED — clearing pending queue, refusing to execute', AGENT);
       // Clear before alerting: a throw in the notifier must not leave a
       // pre-drawdown queue intact to fire once the level relaxes.
@@ -323,7 +342,7 @@ async function run(): Promise<void> {
                 'pre-drawdown queue must not fire once the level relaxes. The strategist will regenerate orders if ' +
                 'a rebalance is still warranted.'
               : 'Nothing was queued.',
-          fields: [{ label: 'Drawdown level', value: drawdownLevel }],
+          fields: [{ label: 'Drawdown level', value: drawdownLevel ?? 'stopped' }],
           agent: AGENT,
           dedupe: { key: 'exec:blocked-stopped', fingerprint: 'stopped' },
         },
