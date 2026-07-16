@@ -110,15 +110,37 @@ export interface TradeRecord {
 
 let _db: DatabaseSync | null = null;
 
-function db(): DatabaseSync {
-  if (_db) return _db;
-  const dir = dirname(DB_FILE);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+/**
+ * SQLITE_BUSY (5) / SQLITE_LOCKED (6) — the two primary codes worth retrying an
+ * open for.
+ *
+ * node:sqlite surfaces EXTENDED result codes, so the raw errcode is often not 5:
+ * SQLITE_BUSY_RECOVERY is 261 (5 | 1<<8), _SNAPSHOT 517, _TIMEOUT 773. Comparing
+ * against 5 directly silently fails to retry — observed as a real
+ * `errcode 261 database is locked` escaping under an 8-process open. Mask to the
+ * low byte to get the primary code.
+ */
+const BUSY_PRIMARY_CODES = new Set([5, 6]);
+const isBusy = (code: unknown): boolean =>
+  typeof code === 'number' && BUSY_PRIMARY_CODES.has(code & 0xff);
+const OPEN_ATTEMPTS = 10;
+
+function openDb(): DatabaseSync {
   const d = new DatabaseSync(DB_FILE);
-  // WAL: concurrent readers + one writer across processes; busy_timeout so a
-  // writer waits (not errors) for a brief concurrent write.
-  d.exec('PRAGMA journal_mode = WAL');
+  // busy_timeout FIRST. It arms the busy handler, and everything below can
+  // need the write lock — including `journal_mode = WAL` itself. Setting it
+  // after (as this used to) leaves the riskiest statement unprotected: SQLite
+  // does not invoke the busy handler on the journal_mode path, so a concurrent
+  // open threw SQLITE_BUSY outright. With agents running as separate processes
+  // that meant an agent could die on startup; for risk-manager, dying means the
+  // drawdown gate is never written and the hard stop silently doesn't fire.
   d.exec('PRAGMA busy_timeout = 5000');
+  // Only set WAL when it isn't already — journal_mode is persistent, so on an
+  // existing db this is a no-op read instead of a lock acquisition.
+  const mode = d.prepare('PRAGMA journal_mode').get() as { journal_mode?: string } | undefined;
+  if (String(mode?.journal_mode ?? '').toLowerCase() !== 'wal') {
+    d.exec('PRAGMA journal_mode = WAL');
+  }
   // FULL (not NORMAL): this is a real-money trade ledger on a Pi with no
   // guaranteed UPS. FULL fsyncs on commit so a power loss can't roll back a
   // recently recorded trade. Writes are low-frequency here, so the cost is
@@ -127,9 +149,32 @@ function db(): DatabaseSync {
   d.exec('CREATE TABLE IF NOT EXISTS state_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
   d.exec('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, data TEXT NOT NULL)');
   d.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
-  _db = d;
-  migrateLegacy(d);
   return d;
+}
+
+function db(): DatabaseSync {
+  if (_db) return _db;
+  const dir = dirname(DB_FILE);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  // Retry the whole open on BUSY/LOCKED. busy_timeout covers contention *within*
+  // an open connection, but the first-ever open of a fresh db still races other
+  // processes creating the WAL, and that window is not covered by the handler.
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < OPEN_ATTEMPTS; attempt++) {
+    try {
+      const d = openDb();
+      _db = d;
+      migrateLegacy(d);
+      return d;
+    } catch (err) {
+      lastErr = err;
+      if (!isBusy((err as { errcode?: number }).errcode)) throw err;
+      // Jittered backoff — unjittered retries from N processes just re-collide.
+      const until = Date.now() + 20 + Math.floor(Math.random() * 60);
+      while (Date.now() < until) { /* sync spin: DatabaseSync gives us no async seam */ }
+    }
+  }
+  throw lastErr;
 }
 
 function tx(d: DatabaseSync, fn: () => void): void {
