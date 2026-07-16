@@ -1,0 +1,44 @@
+# Dockerfile does `COPY . .` into the build stage. Without this the build
+# context is ~115MB and includes .git (full history) and — critically —
+# src/portfolios/local.ts, the real book, which is gitignored precisely because
+# it must never be published.
+#
+# The final image only copies dist/, node_modules/ and package.json out of the
+# build stage, so none of this ships by default. But it DOES persist in
+# build-cache layers on the build host, and would be published by
+# --cache-to / a registry cache export, `docker save`, or `--target build`.
+
+.git
+.gitignore
+.github
+
+# Secrets — never into a build layer.
+.env
+.env.*
+!.env.example
+deploy/*/.env
+
+# Real portfolio (gitignored; the public repo ships only sample.ts).
+src/portfolios/local.ts
+
+# State — a real-money ledger has no business in an image.
+*.db
+*.db-*
+bot-state.json
+trade-history.json
+*.migrated
+*.bak-presqlite
+
+# Rebuilt inside the image.
+node_modules
+dist
+
+# Standalone Pi services with their own package.json — not part of this build.
+deploy/watchdog/node_modules
+deploy/relogin/node_modules
+
+# Backtest data (gitignored, large, fetched on demand).
+src/validation/data
+
+*.log
+.DS_Store

@@ -2,8 +2,13 @@
 Description=Daily IBKR fund ledger backup to Slack
 
 [Timer]
-# 22:00 local (after US market close). Persistent so a missed run (Pi off)
-# fires on the next boot.
+# 22:00 HOST-LOCAL. Persistent so a missed run (Pi off) fires on the next boot.
+#
+# NOTE: this used to claim "after US market close" — that is not true on an
+# AEST host, where 22:00 local is ~08:00 ET, i.e. PRE-market. The snapshot is
+# therefore of the previous US session, which is fine for a backup (any
+# consistent daily snapshot will do) but would be wrong for anything
+# session-scoped. deploy/digest/ anchors in UTC for exactly that reason.
 OnCalendar=*-*-* 22:00:00
 Persistent=true
 

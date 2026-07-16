@@ -110,15 +110,37 @@ export interface TradeRecord {
 
 let _db: DatabaseSync | null = null;
 
-function db(): DatabaseSync {
-  if (_db) return _db;
-  const dir = dirname(DB_FILE);
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+/**
+ * SQLITE_BUSY (5) / SQLITE_LOCKED (6) — the two primary codes worth retrying an
+ * open for.
+ *
+ * node:sqlite surfaces EXTENDED result codes, so the raw errcode is often not 5:
+ * SQLITE_BUSY_RECOVERY is 261 (5 | 1<<8), _SNAPSHOT 517, _TIMEOUT 773. Comparing
+ * against 5 directly silently fails to retry — observed as a real
+ * `errcode 261 database is locked` escaping under an 8-process open. Mask to the
+ * low byte to get the primary code.
+ */
+const BUSY_PRIMARY_CODES = new Set([5, 6]);
+const isBusy = (code: unknown): boolean =>
+  typeof code === 'number' && BUSY_PRIMARY_CODES.has(code & 0xff);
+const OPEN_ATTEMPTS = 10;
+
+function openDb(): DatabaseSync {
   const d = new DatabaseSync(DB_FILE);
-  // WAL: concurrent readers + one writer across processes; busy_timeout so a
-  // writer waits (not errors) for a brief concurrent write.
-  d.exec('PRAGMA journal_mode = WAL');
+  // busy_timeout FIRST. It arms the busy handler, and everything below can
+  // need the write lock — including `journal_mode = WAL` itself. Setting it
+  // after (as this used to) leaves the riskiest statement unprotected: SQLite
+  // does not invoke the busy handler on the journal_mode path, so a concurrent
+  // open threw SQLITE_BUSY outright. With agents running as separate processes
+  // that meant an agent could die on startup; for risk-manager, dying means the
+  // drawdown gate is never written and the hard stop silently doesn't fire.
   d.exec('PRAGMA busy_timeout = 5000');
+  // Only set WAL when it isn't already — journal_mode is persistent, so on an
+  // existing db this is a no-op read instead of a lock acquisition.
+  const mode = d.prepare('PRAGMA journal_mode').get() as { journal_mode?: string } | undefined;
+  if (String(mode?.journal_mode ?? '').toLowerCase() !== 'wal') {
+    d.exec('PRAGMA journal_mode = WAL');
+  }
   // FULL (not NORMAL): this is a real-money trade ledger on a Pi with no
   // guaranteed UPS. FULL fsyncs on commit so a power loss can't roll back a
   // recently recorded trade. Writes are low-frequency here, so the cost is
@@ -127,9 +149,42 @@ function db(): DatabaseSync {
   d.exec('CREATE TABLE IF NOT EXISTS state_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
   d.exec('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, data TEXT NOT NULL)');
   d.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
-  _db = d;
-  migrateLegacy(d);
+  // Alert dedupe. Deliberately its own table rather than a state_kv key: it is
+  // invisible to loadState()'s SELECT *, and a dedicated row per key means the
+  // claim below is a real compare-and-set instead of a read-modify-write that
+  // two agent processes could interleave.
+  //   expires_at NULL ≡ never expires (a once-ever alert).
+  // Never bind Infinity here — SQLite silently stores it and reads back null.
+  d.exec(
+    'CREATE TABLE IF NOT EXISTS notify_dedupe (' +
+      'key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, sent_at INTEGER NOT NULL, expires_at INTEGER)',
+  );
   return d;
+}
+
+function db(): DatabaseSync {
+  if (_db) return _db;
+  const dir = dirname(DB_FILE);
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  // Retry the whole open on BUSY/LOCKED. busy_timeout covers contention *within*
+  // an open connection, but the first-ever open of a fresh db still races other
+  // processes creating the WAL, and that window is not covered by the handler.
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < OPEN_ATTEMPTS; attempt++) {
+    try {
+      const d = openDb();
+      _db = d;
+      migrateLegacy(d);
+      return d;
+    } catch (err) {
+      lastErr = err;
+      if (!isBusy((err as { errcode?: number }).errcode)) throw err;
+      // Jittered backoff — unjittered retries from N processes just re-collide.
+      const until = Date.now() + 20 + Math.floor(Math.random() * 60);
+      while (Date.now() < until) { /* sync spin: DatabaseSync gives us no async seam */ }
+    }
+  }
+  throw lastErr;
 }
 
 function tx(d: DatabaseSync, fn: () => void): void {
@@ -235,18 +290,28 @@ export function mergeState(updates: Partial<FundState>): void {
  */
 export function appendTrade(trade: TradeRecord): void {
   const d = db();
-  if (trade.execId) {
-    const dup = d.prepare("SELECT 1 FROM trades WHERE json_extract(data,'$.execId') = ? LIMIT 1").get(trade.execId);
-    if (dup) return;
-  }
-  if (trade.orderId) {
-    const dup = d.prepare(
-      "SELECT 1 FROM trades WHERE json_extract(data,'$.orderId') = ? AND json_extract(data,'$.action') = ? " +
-        "AND json_extract(data,'$.symbol') = ? AND json_extract(data,'$.qty') = ? LIMIT 1",
-    ).get(trade.orderId, trade.action, trade.symbol, trade.qty);
-    if (dup) return;
-  }
-  d.prepare('INSERT INTO trades (ts, data) VALUES (?, ?)').run(trade.timestamp ?? null, JSON.stringify(trade));
+  // The dup-check and the insert MUST share one transaction. Left as bare
+  // autocommitting statements, two processes both saw no dup and both inserted
+  // — the guarantee documented above simply didn't hold. Reproduced at 8-out-of-8
+  // duplicates when 8 processes append the same fill through a barrier, i.e. a
+  // 100-share fill recorded as 800. tx()'s BEGIN IMMEDIATE takes the write lock
+  // on the first statement, so the check-and-insert can't interleave.
+  //
+  // Callers must NOT already hold a transaction (nested BEGIN IMMEDIATE throws).
+  tx(d, () => {
+    if (trade.execId) {
+      const dup = d.prepare("SELECT 1 FROM trades WHERE json_extract(data,'$.execId') = ? LIMIT 1").get(trade.execId);
+      if (dup) return;
+    }
+    if (trade.orderId) {
+      const dup = d.prepare(
+        "SELECT 1 FROM trades WHERE json_extract(data,'$.orderId') = ? AND json_extract(data,'$.action') = ? " +
+          "AND json_extract(data,'$.symbol') = ? AND json_extract(data,'$.qty') = ? LIMIT 1",
+      ).get(trade.orderId, trade.action, trade.symbol, trade.qty);
+      if (dup) return;
+    }
+    d.prepare('INSERT INTO trades (ts, data) VALUES (?, ?)').run(trade.timestamp ?? null, JSON.stringify(trade));
+  });
 }
 
 export function loadTradeHistory(): TradeRecord[] {
@@ -256,6 +321,81 @@ export function loadTradeHistory(): TradeRecord[] {
     try { out.push(JSON.parse(r.data) as TradeRecord); } catch { /* skip */ }
   }
   return out;
+}
+
+/** Prune expired dedupe rows on ~1 claim in 64 — see claimAlert. */
+const PRUNE_ODDS = 64;
+
+/**
+ * Claim the right to send one alert — ATOMIC across processes.
+ *
+ * Mirrors appendTrade's philosophy: the store guarantees at-most-once, so
+ * callers never need their own dedup and stay one-liners.
+ *
+ * Returns true (caller should send) when:
+ *   - the key has never been alerted, OR
+ *   - `fingerprint` CHANGED — a state transition (warning → derisking), OR
+ *   - the previous claim has expired — a re-nag on a stuck condition.
+ *
+ * `ttlMs` of Infinity means never expire: a once-ever alert. It is stored as
+ * NULL rather than a number, because binding Infinity to a SQLite column
+ * silently succeeds and reads back as null — a trap worth closing at the edge.
+ *
+ * The SELECT and the upsert both run inside tx()'s BEGIN IMMEDIATE, which takes
+ * the write lock on the first statement, so the check-and-set cannot interleave
+ * with another process. Callers must NOT hold their own transaction.
+ */
+export function claimAlert(key: string, fingerprint: string, ttlMs: number): boolean {
+  const d = db();
+  const now = Date.now();
+  let claimed = false;
+
+  tx(d, () => {
+    const row = d
+      .prepare('SELECT fingerprint, sent_at, expires_at FROM notify_dedupe WHERE key = ?')
+      .get(key) as { fingerprint: string; sent_at: number; expires_at: number | null } | undefined;
+
+    if (row && row.fingerprint === fingerprint) {
+      // A backwards clock step (the Pi has no RTC and steps on NTP sync) would
+      // otherwise make a re-nag unreachable. Treat it as elapsed: a duplicate
+      // alert is cheap, a silently suppressed one is not.
+      const clockWentBackwards = now < row.sent_at;
+      const live = row.expires_at === null || now < row.expires_at;
+      if (live && !clockWentBackwards) return; // suppressed
+    }
+
+    const expiresAt = Number.isFinite(ttlMs) ? now + ttlMs : null;
+    d.prepare(
+      'INSERT INTO notify_dedupe (key, fingerprint, sent_at, expires_at) VALUES (?, ?, ?, ?) ' +
+        'ON CONFLICT(key) DO UPDATE SET fingerprint = excluded.fingerprint, ' +
+        'sent_at = excluded.sent_at, expires_at = excluded.expires_at',
+    ).run(key, fingerprint, now, expiresAt);
+
+    // Opportunistic prune. Dropping an EXPIRED row is semantically free — a
+    // missing row and an expired row both mean "send" — so this can never
+    // resurrect an old alert. NULL (never-expires) rows are left alone by the
+    // IS NOT NULL guard; those are the once-ever keys and must persist.
+    // Probabilistic so the write lock isn't lengthened on every claim.
+    if (Math.floor(Math.random() * PRUNE_ODDS) === 0) {
+      d.prepare('DELETE FROM notify_dedupe WHERE expires_at IS NOT NULL AND expires_at < ?').run(now);
+    }
+
+    claimed = true;
+  });
+
+  return claimed;
+}
+
+/**
+ * Give back a claim, so the next attempt re-sends.
+ *
+ * Called when delivery FAILED. Without this, claim-then-send silently loses any
+ * once-ever alert (a fill, the digest) on a single transient Slack 5xx — the
+ * row persists, never expires, and the alert is never retried. Releasing only
+ * on a failed send means no duplicate was ever delivered.
+ */
+export function releaseAlert(key: string): void {
+  db().prepare('DELETE FROM notify_dedupe WHERE key = ?').run(key);
 }
 
 /** Close the underlying connection (graceful shutdown / test isolation). */

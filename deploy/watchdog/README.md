@@ -51,6 +51,10 @@ ssh your-pi
 cd ~/ibkr-fund && git pull
 cd ~/ibkr-fund/pi/watchdog && npm install
 
+# Alerting — optional but recommended. Without it the watchdog restarts the
+# container silently and you never hear it happened.
+cp .env.example .env && chmod 600 .env   # then set IBKR_FUND_ALERT_WEBHOOK
+
 mkdir -p ~/.config/systemd/user
 cp systemd/ibkr-fund-watchdog.service ~/.config/systemd/user/
 cp systemd/ibkr-fund-watchdog.timer ~/.config/systemd/user/
@@ -101,6 +105,10 @@ Persisted at `~/.local/state/bezant-watchdog/state.json`:
 
 All thresholds are env-overridable. Defaults (top of `index.ts`):
 
+- `IBKR_FUND_ALERT_WEBHOOK` — **recommended**, no default. Without it the
+  watchdog restarts the container silently and you never hear that it happened.
+  Set the SAME webhook as the fund and `pi/relogin` — one channel. Read from
+  `.env` in this directory (optional file; the unit tolerates its absence).
 - `BEZANT_HEALTH_URL` — default `http://localhost:8080/health`
 - `BEZANT_CONTAINER` — default `bezant`
 - `BEZANT_RELOGIN_DISABLED_FILE` — default `~/.local/state/bezant-relogin/disabled`
