@@ -31,11 +31,114 @@ import { isExecutionWindow, describeWindow, EXECUTION_WINDOW } from '../strategy
 import { confirmFill } from '../observability/fill-confirmer.js';
 import { loadState, mergeState, appendTrade, loadTradeHistory } from '../state/store.js';
 import type { WashSaleEntry } from '../tax/harvesting.js';
-import { alert } from '../notify/slack.js';
+import { alert, notify } from '../notify/slack.js';
+import { storeHooks } from '../notify/store-hooks.js';
+import type { ExecutionOutcome } from '../execution/executor.js';
 import { config } from '../config.js';
 import { log, logError } from '../log.js';
 
 const AGENT = 'ExecutionBot';
+
+const usd = (n: number): string => `$${n.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+
+/**
+ * Report a finished run — ONE message, plus one per correctness anomaly.
+ *
+ * Deliberately coalesced rather than a message per fill: a 17-position
+ * rebalance would be 17 messages, near-certain to hit Slack's ~1/sec webhook
+ * limit, and per-fill dedupe keys give no burst protection because every key is
+ * distinct. Individual fills are ledger data and already have a reader
+ * (scripts/show-fills.ts); what a human wants from a run is the shape of it.
+ *
+ * This lives here rather than in the executor because the executor is pure and
+ * synchronous on the fill path, and because only the agent can see post-run
+ * NAV/cash.
+ */
+async function reportRun(outcome: ExecutionOutcome, runAt: string): Promise<void> {
+  // Anomalies first, individually: these are correctness events, not volume.
+  for (const a of outcome.anomalies) {
+    const isDivergence = a.kind === 'ledger-diverged';
+    await notify(
+      {
+        severity: isDivergence ? 'critical' : 'warn',
+        title: isDivergence
+          ? `Ledger diverged from IBKR — ${a.symbol}`
+          : `Fill recovered from IBKR — ${a.symbol}`,
+        body: a.detail,
+        fields: [
+          { label: 'Symbol', value: a.symbol },
+          ...(a.orderId ? [{ label: 'Order', value: String(a.orderId) }] : []),
+        ],
+        agent: AGENT,
+        // Keyed on the order, not the run: the same divergence recurring on a
+        // later run is a NEW event worth hearing about.
+        dedupe: { key: `exec:${a.kind}:${a.orderId ?? a.symbol}:${runAt.slice(0, 10)}` },
+      },
+      storeHooks,
+    );
+  }
+
+  const executedCount = outcome.executed.length;
+  const nothingHappened = executedCount === 0 && !outcome.halted && !outcome.validationFailed;
+  if (nothingHappened) return; // a quiet run is not news
+
+  const notional = outcome.executed.reduce((s, o) => s + Math.abs(o.estimatedValue ?? 0), 0);
+  // Guard the average: shortfall bps can be non-finite when estimatedValue is 0
+  // (decisionPrice = estimatedValue / qty), and NaN in a headline is worse than
+  // omitting it.
+  const bps = outcome.shortfalls.map(s => s.totalShortfallBps).filter(Number.isFinite);
+  const avgBps = bps.length ? bps.reduce((s, b) => s + b, 0) / bps.length : null;
+
+  const fields = [
+    { label: 'Executed', value: `${executedCount} order${executedCount === 1 ? '' : 's'}` },
+    { label: 'Notional', value: usd(notional) },
+    ...(avgBps !== null ? [{ label: 'Avg shortfall', value: `${avgBps.toFixed(1)} bps` }] : []),
+    ...(outcome.requeue.length ? [{ label: 'Still queued', value: String(outcome.requeue.length) }] : []),
+  ];
+
+  if (outcome.validationFailed) {
+    await notify(
+      {
+        severity: 'warn',
+        title: `Validation trade did not pass — ${outcome.haltReason || 'no confirmed fill'}`,
+        body: 'The queue stays locked until a validation trade confirms a fill.',
+        fields,
+        agent: AGENT,
+        dedupe: { key: `exec:validation-failed:${runAt}` },
+      },
+      storeHooks,
+    );
+    return;
+  }
+
+  if (outcome.halted) {
+    await notify(
+      {
+        severity: 'warn',
+        title: `Execution run halted early — ${outcome.haltReason}`,
+        body: 'A real-money run stopped abnormally (rejection, cap breach, timeout, or guard failure).',
+        fields,
+        agent: AGENT,
+        dedupe: { key: `exec:halted:${runAt}` },
+      },
+      storeHooks,
+    );
+    return;
+  }
+
+  const symbols = outcome.executed.map(o => `${o.action} ${o.qty} ${o.symbol}`).join(', ');
+  await notify(
+    {
+      severity: 'info',
+      title: `Executed ${executedCount} order${executedCount === 1 ? '' : 's'} — ${usd(notional)}`,
+      body: symbols,
+      fields,
+      agent: AGENT,
+      dedupe: { key: `exec:run:${runAt}` },
+    },
+    storeHooks,
+  );
+}
 
 /**
  * Risk data older than this means the risk-manager hasn't run / has errored;
@@ -149,8 +252,26 @@ async function run(): Promise<void> {
       const backfill = reconcileExecutions(loadTradeHistory(), execs);
       for (const t of backfill) appendTrade(t);
       if (backfill.length > 0) {
-        log(`Reconciled ${backfill.length} IBKR execution(s) missing from the ledger: ${backfill.map(t => `${t.action} ${t.qty} ${t.symbol}`).join(', ')}`, AGENT);
-        await alert(`IBKR fund: reconciled ${backfill.length} missing fill(s) from IBKR into the ledger`);
+        const detail = backfill.map(t => `${t.action} ${t.qty} ${t.symbol}`).join(', ');
+        log(`Reconciled ${backfill.length} IBKR execution(s) missing from the ledger: ${detail}`, AGENT);
+        await notify(
+          {
+            severity: 'warn',
+            title: `Reconciled ${backfill.length} missing fill${backfill.length === 1 ? '' : 's'} from IBKR`,
+            // The old alert dropped the symbols the adjacent log already had,
+            // making it strictly less useful than the log line beside it.
+            body: `These fills happened at IBKR but were missing from the ledger: ${detail}`,
+            fields: [{ label: 'Backfilled', value: String(backfill.length) }],
+            agent: AGENT,
+            // Keyed on WHAT was backfilled: the same gap re-reported is noise,
+            // a different gap is news.
+            dedupe: {
+              key: 'exec:reconciled-fills',
+              fingerprint: backfill.map(t => t.execId ?? `${t.orderId}:${t.action}:${t.symbol}:${t.qty}`).sort().join('|'),
+            },
+          },
+          storeHooks,
+        );
       }
     } catch (err) {
       logError('Execution reconciliation failed (continuing)', err, AGENT);
@@ -165,15 +286,49 @@ async function run(): Promise<void> {
     const riskStale = !lastRiskAt || Date.now() - new Date(lastRiskAt).getTime() > RISK_STALE_MS;
     if (!drawdownLevel || riskStale) {
       log(`BLOCKED: risk data missing/stale (level=${drawdownLevel ?? 'unset'}, lastRiskAt=${lastRiskAt ?? 'never'}) — refusing to execute ungated`, AGENT);
-      await alert(`IBKR fund: execution blocked — risk assessment missing/stale (${lastRiskAt ?? 'never'}); not trading ungated`);
+      await notify(
+        {
+          severity: 'warn',
+          title: 'Execution blocked — risk assessment missing or stale',
+          body: 'Refusing to trade ungated. The risk-manager has not produced a fresh drawdown level.',
+          fields: [
+            { label: 'Last risk run', value: lastRiskAt ?? 'never' },
+            { label: 'Drawdown level', value: drawdownLevel ?? 'unset' },
+          ],
+          agent: AGENT,
+          // Coarse fingerprint: the timestamp changes every run, so keying on it
+          // would alert every cycle. This is one condition — "risk is stale" —
+          // that re-nags on the severity ttl until it clears.
+          dedupe: { key: 'exec:risk-stale', fingerprint: drawdownLevel ? 'stale' : 'missing' },
+        },
+        storeHooks,
+      );
       return;
     }
     if (drawdownLevel === 'stopped') {
       log('BLOCKED: Drawdown level is STOPPED — clearing pending queue, refusing to execute', AGENT);
       // Clear before alerting: a throw in the notifier must not leave a
       // pre-drawdown queue intact to fire once the level relaxes.
+      const cleared = ((state.pendingOrders as unknown[] | undefined) ?? []).length;
       mergeState({ pendingOrders: [] });
-      await alert('🚨 IBKR fund: drawdown STOPPED — execution blocked, pending queue cleared for manual review');
+      await notify(
+        {
+          severity: 'critical',
+          title: 'Execution blocked — drawdown STOPPED',
+          // The queue is destroyed, not paused. Worth saying plainly: those
+          // orders are gone and will not fire when the level relaxes.
+          body:
+            cleared > 0
+              ? `The pending queue (${cleared} order${cleared === 1 ? '' : 's'}) has been CLEARED, not paused — a ` +
+                'pre-drawdown queue must not fire once the level relaxes. The strategist will regenerate orders if ' +
+                'a rebalance is still warranted.'
+              : 'Nothing was queued.',
+          fields: [{ label: 'Drawdown level', value: drawdownLevel }],
+          agent: AGENT,
+          dedupe: { key: 'exec:blocked-stopped', fingerprint: 'stopped' },
+        },
+        storeHooks,
+      );
       return;
     }
 
@@ -229,8 +384,9 @@ async function run(): Promise<void> {
       deps,
     );
 
+    const runAt = new Date().toISOString();
     const updates: Record<string, unknown> = {
-      lastExecutionAt: new Date().toISOString(),
+      lastExecutionAt: runAt,
     };
 
     // The executor persisted `remaining` incrementally as it went (via
@@ -250,12 +406,6 @@ async function run(): Promise<void> {
         reason: outcome.haltReason || 'no confirmed fill observed',
       };
       log(`Validation NOT passed (${outcome.haltReason || 'no confirmed fill'}) — queue stays locked`, AGENT);
-      await alert(`⚠️ IBKR fund: validation trade did NOT pass (${outcome.haltReason || 'no confirmed fill'}). Queue stays locked.`);
-    }
-    // Alert on any early halt (rejection, cap breach, timeout, guard failure) —
-    // a real-money run that stopped abnormally should not be silent.
-    if (outcome.halted && !outcome.validationFailed) {
-      await alert(`⚠️ IBKR fund: execution run halted early — ${outcome.haltReason}. ${outcome.executed.length} order(s) executed, ${outcome.requeue.length} queued.`);
     }
     if (outcome.shortfalls.length > 0) {
       updates.shortfallMetrics = outcome.shortfalls;
@@ -274,6 +424,11 @@ async function run(): Promise<void> {
       updates.washSales = Array.from(merged.values());
     }
     mergeState(updates);
+
+    // Persist first, tell second — same rule as the risk gate. Everything below
+    // is I/O and must not be able to lose the run's state.
+    await reportRun(outcome, runAt);
+
     log('Execution complete', AGENT);
 
   } finally {

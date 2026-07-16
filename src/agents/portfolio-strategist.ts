@@ -19,10 +19,26 @@ import { drawdownExposureMultiplier, type DrawdownState } from '../risk/drawdown
 import { navSanityViolation, priceSanityViolations } from '../risk/data-sanity.js';
 import { isStrategistWindow, describeWindow, STRATEGIST_WINDOW } from '../strategy/market-hours.js';
 import { loadState, mergeState } from '../state/store.js';
-import { alert } from '../notify/slack.js';
+import { notify } from '../notify/slack.js';
+import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
 
 const AGENT = 'PortfolioStrategist';
+
+/** Format a dollar amount. Named `fmtUsd` — `usd` is taken by the balances read in run(). */
+const fmtUsd = (n: number): string => `$${n.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+
+/**
+ * Collapse a navSanityViolation message to its CLASS, for use as a dedupe
+ * fingerprint. The message embeds live NAV figures, so fingerprinting on the
+ * message itself would change every run and defeat the dedupe entirely.
+ */
+function navViolationClass(reason: string): string {
+  if (reason.includes('non-positive/NaN')) return 'nav-nan';
+  if (reason.includes('below floor')) return 'nav-floor';
+  if (reason.includes('moved')) return 'nav-move';
+  return 'nav-other';
+}
 
 async function run(): Promise<void> {
   log('Portfolio strategy analysis starting', AGENT);
@@ -57,8 +73,32 @@ async function run(): Promise<void> {
     const navBad = navSanityViolation(navUsd, lastNavUsd, config.dataSanity);
     if (navBad) {
       log(`SUSPECT NAV — skipping order generation: ${navBad}`, AGENT);
-      await alert(`IBKR fund: strategist skipped — suspect NAV read (${navBad})`);
       mergeState({ lastStrategyAt: new Date().toISOString() });
+      // NOTE: this path deliberately does NOT advance lastNavUsd (the price
+      // path below does). So the same comparison recurs every cycle and the
+      // strategist stays skipped until a human intervenes — there is no
+      // self-clearing path. That is arguably right for a suspect NAV, but it
+      // means this alert is the ONLY signal you are wedged, so it must re-nag.
+      //
+      // Fingerprint on the violation CLASS, never the NAV value: NAV moves
+      // every run, so a value-based fingerprint would never match and this
+      // would fire on every single cycle instead of re-nagging on its ttl.
+      await notify(
+        {
+          severity: 'warn',
+          title: 'Strategist skipped — suspect NAV read',
+          body:
+            `${navBad}. No orders were generated and the existing queue is untouched. This does not clear on its ` +
+            'own: the strategist will keep skipping until the NAV read is sane or the stored baseline is corrected.',
+          fields: [
+            { label: 'NAV', value: fmtUsd(navUsd) },
+            { label: 'Baseline', value: lastNavUsd === undefined ? 'none' : fmtUsd(lastNavUsd) },
+          ],
+          agent: AGENT,
+          dedupe: { key: 'strategist:nav-suspect', fingerprint: navViolationClass(navBad) },
+        },
+        storeHooks,
+      );
       return;
     }
     const lastPrices = new Map<string, number>(
@@ -70,8 +110,27 @@ async function run(): Promise<void> {
     if (priceBad.length > 0) {
       const detail = priceBad.map(b => `${b.symbol}(${b.reason})`).join(', ');
       log(`SUSPECT PRICES — skipping order generation: ${detail}`, AGENT);
-      await alert(`IBKR fund: strategist skipped — suspect prices: ${detail}`);
       mergeState({ lastStrategyAt: new Date().toISOString(), lastNavUsd: navUsd });
+      await notify(
+        {
+          severity: 'warn',
+          title: `Strategist skipped — suspect prices on ${priceBad.length} symbol${priceBad.length === 1 ? '' : 's'}`,
+          // `detail` is an unbounded join over every violating symbol — 17 of
+          // them would be the likeliest thing in this system to breach Slack's
+          // 3000-char section limit. The renderer truncates rather than letting
+          // Slack 400 the whole post.
+          body: detail,
+          fields: [{ label: 'Symbols', value: priceBad.map(b => b.symbol).join(', ') }],
+          agent: AGENT,
+          // Fingerprint on WHICH symbols, not their prices — prices move every
+          // run. Sorted so ordering churn isn't mistaken for a new condition.
+          dedupe: {
+            key: 'strategist:prices-suspect',
+            fingerprint: priceBad.map(b => b.symbol).sort().join(','),
+          },
+        },
+        storeHooks,
+      );
       return;
     }
 

@@ -20,6 +20,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 const calls: string[] = [];
 const merged: Record<string, unknown>[] = [];
+const notified: Array<{ severity: string }> = [];
 
 vi.mock('../connection/gateway.js', () => ({
   connect: vi.fn(async () => {}),
@@ -35,9 +36,16 @@ vi.mock('../state/store.js', () => ({
   mergeState: vi.fn((u: Record<string, unknown>) => { calls.push('mergeState'); merged.push(u); }),
 }));
 
+vi.mock('../notify/store-hooks.js', () => ({ storeHooks: { claim: () => true, release: () => {} } }));
+
+// notify() is contractually never-throws, so a throwing fake is not a realistic
+// production state — it is the point. The gate write must survive even a
+// notifier that violates its own contract, because the gate decides whether
+// real money trades.
 vi.mock('../notify/slack.js', () => ({
-  alert: vi.fn(async () => {
-    calls.push('alert');
+  notify: vi.fn(async (e: { severity: string }) => {
+    calls.push('notify');
+    notified.push(e);
     throw new Error('slack exploded');
   }),
 }));
@@ -46,6 +54,7 @@ describe('risk-manager: hard-stop gate is persisted before notifying', () => {
   beforeEach(() => {
     calls.length = 0;
     merged.length = 0;
+    notified.length = 0;
   });
 
   afterEach(() => {
@@ -71,10 +80,16 @@ describe('risk-manager: hard-stop gate is persisted before notifying', () => {
     await expect(run()).rejects.toThrow();
 
     expect(calls).toContain('mergeState');
-    expect(calls).toContain('alert');
+    expect(calls).toContain('notify');
     expect(
       calls.indexOf('mergeState'),
-      `expected mergeState before alert, got: ${calls.join(' → ')}`,
-    ).toBeLessThan(calls.indexOf('alert'));
+      `expected mergeState before notify, got: ${calls.join(' → ')}`,
+    ).toBeLessThan(calls.indexOf('notify'));
+  });
+
+  it('raises the hard stop as critical', async () => {
+    const { run } = await import('./risk-manager.js');
+    await expect(run()).rejects.toThrow();
+    expect(notified[0].severity).toBe('critical');
   });
 });

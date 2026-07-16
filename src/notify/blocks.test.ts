@@ -150,6 +150,21 @@ describe('mrkdwn escaping', () => {
     expect(textsOf(p).some((t) => t.includes('&lt;!channel&gt;'))).toBe(true);
   });
 
+  // Regression: an earlier version escaped only the blocks. Slack renders the
+  // TOP-LEVEL `text` as mrkdwn, so a raw <!channel> there pings the channel —
+  // caught only by inspecting the whole payload, which is why this asserts on
+  // the serialised bytes rather than on textsOf().
+  it('escapes the top-level text and fallback, not just the blocks', () => {
+    const p = renderSlackPayload(ev({ title: 'order rejected: <!channel> & <https://x|click>' }), META);
+    expect(p.text).not.toContain('<!channel>');
+    expect(p.attachments[0].fallback).not.toContain('<!channel>');
+    expect(JSON.stringify(p), 'no unescaped angle bracket may reach the wire anywhere').not.toMatch(/<[!/a-zA-Z]/);
+  });
+
+  it('renderText stays UNESCAPED for logs — humans read the journal', () => {
+    expect(renderText(ev({ title: 'a < b & c' }), META)).toContain('a < b & c');
+  });
+
   it('escapes angle brackets in field values (IBKR status strings)', () => {
     const p = renderSlackPayload(ev({ fields: [{ label: 'Status', value: '<pending|cancel>' }] }), META);
     const fieldBlock = (p.attachments[0].blocks as Array<any>).find((b) => b.fields);

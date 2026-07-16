@@ -108,7 +108,14 @@ function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 1) + '…';
 }
 
-/** Plain-text rendering — the `text` field, the attachment fallback, and what noop logs. */
+/**
+ * Plain-text rendering, UNESCAPED — for logs and the noop notifier, where
+ * `&lt;` would be noise for a human reading a journal.
+ *
+ * Do NOT put this on the wire as-is: Slack renders the top-level `text` field
+ * as mrkdwn, so an unescaped `<!channel>` arriving in an IBKR status string
+ * would ping the channel. renderSlackPayload escapes it.
+ */
 export function renderText(e: NotifyEvent, meta: RenderMeta): string {
   const head = `${SEVERITY_EMOJI[e.severity]} ${e.title}`;
   const parts = [head];
@@ -124,7 +131,10 @@ function footer(e: NotifyEvent, meta: RenderMeta): string {
 }
 
 export function renderSlackPayload(e: NotifyEvent, meta: RenderMeta): SlackPayload {
-  const text = renderText(e, meta);
+  // Escaped: Slack renders the top-level `text` as mrkdwn. `fallback` gets the
+  // same treatment — a literal `&lt;` in a push preview is a cosmetic wart; an
+  // unintended @channel at 3am is not.
+  const text = escapeMrkdwn(renderText(e, meta));
   const blocks: unknown[] = [];
 
   // Headline. `text` is required, so this section always has content — an empty

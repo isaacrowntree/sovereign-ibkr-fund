@@ -11,10 +11,20 @@ import { correlationStressTest } from '../risk/stress-test.js';
 import { sampleCovMatrix } from '../portfolio/covariance.js';
 import { computeIntradayDrawdownFromEvents } from '../observability/intraday-pnl.js';
 import { loadState, mergeState, type ObservedEventState } from '../state/store.js';
-import { alert } from '../notify/slack.js';
+import { notify } from '../notify/slack.js';
+import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
 
 const AGENT = 'RiskManager';
+
+/**
+ * One dedupe key for the whole drawdown ladder, fingerprinted on the level.
+ * Sharing the key across levels is what makes every transition — including the
+ * recovery back to normal — a change rather than a separate always-fires alert.
+ */
+const DD_KEY = 'risk:drawdown-level';
+
+const usd = (n: number): string => `$${n.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 
 /** Order drawdown levels by severity and return the worse of two. */
 const DD_RANK: Record<DrawdownState['level'], number> = { normal: 0, warning: 1, derisking: 2, stopped: 3 };
@@ -40,12 +50,16 @@ export async function run(): Promise<void> {
 
     const state = loadState();
     let navHistory = (state.navHistory || []) as number[];
+    // Read before we overwrite it below — the recovery alert needs to know what
+    // we're recovering FROM.
+    const previousLevel = state.drawdownLevel as DrawdownState['level'] | undefined;
 
     // Phantom-drawdown guard: if the historical peak is implausibly higher
     // than current NAV (>3x), the most plausible explanation is a capital
     // withdrawal — not a market drawdown — so the legacy peak is meaningless
     // for risk gating. Drop history older than the discontinuity and rebuild
     // peak from the current account state.
+    let phantomReset: { oldPeak: number; nav: number } | null = null;
     if (navHistory.length > 0) {
       const oldPeak = Math.max(...navHistory);
       if (oldPeak > account.netLiquidation * 3) {
@@ -53,6 +67,7 @@ export async function run(): Promise<void> {
           `Phantom drawdown detected (oldPeak=$${oldPeak.toFixed(0)}, currentNAV=$${account.netLiquidation.toFixed(0)}); resetting navHistory — likely a capital withdrawal.`,
           AGENT,
         );
+        phantomReset = { oldPeak, nav: account.netLiquidation };
         navHistory = [];
       }
     }
@@ -191,14 +206,101 @@ export async function run(): Promise<void> {
     if (state.stressTest) updates.stressTest = state.stressTest;
     mergeState(updates);
 
+    // A capital withdrawal silently wipes NAV history and rebuilds the peak —
+    // that resets the drawdown baseline, so it must not be a log-only event.
+    // Fingerprinted on the CLASS, not the NAV: NAV moves every run, so a
+    // value-based fingerprint would never match and this would alert on every
+    // cycle forever.
+    if (phantomReset) {
+      await notify(
+        {
+          severity: 'warn',
+          title: 'NAV history reset — suspected capital withdrawal',
+          body:
+            'The historical peak was implausibly far above current NAV, so the drawdown baseline has been rebuilt ' +
+            'from the current account state. If this was NOT a withdrawal, the drawdown gate is now measuring from ' +
+            'the wrong peak.',
+          fields: [
+            { label: 'Old peak', value: usd(phantomReset.oldPeak) },
+            { label: 'Current NAV', value: usd(phantomReset.nav) },
+          ],
+          agent: AGENT,
+          dedupe: { key: 'risk:phantom-drawdown', fingerprint: 'nav-reset' },
+        },
+        storeHooks,
+      );
+    }
+
+    // Drawdown level. Fingerprinted on the level itself, so this alerts on
+    // TRANSITIONS (normal → warning → derisking → stopped) rather than on every
+    // run, and re-nags only once the ttl lapses on a stuck condition.
+    const ddFields = [
+      { label: 'Drawdown', value: `${dd.drawdownPct.toFixed(1)}%` },
+      { label: 'Peak NAV', value: usd(dd.peak) },
+      { label: 'Current NAV', value: usd(account.netLiquidation) },
+    ];
+
     if (effectiveLevel === 'stopped') {
-      log('HARD STOP: Portfolio drawdown exceeds limit — manual review required', AGENT);
-      await alert(`🚨 IBKR fund HARD STOP — drawdown ${dd.drawdownPct.toFixed(1)}% (level ${effectiveLevel}). Execution blocked, manual review required.`);
+      log('HARD STOP: Portfolio drawdown exceeds limit', AGENT);
+      await notify(
+        {
+          severity: 'critical',
+          title: `HARD STOP — drawdown ${dd.drawdownPct.toFixed(1)}% (limit ${DD_LIMITS.hardStopPct}%)`,
+          // NOT "manual review required": assessDrawdown recomputes the level
+          // from navHistory every run, so the stop CLEARS ITSELF once NAV
+          // recovers. Nothing waits for a human. Saying otherwise sends you
+          // looking for a button that doesn't exist.
+          body:
+            'Execution is blocked and the pending queue has been cleared. This gate re-evaluates every run and ' +
+            'lifts on its own if NAV recovers — you will get a recovery alert if it does.',
+          fields: ddFields,
+          agent: AGENT,
+          dedupe: { key: DD_KEY, fingerprint: effectiveLevel },
+        },
+        storeHooks,
+      );
     } else if (effectiveLevel === 'derisking') {
       log('DE-RISKING: Reducing exposure to 50%', AGENT);
-      await alert(`⚠️ IBKR fund DE-RISKING — drawdown ${dd.drawdownPct.toFixed(1)}%. Exposure cut to 50%.`);
+      await notify(
+        {
+          severity: 'warn',
+          title: `DE-RISKING — drawdown ${dd.drawdownPct.toFixed(1)}% (limit ${DD_LIMITS.deriskPct}%)`,
+          body: 'Exposure cut to 50%.',
+          fields: ddFields,
+          agent: AGENT,
+          dedupe: { key: DD_KEY, fingerprint: effectiveLevel },
+        },
+        storeHooks,
+      );
     } else if (effectiveLevel === 'warning') {
+      // Previously log-only, which meant the FIRST threshold you cross was
+      // silent and you only heard at the de-risk level.
       log('WARNING: Tightening risk limits', AGENT);
+      await notify(
+        {
+          severity: 'warn',
+          title: `Drawdown warning — ${dd.drawdownPct.toFixed(1)}% (limit ${DD_LIMITS.warningPct}%)`,
+          body: 'Risk limits tightened. Execution is still permitted.',
+          fields: ddFields,
+          agent: AGENT,
+          dedupe: { key: DD_KEY, fingerprint: effectiveLevel },
+        },
+        storeHooks,
+      );
+    } else if (previousLevel && previousLevel !== 'normal') {
+      // Recovery. The gate lifting is the counterpart to the alert that raised
+      // it — without this you are told trading stopped and never told it resumed.
+      await notify(
+        {
+          severity: 'recovery',
+          title: `Drawdown recovered to normal — ${dd.drawdownPct.toFixed(1)}%`,
+          body: `Was ${previousLevel}. Execution is unblocked.`,
+          fields: ddFields,
+          agent: AGENT,
+          dedupe: { key: DD_KEY, fingerprint: effectiveLevel },
+        },
+        storeHooks,
+      );
     }
 
   } finally {

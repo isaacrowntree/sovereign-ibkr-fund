@@ -118,6 +118,27 @@ export interface ExecutorDeps {
   logError(message: string, err: unknown): void;
 }
 
+/**
+ * Something a human should hear about, surfaced on the outcome rather than
+ * notified from here.
+ *
+ * The executor is deliberately pure — it takes an ExecutorDeps of injected
+ * collaborators and imports no I/O, which is what keeps executor.test.ts
+ * fake-driven. It's also synchronous on the fill path (recordFilledTrade is
+ * `(...): void`), so awaiting a notifier here would mean an async refactor plus
+ * a 10s webhook inside the order loop, and fire-and-forget would be killed by
+ * the agent's `process.exit(0)` before the POST landed.
+ *
+ * So: collect, and let execution-bot (which is async, already awaits, and can
+ * see post-run NAV/cash) do the telling.
+ */
+export interface ExecutionAnomaly {
+  kind: 'ledger-diverged' | 'fill-recovered';
+  symbol: string;
+  detail: string;
+  orderId?: string | number;
+}
+
 export interface ExecutionOutcome {
   mode: 'validate' | 'normal';
   /** Orders that should remain in the pending queue (never includes executed ones). */
@@ -132,6 +153,8 @@ export interface ExecutionOutcome {
   validationFailed: boolean;
   shortfalls: ShortfallResult[];
   washSales: WashSaleEntry[];
+  /** Correctness events worth a human's attention. See ExecutionAnomaly. */
+  anomalies: ExecutionAnomaly[];
 }
 
 /** CPAPI order statuses that mean the order is no longer working. */
@@ -164,6 +187,7 @@ export async function executeQueue(
   const buys = plan.orders.filter(o => o.action === 'BUY');
   const shortfalls: ShortfallResult[] = [];
   const washSales: WashSaleEntry[] = [];
+  const anomalies: ExecutionAnomaly[] = [];
   const executed: StagedOrder[] = [];
   let confirmedFill = false;
   let halted = false;
@@ -326,6 +350,17 @@ export async function executeQueue(
       // unwind the run (that would leave the filled order in the queue to
       // re-execute). Log and carry on; the order is still marked executed.
       deps.logError(`Bookkeeping failed for ${order.symbol} (fill occurred) — continuing`, e);
+      // Real shares moved but the ledger doesn't know: every downstream number
+      // (drawdown, tax lots, drift) is now computed from a book that disagrees
+      // with IBKR. Silence here is the worst outcome in the whole system.
+      anomalies.push({
+        kind: 'ledger-diverged',
+        symbol: order.symbol,
+        orderId: result.orderId,
+        detail:
+          `${order.action} ${filledQty} ${order.symbol} @ $${fillPrice.toFixed(2)} filled at IBKR, but writing it ` +
+          `to the ledger failed: ${e instanceof Error ? e.message : String(e)}`,
+      });
     }
     executed.push({ ...order, qty: filledQty });
   };
@@ -361,6 +396,7 @@ export async function executeQueue(
         validationFailed: plan.mode === 'validate' && !confirmedFill,
         shortfalls,
         washSales,
+        anomalies,
       };
     }
   }
@@ -390,6 +426,17 @@ export async function executeQueue(
     if (filledQty <= 0) return 0;
     const avgPrice = fills.reduce((s, e) => s + e.qty * e.price, 0) / filledQty;
     deps.log(`RECONCILED from IBKR executions: ${order.action} ${filledQty} ${order.symbol} @ $${avgPrice.toFixed(2)} DID fill (confirmation misreported).`);
+    // The WS confirmation said this didn't fill; IBKR's own execution history
+    // says it did. We recovered, but the stream is lying to us — and every
+    // other fill this run was judged by that same stream.
+    anomalies.push({
+      kind: 'fill-recovered',
+      symbol: order.symbol,
+      orderId,
+      detail:
+        `${order.action} ${filledQty} ${order.symbol} @ $${avgPrice.toFixed(2)} was reported as not filled, but ` +
+        `IBKR's execution history shows it did. Recovered from executions; the WS stream misreported.`,
+    });
     confirmedFill = true;
     recordExecuted(order, filledQty, avgPrice, 'filled', { orderId, symbol: order.symbol, action: order.action, qty: filledQty, status: 'filled' } as TradeResult);
     return filledQty;
@@ -631,5 +678,6 @@ export async function executeQueue(
     validationFailed: plan.mode === 'validate' && !confirmedFill,
     shortfalls,
     washSales,
+    anomalies,
   };
 }
