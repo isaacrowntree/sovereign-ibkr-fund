@@ -28,7 +28,7 @@ const DD_LIMITS: DrawdownLimits = {
   hardStopPct: config.risk.drawdownHardStopPct,
 };
 
-async function run(): Promise<void> {
+export async function run(): Promise<void> {
   log('Risk assessment starting', AGENT);
   await connect();
   requestDelayedData();
@@ -173,6 +173,24 @@ async function run(): Promise<void> {
       }
     }
 
+    // Fix #7: Persist the EFFECTIVE drawdown level (snapshot ⊔ intraday) so the
+    // execution bot can enforce it.
+    //
+    // This MUST happen before any notification. The gate is enforced by
+    // execution-bot reading `drawdownLevel`/`lastRiskAt` from state; if an
+    // alert throws first, this write is skipped, and because RISK_STALE_MS (5h)
+    // exceeds the agent cadence (4h) the staleness fail-safe does NOT fire —
+    // execution-bot reads a stale `normal` and trades a drawdown book. Gate
+    // state must never be downstream of an I/O call.
+    const updates: Record<string, unknown> = {
+      drawdownLevel: effectiveLevel,
+      navHistory,
+      lastRiskAt: new Date().toISOString(),
+    };
+    if (state.riskMetrics) updates.riskMetrics = state.riskMetrics;
+    if (state.stressTest) updates.stressTest = state.stressTest;
+    mergeState(updates);
+
     if (effectiveLevel === 'stopped') {
       log('HARD STOP: Portfolio drawdown exceeds limit — manual review required', AGENT);
       await alert(`🚨 IBKR fund HARD STOP — drawdown ${dd.drawdownPct.toFixed(1)}% (level ${effectiveLevel}). Execution blocked, manual review required.`);
@@ -182,17 +200,6 @@ async function run(): Promise<void> {
     } else if (effectiveLevel === 'warning') {
       log('WARNING: Tightening risk limits', AGENT);
     }
-
-    // Fix #7: Persist the EFFECTIVE drawdown level (snapshot ⊔ intraday) so the
-    // execution bot can enforce it.
-    const updates: Record<string, unknown> = {
-      drawdownLevel: effectiveLevel,
-      navHistory,
-      lastRiskAt: new Date().toISOString(),
-    };
-    if (state.riskMetrics) updates.riskMetrics = state.riskMetrics;
-    if (state.stressTest) updates.stressTest = state.stressTest;
-    mergeState(updates);
 
   } finally {
     disconnect();

@@ -170,8 +170,10 @@ async function run(): Promise<void> {
     }
     if (drawdownLevel === 'stopped') {
       log('BLOCKED: Drawdown level is STOPPED — clearing pending queue, refusing to execute', AGENT);
-      await alert('🚨 IBKR fund: drawdown STOPPED — execution blocked, pending queue cleared for manual review');
+      // Clear before alerting: a throw in the notifier must not leave a
+      // pre-drawdown queue intact to fire once the level relaxes.
       mergeState({ pendingOrders: [] });
+      await alert('🚨 IBKR fund: drawdown STOPPED — execution blocked, pending queue cleared for manual review');
       return;
     }
 
