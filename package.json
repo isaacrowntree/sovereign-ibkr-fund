@@ -6,6 +6,9 @@
   "private": true,
   "type": "commonjs",
   "main": "dist/index.js",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",

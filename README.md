@@ -38,7 +38,8 @@ Includes a backtest engine (HRP, risk-parity, Black-Litterman, Ledoit-Wolf covar
 
 ## Requirements
 
-- Node 20+
+- Node 22.13+ (state is SQLite via the built-in `node:sqlite`, which doesn't exist before 22.5 and is unflagged from 22.13)
+- [pnpm](https://pnpm.io) 9+ (`corepack enable pnpm`) — `pnpm-lock.yaml` is the committed lockfile
 - A running [bezant](https://github.com/isaacrowntree/bezant) gateway (default `http://localhost:8080`)
 - An Interactive Brokers account (**start on paper**)
 
@@ -47,10 +48,10 @@ Includes a backtest engine (HRP, risk-parity, Black-Litterman, Ledoit-Wolf covar
 ```sh
 git clone https://github.com/isaacrowntree/sovereign-ibkr-fund.git
 cd sovereign-ibkr-fund
-npm install
+pnpm install                 # npm < 11.13 cannot parse the `#path:` dep fragment
 cp .env.example .env        # point BEZANT_URL at your bezant; TRADING_MODE=paper
-npm run build
-npm start                    # status server + built-in scheduler, against the sample portfolio
+pnpm run build
+pnpm start                   # status server + built-in scheduler, against the sample portfolio
 ```
 
 Out of the box it runs the **sample** model portfolio (a generic diversified ETF template) against **paper** trading. Nothing trades live until you set `TRADING_MODE=live` and provide your own portfolio.
@@ -59,7 +60,7 @@ Out of the box it runs the **sample** model portfolio (a generic diversified ETF
 
 The agents are just `node dist/agents/<name>.js --once`. Anything can schedule them:
 
-- **Built-in scheduler** (default): `npm start` runs every agent on its cadence. Tune per agent with `SCHED_*_SEC` env vars.
+- **Built-in scheduler** (default): `pnpm start` runs every agent on its cadence. Tune per agent with `SCHED_*_SEC` env vars.
 - **cron / systemd**: point timers at the `--once` scripts. Examples in [`deploy/`](deploy/).
 - **paperclip** (or any orchestrator): set `ENABLE_SCHEDULER=false` and have it invoke the `--once` scripts; it becomes the scheduler. `deploy/` has a reference adapter.
 
@@ -69,7 +70,7 @@ The public repo ships [`src/portfolios/sample.ts`](src/portfolios/sample.ts). To
 
 ```sh
 cp src/portfolios/local.example.ts src/portfolios/local.ts   # edit; weights sum to 100
-npm run build
+pnpm run build
 ```
 
 `local.ts` is gitignored and never published. All other tuning is env-driven — see [`.env.example`](.env.example).
@@ -92,8 +93,8 @@ None of this is a guarantee. **This is not financial advice. Trade at your own r
 The dataset (Yahoo Finance daily bars) is gitignored — generate it, then the backtest suites run:
 
 ```sh
-npm run fetch-data     # writes src/validation/data/historical-daily.json
-npm test               # backtest suites skip automatically until the data exists
+pnpm run fetch-data    # writes src/validation/data/historical-daily.json
+pnpm test              # backtest suites skip automatically until the data exists
 ```
 
 ## License

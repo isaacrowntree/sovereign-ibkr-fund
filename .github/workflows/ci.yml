@@ -10,13 +10,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # This is a pnpm project: pnpm-lock.yaml is committed and the Dockerfile
+      # builds with `corepack enable && pnpm install --frozen-lockfile`. CI used
+      # `npm install`, which cannot parse the `#path:` fragment in the
+      # bezant-client dep (pnpm syntax) until npm 11.13 — so every CI run since
+      # this repo was created died here, before a single test executed.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9 # lockfileVersion 9.0
+
+      # Node 22, not 20: store.ts imports `node:sqlite`, which does not exist in
+      # Node 20. Under the old pin every store test failed with
+      # ERR_UNKNOWN_BUILTIN_MODULE — invisible, because install died first.
+      # Matches the Dockerfile (node:22-bookworm-slim / nodesource setup_22.x).
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-      - run: npm install
-      - run: npm run typecheck
-      - run: npm test            # backtest suites skip without data — clone stays green
-      - run: npm run build
+          node-version: '22'
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run typecheck
+      - run: pnpm test # backtest suites skip without data — clone stays green
+      - run: pnpm run build
 
   secret-scan:
     runs-on: ubuntu-latest
