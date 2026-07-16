@@ -11,6 +11,10 @@
  * (execution-bot's fill confirmer, risk-manager's intraday DD) reads
  * `state.observedEvents` to enrich their own logic.
  */
+// Load .env before anything reads process.env: this agent doesn't import
+// ../config.js, so without this the new stream-health notify() would never see
+// IBKR_FUND_ALERT_WEBHOOK. dotenv does not override injected env vars.
+import 'dotenv/config';
 import {
   reconcileCursor,
   reconcileMarketDataCursor,

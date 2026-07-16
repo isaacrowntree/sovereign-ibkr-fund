@@ -20,6 +20,12 @@
  * host-local date key would name the wrong session and could double-fire or
  * skip across the dateline.
  */
+// Load .env before anything reads process.env. Unlike most agents this one
+// doesn't import ../config.js (it needs no config values), so it would
+// otherwise never trigger dotenv — leaving IBKR_FUND_ALERT_WEBHOOK unset and
+// the digest silently falling back to the noop notifier. dotenv does not
+// override already-set vars, so an orchestrator that injects env still wins.
+import 'dotenv/config';
 import { loadState, loadTradeHistory, type TradeRecord } from '../state/store.js';
 import { notify, type NotifyField } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
