@@ -42,8 +42,32 @@ interface PostResult {
   body: string;
 }
 
+/**
+ * Validate the webhook URL before handing it to fetch.
+ *
+ * A URL with no scheme (`hooks.slack.com/...` instead of `https://...`) makes
+ * fetch throw `Failed to parse URL from <the entire secret>` — and that message
+ * goes straight to logError, i.e. into the systemd journal / docker logs. Every
+ * other failure mode is safe (a DNS failure is just "fetch failed"; the host
+ * lives in err.cause, which log.ts never reads), so this one config typo is the
+ * only path that leaks the credential. Fail closed and never interpolate the
+ * URL into the message.
+ */
+function validWebhook(url: string): boolean {
+  try {
+    const u = new URL(url);
+    return u.protocol === 'https:' || u.protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
 /** POST once. Resolves null when the transport itself failed (network/timeout). */
 async function post(webhook: string, payload: unknown): Promise<PostResult | null> {
+  if (!validWebhook(webhook)) {
+    logError('IBKR_FUND_ALERT_WEBHOOK is not a valid URL (missing https:// scheme?) — not sending', '', AGENT);
+    return null;
+  }
   try {
     const res = await fetch(webhook, {
       method: 'POST',

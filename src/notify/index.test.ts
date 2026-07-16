@@ -65,6 +65,29 @@ describe('the webhook is never contacted by accident', () => {
   });
 });
 
+describe('a malformed webhook URL must not leak the credential into logs', () => {
+  // fetch('hooks.slack.com/...') throws "Failed to parse URL from <full secret>",
+  // and that message goes to logError → the systemd journal. Verified: this is
+  // the ONLY failure path that leaks (a DNS failure is just "fetch failed").
+  const SECRET_PATH = 'hooks.slack.com/services/T01ABCDEF/B02GHIJKL/SuperSecretTokenXYZ';
+
+  it.each([
+    ['scheme-less', SECRET_PATH],
+    ['garbage', 'not a url at all'],
+    ['unsupported scheme', 'ftp://hooks.slack.com/services/T01/B02/SuperSecretTokenXYZ'],
+  ])('refuses to send to a %s URL rather than letting fetch throw with it', async (_label, url) => {
+    process.env.IBKR_FUND_ALERT_WEBHOOK = url;
+    await expect(alert('x')).resolves.toBeUndefined();
+    expect(fetchSpy, 'never hand an unparseable URL to fetch').not.toHaveBeenCalled();
+  });
+
+  it('accepts a well-formed https webhook', async () => {
+    process.env.IBKR_FUND_ALERT_WEBHOOK = HOOK;
+    await alert('x');
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('getNotifier precedence', () => {
   const cases: Array<[string | undefined, boolean, 'webhook' | 'noop']> = [
     ['noop', true, 'noop'],
