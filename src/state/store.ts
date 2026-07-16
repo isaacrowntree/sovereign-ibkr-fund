@@ -149,6 +149,16 @@ function openDb(): DatabaseSync {
   d.exec('CREATE TABLE IF NOT EXISTS state_kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
   d.exec('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, data TEXT NOT NULL)');
   d.exec('CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL)');
+  // Alert dedupe. Deliberately its own table rather than a state_kv key: it is
+  // invisible to loadState()'s SELECT *, and a dedicated row per key means the
+  // claim below is a real compare-and-set instead of a read-modify-write that
+  // two agent processes could interleave.
+  //   expires_at NULL ≡ never expires (a once-ever alert).
+  // Never bind Infinity here — SQLite silently stores it and reads back null.
+  d.exec(
+    'CREATE TABLE IF NOT EXISTS notify_dedupe (' +
+      'key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, sent_at INTEGER NOT NULL, expires_at INTEGER)',
+  );
   return d;
 }
 
@@ -301,6 +311,81 @@ export function loadTradeHistory(): TradeRecord[] {
     try { out.push(JSON.parse(r.data) as TradeRecord); } catch { /* skip */ }
   }
   return out;
+}
+
+/** Prune expired dedupe rows on ~1 claim in 64 — see claimAlert. */
+const PRUNE_ODDS = 64;
+
+/**
+ * Claim the right to send one alert — ATOMIC across processes.
+ *
+ * Mirrors appendTrade's philosophy: the store guarantees at-most-once, so
+ * callers never need their own dedup and stay one-liners.
+ *
+ * Returns true (caller should send) when:
+ *   - the key has never been alerted, OR
+ *   - `fingerprint` CHANGED — a state transition (warning → derisking), OR
+ *   - the previous claim has expired — a re-nag on a stuck condition.
+ *
+ * `ttlMs` of Infinity means never expire: a once-ever alert. It is stored as
+ * NULL rather than a number, because binding Infinity to a SQLite column
+ * silently succeeds and reads back as null — a trap worth closing at the edge.
+ *
+ * The SELECT and the upsert both run inside tx()'s BEGIN IMMEDIATE, which takes
+ * the write lock on the first statement, so the check-and-set cannot interleave
+ * with another process. Callers must NOT hold their own transaction.
+ */
+export function claimAlert(key: string, fingerprint: string, ttlMs: number): boolean {
+  const d = db();
+  const now = Date.now();
+  let claimed = false;
+
+  tx(d, () => {
+    const row = d
+      .prepare('SELECT fingerprint, sent_at, expires_at FROM notify_dedupe WHERE key = ?')
+      .get(key) as { fingerprint: string; sent_at: number; expires_at: number | null } | undefined;
+
+    if (row && row.fingerprint === fingerprint) {
+      // A backwards clock step (the Pi has no RTC and steps on NTP sync) would
+      // otherwise make a re-nag unreachable. Treat it as elapsed: a duplicate
+      // alert is cheap, a silently suppressed one is not.
+      const clockWentBackwards = now < row.sent_at;
+      const live = row.expires_at === null || now < row.expires_at;
+      if (live && !clockWentBackwards) return; // suppressed
+    }
+
+    const expiresAt = Number.isFinite(ttlMs) ? now + ttlMs : null;
+    d.prepare(
+      'INSERT INTO notify_dedupe (key, fingerprint, sent_at, expires_at) VALUES (?, ?, ?, ?) ' +
+        'ON CONFLICT(key) DO UPDATE SET fingerprint = excluded.fingerprint, ' +
+        'sent_at = excluded.sent_at, expires_at = excluded.expires_at',
+    ).run(key, fingerprint, now, expiresAt);
+
+    // Opportunistic prune. Dropping an EXPIRED row is semantically free — a
+    // missing row and an expired row both mean "send" — so this can never
+    // resurrect an old alert. NULL (never-expires) rows are left alone by the
+    // IS NOT NULL guard; those are the once-ever keys and must persist.
+    // Probabilistic so the write lock isn't lengthened on every claim.
+    if (Math.floor(Math.random() * PRUNE_ODDS) === 0) {
+      d.prepare('DELETE FROM notify_dedupe WHERE expires_at IS NOT NULL AND expires_at < ?').run(now);
+    }
+
+    claimed = true;
+  });
+
+  return claimed;
+}
+
+/**
+ * Give back a claim, so the next attempt re-sends.
+ *
+ * Called when delivery FAILED. Without this, claim-then-send silently loses any
+ * once-ever alert (a fill, the digest) on a single transient Slack 5xx — the
+ * row persists, never expires, and the alert is never retried. Releasing only
+ * on a failed send means no duplicate was ever delivered.
+ */
+export function releaseAlert(key: string): void {
+  db().prepare('DELETE FROM notify_dedupe WHERE key = ?').run(key);
 }
 
 /** Close the underlying connection (graceful shutdown / test isolation). */
