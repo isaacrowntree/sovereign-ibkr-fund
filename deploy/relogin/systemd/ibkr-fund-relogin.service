@@ -1,14 +1,14 @@
 [Unit]
 Description=Re-login to IBKR Client Portal Gateway when the session expires
-Documentation=https://github.com/isaacrowntree/ibkr-fund/tree/master/pi/relogin
+Documentation=https://github.com/isaacrowntree/sovereign-ibkr-fund/tree/main/deploy/relogin
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/ibkr-fund/pi/relogin
-EnvironmentFile=%h/ibkr-fund/pi/relogin/.env
-ExecStart=/usr/bin/env npx tsx %h/ibkr-fund/pi/relogin/index.ts
+WorkingDirectory=%h/sovereign-ibkr-fund/deploy/relogin
+EnvironmentFile=%h/sovereign-ibkr-fund/deploy/relogin/.env
+ExecStart=/usr/bin/env npx tsx %h/sovereign-ibkr-fund/deploy/relogin/index.ts
 StandardOutput=journal
 StandardError=journal
 # Don't restart automatically — the timer handles cadence and the script

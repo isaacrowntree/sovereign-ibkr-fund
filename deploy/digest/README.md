@@ -31,8 +31,8 @@ different dates, so no single local time is correct year-round.
 ## Install
 
 ```sh
-mkdir -p ~/ibkr-fund/pi/digest
-cp .env.example ~/ibkr-fund/pi/digest/.env   # then edit: same webhook as the fund
+mkdir -p ~/sovereign-ibkr-fund/deploy/digest
+cp .env.example ~/sovereign-ibkr-fund/deploy/digest/.env   # then edit: same webhook as the fund
 cp ibkr-fund-digest.service ibkr-fund-digest.timer ~/.config/systemd/user/
 
 systemctl --user daemon-reload

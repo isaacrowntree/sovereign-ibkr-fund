@@ -6,14 +6,20 @@ Wants=docker.service
 [Service]
 Type=oneshot
 # Alert webhook (same URL as the fund/watchdog/relogin — see .env.example).
-EnvironmentFile=%h/ibkr-fund/pi/digest/.env
-# Mirrors the backup unit: runs inside the paperclip container so it shares the
-# fund's cwd, and therefore the same bot-state.db. The digest reads state only —
-# no IBKR connection — so it does not need the gateway to be up.
-# -e forwards the webhook from this unit into the container.
+EnvironmentFile=%h/sovereign-ibkr-fund/deploy/digest/.env
+# Mirrors the backup unit: runs inside the paperclip container. The digest needs
+# no IBKR connection, so the gateway does not have to be up.
+# -e forwards the webhook/NOTIFIER/TRADING_MODE from this unit into the container.
+#
+# NOT "reads state only" — the digest WRITES `notify_dedupe`. That write is how
+# the stale-ledger bug stayed alive: with STATE_DIR unset it defaulted to cwd
+# (the old `ibkr-fund` checkout) and kept that copy warm until 2026-08-02.
+# STATE_DIR is now explicit and points at the durable location outside the
+# paperclip workspace (/var/lib/sovereign-fund/state -> /fund-state).
 ExecStart=/usr/bin/docker exec -u node \
   -e IBKR_FUND_ALERT_WEBHOOK \
   -e NOTIFIER \
   -e TRADING_MODE \
-  -w /paperclip/instances/default/projects/34fe08e4-d395-4266-b0f0-428b84c5170e/1e86c103-2643-4908-9780-9b26f0064728/ibkr-fund \
+  -e STATE_DIR=/fund-state/state \
+  -w /paperclip/instances/default/projects/COMPANY_ID/PROJECT_ID/sovereign-ibkr-fund \
   paperclip node dist/agents/daily-summary.js --once

@@ -19,3 +19,10 @@ src/portfolios/local.ts
 
 # Backtest data
 src/validation/data/
+
+# DB dumps — may contain agent credentials; never commit
+backups/
+
+# host marker: this checkout runs prebuilt artefacts, never builds. Must NOT be
+# committed — it would make every clone refuse to build.
+.prebuilt

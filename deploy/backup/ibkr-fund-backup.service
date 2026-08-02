@@ -6,11 +6,23 @@ Wants=docker.service
 [Service]
 Type=oneshot
 # Slack bot token + channel for the upload (see .env.example).
-EnvironmentFile=%h/ibkr-fund/pi/backup/.env
+EnvironmentFile=%h/sovereign-ibkr-fund/deploy/backup/.env
 # Runs in the paperclip container (has node 24 + node:sqlite); -e forwards the
-# Slack env from this unit into the container. STATE_DIR defaults to cwd (-w).
+# Slack env from this unit into the container.
+#
+# STATE_DIR IS SET EXPLICITLY AND MUST STAY THAT WAY. backup-to-slack.mjs does
+# `process.env.STATE_DIR || '.'` and does NOT load dotenv, so with no STATE_DIR
+# it silently resolves to the working directory. That is exactly how every
+# scheduled backup up to 2026-08-02 ended up copying a STALE ledger from the old
+# `ibkr-fund` checkout instead of the live one (303104 bytes vs the real 311296)
+# — a month of backups that looked fine and were not.
+#
+# The ledger now lives OUTSIDE the paperclip workspace, at
+# /var/lib/sovereign-fund/state (bind-mounted into the container as /fund-state),
+# so long-lived data is not exposed to deploy/workspace churn.
 ExecStart=/usr/bin/docker exec -u node \
   -e IBKR_FUND_SLACK_BOT_TOKEN \
   -e IBKR_FUND_BACKUP_SLACK_CHANNEL \
-  -w /paperclip/instances/default/projects/34fe08e4-d395-4266-b0f0-428b84c5170e/1e86c103-2643-4908-9780-9b26f0064728/ibkr-fund \
+  -e STATE_DIR=/fund-state/state \
+  -w /paperclip/instances/default/projects/COMPANY_ID/PROJECT_ID/sovereign-ibkr-fund \
   paperclip node scripts/backup-to-slack.mjs

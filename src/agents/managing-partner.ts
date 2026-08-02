@@ -2,12 +2,64 @@
  * Managing Partner (CEO)
  * Orchestrates the fund: checks portfolio, delegates to risk/strategy/execution.
  */
-import { connect, disconnect, getAccountSummary, getMarketPrices, requestDelayedData } from '../connection/gateway.js';
+import { connect, disconnect, getAccountSummary, getMarketPrices, getUsdBalances, requestDelayedData } from '../connection/gateway.js';
 import { TARGET_PORTFOLIO, validateTargets } from '../config.js';
 import { loadState, mergeState } from '../state/store.js';
 import { log, logError } from '../log.js';
 
 const AGENT = 'ManagingPartner';
+
+export interface SnapshotHolding {
+  symbol: string;
+  sleeve: string;
+  targetPct: number;
+  currentPct: number;
+  currentValue: number;
+}
+
+export interface Snapshot {
+  netLiquidation: number;
+  cashValue: number;
+  holdings: SnapshotHolding[];
+}
+
+/**
+ * Build the dashboard/digest snapshot. Pure, so it can be tested.
+ *
+ * EVERYTHING HERE IS USD. Position `mktValue` and `qty * price` are in the
+ * position's currency (USD), while `getAccountSummary().netLiquidation` is the
+ * account BASE currency — AUD on this account. Dividing a USD value by an AUD
+ * NAV understated every weight by the AUD/USD rate (~1.42x), so a ~95%-invested
+ * book read as ~67% invested and every holding looked chronically underweight
+ * in the daily digest. `portfolio-strategist.ts` already uses getUsdBalances()
+ * for exactly this reason; this path did not. See getUsdBalances/deriveUsdBalances.
+ */
+export function buildHoldingsSnapshot(params: {
+  navUsd: number;
+  cashUsd: number;
+  positions: { symbol: string; qty: number }[];
+  prices: Map<string, number>;
+  targets: readonly { symbol: string; pct: number; sleeve: string }[];
+}): Snapshot {
+  const { navUsd, cashUsd, positions, prices, targets } = params;
+  return {
+    netLiquidation: navUsd,
+    cashValue: cashUsd,
+    holdings: targets.map(t => {
+      const pos = positions.find(p => p.symbol === t.symbol);
+      const price = prices.get(t.symbol) || 0;
+      const currentValue = pos ? pos.qty * price : 0;
+      const currentPct = navUsd > 0 ? (currentValue / navUsd) * 100 : 0;
+      return {
+        symbol: t.symbol,
+        sleeve: t.sleeve,
+        targetPct: t.pct,
+        currentPct: Math.round(currentPct * 10) / 10,
+        currentValue: Math.round(currentValue * 100) / 100,
+      };
+    }),
+  };
+}
 
 async function run(): Promise<void> {
   log('Fund oversight cycle starting', AGENT);
@@ -64,22 +116,16 @@ async function run(): Promise<void> {
       log(`Execution — Avg shortfall: ${avgBps.toFixed(1)} bps | Total cost: $${totalUsd.toFixed(2)} (${shortfallMetrics.length} fills)`, AGENT);
     }
 
-    // Build snapshot for the dashboard
-    const snapshot = {
-      netLiquidation: account.netLiquidation,
-      cashValue: account.totalCashValue,
-      holdings: TARGET_PORTFOLIO.map(t => {
-        const pos = account.positions.find((p: { symbol: string }) => p.symbol === t.symbol);
-        const price = prices.get(t.symbol) || 0;
-        const currentValue = pos ? pos.qty * price : 0;
-        const currentPct = account.netLiquidation > 0 ? (currentValue / account.netLiquidation) * 100 : 0;
-        return {
-          symbol: t.symbol, sleeve: t.sleeve, targetPct: t.pct,
-          currentPct: Math.round(currentPct * 10) / 10,
-          currentValue: Math.round(currentValue * 100) / 100,
-        };
-      }),
-    };
+    // Build snapshot for the dashboard — in USD, see buildHoldingsSnapshot.
+    const usd = await getUsdBalances();
+    log(`NAV(USD): $${usd.usdNav.toFixed(2)} | Cash(USD): $${usd.usdCash.toFixed(2)} [base NAV $${account.netLiquidation.toFixed(2)}]`, AGENT);
+    const snapshot = buildHoldingsSnapshot({
+      navUsd: usd.usdNav,
+      cashUsd: usd.usdCash,
+      positions: account.positions,
+      prices,
+      targets: TARGET_PORTFOLIO,
+    });
 
     mergeState({
       lastCheckAt: state.lastCheckAt,

@@ -48,8 +48,8 @@ persistent issues that restart can't fix.
 
 ```bash
 ssh your-pi
-cd ~/ibkr-fund && git pull
-cd ~/ibkr-fund/pi/watchdog && npm install
+cd ~/sovereign-ibkr-fund && git pull
+cd ~/sovereign-ibkr-fund/deploy/watchdog && npm install
 
 # Alerting — optional but recommended. Without it the watchdog restarts the
 # container silently and you never hear it happened.

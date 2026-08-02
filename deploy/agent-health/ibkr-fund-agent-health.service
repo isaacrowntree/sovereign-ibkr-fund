@@ -1,0 +1,17 @@
+[Unit]
+Description=IBKR fund — alert on failing/silent paperclip agents
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+# PAPERCLIP_DATABASE_URL + IBKR_FUND_ALERT_WEBHOOK
+EnvironmentFile=%h/sovereign-ibkr-fund/deploy/agent-health/.env
+# Runs inside the paperclip container: it has node 24 and the `postgres` driver,
+# and /fund-state (durable, outside deploy churn) for the dedupe state file.
+ExecStart=/usr/bin/docker exec -u node \
+  -e PAPERCLIP_DATABASE_URL \
+  -e IBKR_FUND_ALERT_WEBHOOK \
+  -e AGENT_HEALTH_STATE_DIR=/fund-state/state \
+  -w /paperclip/instances/default/projects/COMPANY_ID/PROJECT_ID/sovereign-ibkr-fund \
+  paperclip node deploy/agent-health/check.mjs

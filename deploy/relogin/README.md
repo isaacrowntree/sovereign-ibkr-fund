@@ -58,14 +58,14 @@ These commands assume you're running as `pi` on the Pi (`your-pi`).
 
 ```bash
 ssh your-pi
-cd ~ && git clone https://github.com/isaacrowntree/ibkr-fund.git
+cd ~ && git clone https://github.com/isaacrowntree/sovereign-ibkr-fund.git
 ```
 
 ### 2. Install runtime dependencies
 
 ```bash
 ssh your-pi
-cd ~/ibkr-fund/pi/relogin
+cd ~/sovereign-ibkr-fund/deploy/relogin
 npm install
 npm run install-browsers   # downloads Chromium (~150 MB)
 ```
@@ -77,7 +77,7 @@ If `playwright install` complains about missing system libs, run
 
 ```bash
 ssh your-pi
-cd ~/ibkr-fund/pi/relogin
+cd ~/sovereign-ibkr-fund/deploy/relogin
 cp .env.example .env
 chmod 600 .env
 $EDITOR .env   # fill IBKR_USERNAME and IBKR_PASSWORD
@@ -91,8 +91,8 @@ also override `BEZANT_LOGIN_URL` here.
 ```bash
 ssh your-pi
 mkdir -p ~/.config/systemd/user
-cp ~/ibkr-fund/pi/relogin/systemd/ibkr-fund-relogin.service ~/.config/systemd/user/
-cp ~/ibkr-fund/pi/relogin/systemd/ibkr-fund-relogin.timer ~/.config/systemd/user/
+cp ~/sovereign-ibkr-fund/deploy/relogin/systemd/ibkr-fund-relogin.service ~/.config/systemd/user/
+cp ~/sovereign-ibkr-fund/deploy/relogin/systemd/ibkr-fund-relogin.timer ~/.config/systemd/user/
 systemctl --user daemon-reload
 systemctl --user enable --now ibkr-fund-relogin.timer
 ```

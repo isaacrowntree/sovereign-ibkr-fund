@@ -1,0 +1,11 @@
+[Unit]
+Description=Check paperclip agent health hourly
+
+[Timer]
+# Hourly: fast enough to catch a break within one 4h cycle, slow enough that the
+# set-based dedupe in check.mjs keeps it quiet when nothing changes.
+OnCalendar=*-*-* *:07:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

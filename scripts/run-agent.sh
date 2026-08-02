@@ -10,6 +10,15 @@
 # a fresh clone the script just failed; worse, on a host where dist/ had been
 # built once, a pull would update src/ and leave dist/ stale — silently running
 # OLD code against a real account. So: build when the source is newer.
+#
+# PREBUILT HOSTS (e.g. the Pi): some hosts cannot build this repo at all — the
+# bezant-client git dep needs a `prepare` step that fails there, so `pnpm
+# install` can never provide typescript. Those hosts get dist/ pushed to them
+# from a workstation (scripts/deploy-to-pi.sh) and must NEVER try to build.
+# Marked by a `.prebuilt` file in the repo root (or IBKR_FUND_PREBUILT=1).
+# On such a host we also skip `git pull`: pulling would advance src/ without
+# advancing the pushed dist/, which is exactly the stale-code trap below.
+# The staleness check still applies — it just fails loudly instead of building.
 set -euo pipefail
 
 AGENT="${1:?Usage: run-agent.sh <agent-name>}"
@@ -17,9 +26,16 @@ SCRIPT="dist/agents/${AGENT}.js"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$DIR"
 
+PREBUILT=0
+if [ -f .prebuilt ] || [ "${IBKR_FUND_PREBUILT:-}" = "1" ]; then
+  PREBUILT=1
+fi
+
 # Pull latest source. Best-effort: a network blip must not stop a scheduled run
-# from executing the code already on disk.
-git pull -q 2>/dev/null || true
+# from executing the code already on disk. Skipped on prebuilt hosts (see above).
+if [ "$PREBUILT" = 0 ]; then
+  git pull -q 2>/dev/null || true
+fi
 
 # pnpm, not npm: pnpm-lock.yaml is the committed lockfile, and npm below 11.13
 # cannot parse the `#path:` fragment in the bezant-client dep. Resolved lazily —
@@ -38,12 +54,40 @@ pnpm_bin() {
   return 1
 }
 
+# Freshness contract lives in one place so deploy + runtime cannot drift.
+. "$DIR/scripts/fingerprint.sh"
+
 need_build=0
-if [ ! -f dist/index.js ] || [ -n "$(find src -name '*.ts' -newer dist/index.js -print -quit 2>/dev/null)" ]; then
+if [ "$PREBUILT" = 1 ]; then
+  # Content contract: dist/.build-stamp records the fingerprint deploy-to-pi.sh
+  # built from. Mismatch => the tree changed since the last deploy.
+  if [ ! -f dist/index.js ] || [ ! -f dist/.build-stamp ]; then
+    need_build=1
+  elif [ "$(source_fingerprint)" != "$(grep '^fingerprint=' dist/.build-stamp 2>/dev/null | cut -d= -f2)" ]; then
+    need_build=1
+  fi
+elif [ ! -f dist/index.js ] || [ -n "$(find src -name '*.ts' -newer dist/index.js -print -quit 2>/dev/null)" ]; then
   need_build=1
 fi
 
-if [ ! -d node_modules ] || [ "$need_build" = 1 ]; then
+if [ "$PREBUILT" = 1 ]; then
+  # Never build here. Refuse to run rather than execute stale code against a
+  # real account — the operator must redeploy from their workstation.
+  if [ "$need_build" = 1 ]; then
+    echo "[run-agent] FATAL: this host is marked .prebuilt and dist/ does not match src/." >&2
+    if [ ! -f dist/index.js ]; then
+      echo "[run-agent] dist/index.js is missing entirely." >&2
+    elif [ ! -f dist/.build-stamp ]; then
+      echo "[run-agent] dist/.build-stamp is missing — deployed by an older script?" >&2
+    else
+      echo "[run-agent] built from : $(grep '^fingerprint=' dist/.build-stamp | cut -d= -f2)" >&2
+      echo "[run-agent] tree is now: $(source_fingerprint)" >&2
+      echo "[run-agent] $(grep '^rev=' dist/.build-stamp 2>/dev/null)" >&2
+    fi
+    echo "[run-agent] Redeploy from your workstation: scripts/deploy-to-pi.sh" >&2
+    exit 1
+  fi
+elif [ ! -d node_modules ] || [ "$need_build" = 1 ]; then
   PM="$(pnpm_bin)" || {
     echo "[run-agent] FATAL: need to $( [ -d node_modules ] || echo 'install deps'; [ "$need_build" = 1 ] && echo 'rebuild' ) but pnpm is unavailable." >&2
     echo "[run-agent] install it with: corepack enable pnpm" >&2

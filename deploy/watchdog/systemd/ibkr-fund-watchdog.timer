@@ -1,6 +1,6 @@
 [Unit]
 Description=Probe bezant /health and restart container if wedged
-Documentation=https://github.com/isaacrowntree/ibkr-fund/tree/master/pi/watchdog
+Documentation=https://github.com/isaacrowntree/sovereign-ibkr-fund/tree/main/deploy/watchdog
 
 [Timer]
 # Fire 90s after boot (after bezant has had time to come up + relogin's

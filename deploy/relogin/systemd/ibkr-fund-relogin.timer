@@ -1,6 +1,6 @@
 [Unit]
 Description=Probe bezant-server every 5 min and re-login to IBKR if expired
-Documentation=https://github.com/isaacrowntree/ibkr-fund/tree/master/pi/relogin
+Documentation=https://github.com/isaacrowntree/sovereign-ibkr-fund/tree/main/deploy/relogin
 
 [Timer]
 # Fire 2 min after boot to give bezant-server / cloudflared time to settle,

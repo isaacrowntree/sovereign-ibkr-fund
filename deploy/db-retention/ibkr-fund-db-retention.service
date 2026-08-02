@@ -1,0 +1,13 @@
+[Unit]
+Description=paperclip DB retention — redact old heartbeat_runs blobs
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/sovereign-ibkr-fund/deploy/db-retention/.env
+ExecStart=/usr/bin/docker exec -u node \
+  -e PAPERCLIP_DATABASE_URL \
+  -e RETENTION_DAYS \
+  -w /paperclip/instances/default/projects/COMPANY_ID/PROJECT_ID/sovereign-ibkr-fund \
+  paperclip node deploy/db-retention/prune.mjs
