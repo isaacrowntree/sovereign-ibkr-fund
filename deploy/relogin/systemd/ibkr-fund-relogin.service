@@ -14,8 +14,21 @@ StandardError=journal
 # Don't restart automatically — the timer handles cadence and the script
 # self-disables after MAX_CONSECUTIVE_FAILURES.
 Restart=no
-# Bound the worst-case run (30s silent recovery + 2-min IB Key wait + slack)
-TimeoutStartSec=240
+# Bound the worst-case run. Budget it against the LONGEST path through
+# index.ts, which is the wedged-gateway retry — it performs a second full
+# credential login after bouncing bezant:
+#   ~30s  silent recovery (2 rungs x 15s)
+#   ~10s  browser launch + nav
+#   120s  IB Key wait (POST_LOGIN_TIMEOUT_MS), attempt 1
+#   ~60s  bezant restart + health poll
+#   120s  IB Key wait, attempt 2
+#   ~10s  teardown + disable alert
+# = ~350s. At 240 systemd SIGTERMd that path mid-retry, Playwrights browser
+# died under it, and the run was scored a genuine auth failure -> self-disable
+# -> fund logged out from 2026-08-20 22:22 until a manual reset on 08-24.
+# The script also enforces its own RUN_DEADLINE_MS below this, so it finishes
+# on its own terms and this is only a backstop.
+TimeoutStartSec=420
 
 [Install]
 WantedBy=default.target

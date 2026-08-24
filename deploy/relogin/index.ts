@@ -402,11 +402,81 @@ async function restartBezant(): Promise<boolean> {
   return false;
 }
 
+// ---------- termination-safe finalisation ----------
+
+/**
+ * Self-imposed ceiling on a whole run, kept BELOW the unit's TimeoutStartSec
+ * (420s) so we always finish on our own terms. When systemd is the one to call
+ * time, it SIGTERMs mid-flight: Playwright's browser is torn down under the
+ * login, the outcome is misrecorded as a generic `error`, and — because
+ * MAX_CONSECUTIVE_FAILURES is 1 — the fund parks itself until a human taps a
+ * push. That is exactly how 2026-08-20 turned a recoverable wedge into a
+ * 3.5-day outage.
+ */
+const RUN_DEADLINE_MS = 380_000;
+
+let finalized = false;
+let activeState: KeepaliveState | null = null;
+
+/**
+ * Record a failed attempt and, at the threshold, disable + alert. Safe to call
+ * from a signal handler: it is idempotent, and it awaits the webhook so the
+ * alert actually leaves the process before we exit. systemd allows
+ * TimeoutStopSec (90s by default) between SIGTERM and SIGKILL, which is ample
+ * for alert()'s 8s budget.
+ */
+async function finalizeFailure(outcome: LoginOutcome | 'terminated', reason: string): Promise<void> {
+  if (finalized) return;
+  finalized = true;
+
+  const state = activeState ?? (await loadState());
+  state.consecutiveFailures += 1;
+
+  if (state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+    await setDisabled();
+    log(
+      `Hit ${MAX_CONSECUTIVE_FAILURES} consecutive failure(s) (last outcome: ${outcome}) — ` +
+        `disabling further automatic attempts. Manual reset required (see top-of-file comment).`,
+    );
+    await alert(
+      `IBKR re-login failed (${outcome}: ${reason}) — auto-relogin is now DISABLED and the fund ` +
+        `is logged out. Reset when you can tap an IB Key push:\n` +
+        `ssh your-pi 'rm -f ~/.local/state/bezant-relogin/disabled && systemctl --user start ibkr-fund-relogin.service'`,
+    );
+  }
+
+  await saveState(state);
+}
+
+async function finalizeSuccess(): Promise<void> {
+  if (finalized) return;
+  finalized = true;
+
+  const state = activeState ?? (await loadState());
+  state.consecutiveFailures = 0;
+  state.lastSuccessAt = new Date().toISOString();
+  await saveState(state);
+}
+
+/** Bail out cleanly on a signal or our own deadline, with state + alert flushed. */
+function installTerminationHandlers(): void {
+  const bail = (reason: string) => {
+    log(`Run cut short (${reason}) — recording the attempt before exiting.`);
+    void finalizeFailure('terminated', reason).finally(() => process.exit(1));
+  };
+
+  process.on('SIGTERM', () => bail('SIGTERM — likely systemd TimeoutStartSec'));
+  process.on('SIGINT', () => bail('SIGINT'));
+  setTimeout(() => bail(`self-imposed ${RUN_DEADLINE_MS / 1000}s run deadline`), RUN_DEADLINE_MS).unref();
+}
+
 async function main(): Promise<void> {
   if (!USERNAME || !PASSWORD) {
     log('FATAL: IBKR_USERNAME or IBKR_PASSWORD not set in .env');
     process.exit(2);
   }
+
+  installTerminationHandlers();
 
   if (await isDisabled()) {
     log('disabled sentinel present — exiting. Reset with: rm ~/.local/state/bezant-relogin/disabled');
@@ -428,14 +498,13 @@ async function main(): Promise<void> {
 
   const state = await loadState();
   state.lastAttemptAt = new Date().toISOString();
+  activeState = state;
 
   // Most "unhealthy" ticks are a dropped iserver session with a live SSO
   // session behind it — recoverable in place, with no push. Only escalate to
   // a credential login (and a phone buzz) once that has actually failed.
   if (await trySilentRecovery(silentRecoveryDeps())) {
-    state.consecutiveFailures = 0;
-    state.lastSuccessAt = new Date().toISOString();
-    await saveState(state);
+    await finalizeSuccess();
     process.exit(0);
   }
 
@@ -464,26 +533,11 @@ async function main(): Promise<void> {
 
   const success = outcome === 'authenticated';
   if (success) {
-    state.consecutiveFailures = 0;
-    state.lastSuccessAt = new Date().toISOString();
+    await finalizeSuccess();
   } else {
-    state.consecutiveFailures += 1;
+    await finalizeFailure(outcome, 'login did not reach an authenticated session');
   }
 
-  if (!success && state.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-    await setDisabled();
-    log(
-      `Hit ${MAX_CONSECUTIVE_FAILURES} consecutive failure(s) (last outcome: ${outcome}) — ` +
-        `disabling further automatic attempts. Manual reset required (see top-of-file comment).`,
-    );
-    await alert(
-      `IBKR re-login failed (${outcome}) — auto-relogin is now DISABLED and the fund is logged out. ` +
-        `Reset when you can tap an IB Key push:\n` +
-        `ssh your-pi 'rm -f ~/.local/state/bezant-relogin/disabled && systemctl --user start ibkr-fund-relogin.service'`,
-    );
-  }
-
-  await saveState(state);
   process.exit(success ? 0 : 1);
 }
 
