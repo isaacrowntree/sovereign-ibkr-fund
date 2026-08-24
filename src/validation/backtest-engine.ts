@@ -43,13 +43,19 @@ export interface Position {
 export interface BacktestConfig {
   name: string;
   symbols?: string[];
-  optimizerMethod: 'hrp' | 'risk_parity' | 'black_litterman' | 'equal_weight' | 'buy_and_hold';
+  optimizerMethod: 'hrp' | 'risk_parity' | 'black_litterman' | 'equal_weight' | 'static' | 'buy_and_hold';
   rebalanceDriftPct: number;
   rebalanceFreqDays: number;
   drawdownLimits: { warningPct: number; deriskPct: number; hardStopPct: number };
   targetVol: number;
   maxLeverage: number;
   enableRegimeOverlay: boolean;
+  /** Daily samples required before the regime is known (mirrors quant-analyst's 200). */
+  regimeMinHistory?: number;
+  /** Exposure multiplier while the regime is unknown. */
+  unknownRegimeExposure?: number;
+  /** Model portfolio weights in `symbols` order; used by optimizerMethod 'static'. */
+  staticWeights?: number[];
   enableVolTargeting: boolean;
   lookbackDays: number;
   commissionPerTrade: number;
@@ -80,6 +86,8 @@ export interface BacktestResult {
   totalCommissions: number;
   regimeCounts: Record<string, number>;
   rebalanceCount: number;
+  /** Days spent halted at the drawdown hard stop (no orders generated). */
+  hardStopDays: number;
   dailyValues: number[];
   dailyReturns: number[];
   finalPositions: Position[];
@@ -93,7 +101,11 @@ let _cachedData: Record<string, DailyBar[]> | null = null;
 
 export function loadHistoricalData(): Record<string, DailyBar[]> {
   if (_cachedData) return _cachedData;
-  const dataPath = resolve(__dirname, 'data', 'historical-daily.json');
+  // BACKTEST_DATA_FILE lets a study point at a longer or differently-scoped
+  // dataset (e.g. one reaching back through a bear market) without disturbing
+  // the default file the test suites assert against.
+  const file = process.env.BACKTEST_DATA_FILE || 'historical-daily.json';
+  const dataPath = resolve(__dirname, 'data', file);
   _cachedData = JSON.parse(readFileSync(dataPath, 'utf8'));
   return _cachedData!;
 }
@@ -203,6 +215,7 @@ export function runBacktest(
   const dailyReturnsList: number[] = [];
   const regimeCounts: Record<string, number> = {};
   let rebalanceCount = 0;
+  let hardStopDays = 0;
   let lastRebalanceIdx = -Infinity;
   let peakValue = startingCapital;
 
@@ -212,6 +225,9 @@ export function runBacktest(
     driftThresholdPct: config.rebalanceDriftPct,
     minTradeUsd: 50,
     enableRegimeOverlay: config.enableRegimeOverlay,
+    regimeMinHistory: config.regimeMinHistory,
+    unknownRegimeExposure: config.unknownRegimeExposure,
+    staticWeights: config.staticWeights,
     enableVolTargeting: config.enableVolTargeting,
     targetVol: config.targetVol,
     maxLeverage: config.maxLeverage,
@@ -288,8 +304,16 @@ export function runBacktest(
     if (optimSymbols.length < 2 || returnsMatrix[0].length < 30) continue;
 
     // Use shared module for weight computation (computes covariance internally)
+    // Static weights must be re-indexed to optimSymbols, which can be a subset
+    // (a symbol with no data yet is excluded), or the mapping silently shifts.
+    const staticForActive = rebalParams.staticWeights
+      ? optimSymbols.map(s => {
+          const i = symbols.indexOf(s);
+          return i >= 0 ? (rebalParams.staticWeights as number[])[i] ?? 0 : 0;
+        })
+      : undefined;
     const { weights: rawWeights, source: weightSource, covMatrix } = computeTargetWeights(
-      returnsMatrix, optimSymbols, priceArrays, rebalParams.optimizerMethod,
+      returnsMatrix, optimSymbols, priceArrays, rebalParams.optimizerMethod, undefined, staticForActive,
     );
     if (covMatrix.length === 0) continue;
 
@@ -300,17 +324,21 @@ export function runBacktest(
 
     if (regime) regimeCounts[regime] = (regimeCounts[regime] ?? 0) + 1;
 
-    // Hard stop: liquidate all
+    // Hard stop: HALT, do not liquidate.
+    //
+    // This used to sell the entire book and `continue`. That was both unlike
+    // production and unrecoverable. Unlike production because
+    // portfolio-strategist at 'stopped' declines to GENERATE ORDERS and holds
+    // what it has — "halt + manual review", not "sell everything" (the code
+    // there says so explicitly, since a stale liquidation queue executing after
+    // the level relaxes is its own hazard). Unrecoverable because peakValue
+    // never resets: once the book was cash, NAV went flat, the drawdown against
+    // the old peak stayed above the threshold forever, and the run was frozen
+    // for its remaining years. That silently produced a 19.6% full-period return
+    // for any config whose drawdown touched hardStopPct — read as a catastrophic
+    // strategy result when it was an artefact of the harness.
     if (drawdown.level === 'stopped') {
-      for (const pos of positions) {
-        if (pos.shares > 0) {
-          const price = prices.get(pos.symbol) ?? 0;
-          cash += pos.shares * price - config.commissionPerTrade;
-          trades.push({ day: dayIdx, date, symbol: pos.symbol, action: 'SELL', shares: pos.shares, price, commission: config.commissionPerTrade, reason: `Hard stop: drawdown ${drawdown.drawdownPct.toFixed(1)}%` });
-          pos.shares = 0;
-        }
-      }
-      positions = positions.filter(p => p.shares > 0);
+      hardStopDays++;
       continue;
     }
 
@@ -402,7 +430,7 @@ export function runBacktest(
     annualizedReturn: Math.round(annualizedReturn * 100) / 100,
     maxDrawdownPct: Math.round(maxDD * 100) / 100,
     sharpeRatio: Math.round(sharpe * 100) / 100,
-    trades, totalCommissions, regimeCounts, rebalanceCount, dailyValues,
+    trades, totalCommissions, regimeCounts, rebalanceCount, hardStopDays, dailyValues,
     dailyReturns: dailyReturnsList, finalPositions: positions,
     var95: Math.round(var95 * 100) / 100,
     cvar95: Math.round(cvar95 * 100) / 100,

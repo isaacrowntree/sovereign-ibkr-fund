@@ -23,8 +23,12 @@ const SYMBOLS = [
   'XLE',   // Energy
 ];
 
-// ARM IPO'd Sep 14, 2023 — start from Oct 1, 2023 for all
-const START_DATE = new Date('2023-10-01');
+// ARM IPO'd Sep 14, 2023 — start from Oct 1, 2023 for all. Overridable, because
+// that IPO is the ONLY reason the default sample is short, and the default sample
+// therefore contains no bear market. Dropping ARM reaches back to 2020-10 (the
+// 2022 drawdown); dropping ARM and PLTR reaches 2019-10 (COVID as well). Any
+// conclusion about drawdown behaviour needs one of those windows.
+const START_DATE = new Date(process.env.FETCH_START || '2023-10-01');
 const END_DATE = new Date(); // today
 
 interface DailyBar {
@@ -106,7 +110,7 @@ async function main() {
   }
 
   // Write combined file
-  const outPath = resolve(dataDir, 'historical-daily.json');
+  const outPath = resolve(dataDir, process.env.FETCH_OUT || 'historical-daily.json');
   writeFileSync(outPath, JSON.stringify(allData, null, 2));
   console.log(`\nWritten to ${outPath}`);
   console.log(`Total size: ${(JSON.stringify(allData).length / 1024).toFixed(0)} KB`);

@@ -102,6 +102,36 @@ export const config = {
      * would generate a huge share quantity).
      */
     maxPriceMovePct: parseFloat(process.env.MAX_PRICE_MOVE_PCT || '30'),
+    /**
+     * Max age of quant-analyst's market data before order generation is refused.
+     * The agent is scheduled every 4h, so 12h means three consecutive misses —
+     * comfortably past a transient gateway failure, well short of a day's drift.
+     */
+    maxQuantAgeMs: parseFloat(process.env.MAX_QUANT_AGE_HOURS || '12') * 3_600_000,
+    /**
+     * Max calendar days between the newest stored trading day and now.
+     *
+     * 6, not 5: the worst legitimate gap is a Thursday-and-Friday market closure,
+     * where the newest trading day is Wednesday and the next run is the following
+     * Monday — 5 whole days PLUS however many hours into Monday the run lands. A
+     * limit of 5 clips that and false-fires on a real holiday week.
+     *
+     * This is the secondary check. A dead quant-analyst is caught by
+     * maxQuantAgeMs within 12h regardless; this one exists for the subtler case
+     * where the agent runs fine but stores nothing new.
+     */
+    maxHistoryGapDays: parseFloat(process.env.MAX_HISTORY_GAP_DAYS || '6'),
+  },
+  /** Thresholds for the reconciler's model-conformance check. */
+  conformance: {
+    /** Alert when a single holding deviates from its model weight by more (pp). */
+    maxNameDeviationPct: parseFloat(process.env.CONFORMANCE_MAX_NAME_PCT || '10'),
+    /**
+     * Alert when a whole sleeve deviates by more (pp). Sleeve level is what
+     * catches the 2026-08-18 shape: no single name looked extreme, but
+     * tech_growth had been cut from 37% to ~21%.
+     */
+    maxSleeveDeviationPct: parseFloat(process.env.CONFORMANCE_MAX_SLEEVE_PCT || '15'),
   },
   risk: {
     targetVol: parseFloat(process.env.TARGET_VOL || '0.20'),
@@ -111,7 +141,13 @@ export const config = {
     drawdownHardStopPct: parseFloat(process.env.DD_HARD_STOP || '25'),
   },
   strategy: {
-    optimizer: (process.env.OPTIMIZER || 'hrp') as 'hrp' | 'black_litterman' | 'equal_weight',
+    /**
+     * 'static' targets the model portfolio's own weights and runs no optimizer.
+     * It is the honest way to say "hold the deliberate allocation" — previously
+     * that could only be expressed by setting HRP_MIN_DAYS absurdly high to jam
+     * the gate shut, which read as a broken optimizer rather than a choice.
+     */
+    optimizer: (process.env.OPTIMIZER || 'hrp') as 'hrp' | 'black_litterman' | 'equal_weight' | 'static',
     lookbackDays: parseInt(process.env.LOOKBACK_DAYS || '180', 10),
     enableRegimeOverlay: process.env.ENABLE_REGIME !== 'false',
     enableVolTargeting: process.env.ENABLE_VOL_TARGET !== 'false',

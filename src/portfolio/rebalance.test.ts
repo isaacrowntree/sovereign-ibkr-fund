@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { generateRebalanceOrders, decideRebalance, type PortfolioSnapshot } from './rebalance';
+import { generateRebalanceOrders, decideRebalance, computeExposure, computeTargetWeights, type PortfolioSnapshot, type RebalanceParams } from './rebalance';
 
 const PRICE = 100;
 
@@ -476,5 +476,77 @@ describe('decideRebalance', () => {
     expect(decideRebalance(15, Infinity, cfg)).toBe('regular');
     expect(decideRebalance(40, Infinity, cfg)).toBe('urgent');
     expect(decideRebalance(5, Infinity, cfg)).toBe('within-threshold');
+  });
+});
+
+describe('computeExposure — unknown regime', () => {
+  // 120 rising days across two assets, enough for the regime signals to compute.
+  const series = (base: number) => Array.from({ length: 120 }, (_, i) => base * (1 + i * 0.001));
+  const priceArrays = [series(100), series(50)];
+  const cov = [[1e-4, 2e-5], [2e-5, 1e-4]];
+  const base: RebalanceParams = {
+    optimizerMethod: 'hrp',
+    driftThresholdPct: 5,
+    minTradeUsd: 50,
+    enableRegimeOverlay: true,
+    enableVolTargeting: false,
+    targetVol: 0.2,
+    maxLeverage: 1,
+    drawdownLimits: { warningPct: 10, deriskPct: 15, hardStopPct: 25 },
+  };
+
+  it('omitting the new params preserves the legacy always-known behaviour', () => {
+    const r = computeExposure(priceArrays, cov, [], 100_000, 100_000, base);
+    expect(r.regime).not.toBeNull();
+  });
+
+  it('reports the regime as UNKNOWN below the history gate', () => {
+    // Mirrors quant-analyst: it publishes null until it holds 200 daily samples.
+    const r = computeExposure(priceArrays, cov, [], 100_000, 100_000, {
+      ...base, regimeMinHistory: 200,
+    });
+    expect(r.regime).toBeNull();
+  });
+
+  it('applies the configured multiplier while the regime is unknown', () => {
+    const open = computeExposure(priceArrays, cov, [], 100_000, 100_000, {
+      ...base, regimeMinHistory: 200,
+    });
+    const guarded = computeExposure(priceArrays, cov, [], 100_000, 100_000, {
+      ...base, regimeMinHistory: 200, unknownRegimeExposure: 0.85,
+    });
+    // The default is 1.0 — i.e. the overlay currently fails OPEN, treating
+    // "we have no idea" as "fully risk-on". This test pins that so the
+    // behaviour cannot change silently.
+    expect(open.exposure).toBeCloseTo(1.0, 6);
+    expect(guarded.exposure).toBeCloseTo(0.85, 6);
+  });
+});
+
+describe('computeTargetWeights — static', () => {
+  const returns = [
+    [0.01, -0.02, 0.03, 0.01, -0.01, 0.02, 0.00, 0.01, -0.01, 0.02],
+    [0.02, -0.01, 0.01, 0.02, -0.02, 0.01, 0.01, 0.00, -0.02, 0.01],
+  ];
+  const prices = [[10, 11, 12, 11, 12, 13, 12, 13, 14, 13], [20, 21, 22, 21, 22, 23, 22, 23, 24, 23]];
+
+  it('targets the supplied model weights, normalised', () => {
+    const r = computeTargetWeights(returns, ['A', 'B'], prices, 'static', undefined, [30, 10]);
+    expect(r.source).toBe('static');
+    expect(r.weights[0]).toBeCloseTo(0.75, 6);
+    expect(r.weights[1]).toBeCloseTo(0.25, 6);
+  });
+
+  it('still returns a covariance matrix', () => {
+    // Returning [] made the backtest engine `continue` on every day, silently
+    // turning a static-rebalance run into a no-trade buy-and-hold with no error.
+    const r = computeTargetWeights(returns, ['A', 'B'], prices, 'static', undefined, [50, 50]);
+    expect(r.covMatrix.length).toBe(2);
+  });
+
+  it('falls back to equal weight if no static weights are supplied', () => {
+    const r = computeTargetWeights(returns, ['A', 'B'], prices, 'static');
+    expect(r.source).toContain('no static weights');
+    expect(r.weights).toEqual([0.5, 0.5]);
   });
 });

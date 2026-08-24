@@ -22,7 +22,15 @@ import { covToCorr } from './covariance.js';
 
 // ---------- Types ----------
 
-export type OptimizerMethod = 'hrp' | 'risk_parity' | 'black_litterman' | 'equal_weight';
+/**
+ * `static` is not an optimizer — it targets the model portfolio's own weights.
+ * It exists so the allocation the fund ACTUALLY runs is expressible here: every
+ * comparison in src/validation previously had to approximate it as buy-and-hold
+ * (never rebalancing) or equal-weight, neither of which is what the strategist
+ * does. It also replaces the HRP_MIN_DAYS=999999 workaround as the honest way to
+ * say "do not optimize, hold the deliberate allocation".
+ */
+export type OptimizerMethod = 'hrp' | 'risk_parity' | 'black_litterman' | 'equal_weight' | 'static';
 
 export interface RebalanceParams {
   optimizerMethod: OptimizerMethod;
@@ -33,6 +41,15 @@ export interface RebalanceParams {
   targetVol: number;
   maxLeverage: number;
   drawdownLimits: DrawdownLimits;
+  /**
+   * Daily samples required before a regime is considered known. Matches
+   * quant-analyst's `>= 200` gate. 0 keeps the legacy always-known behaviour.
+   */
+  regimeMinHistory?: number;
+  /** Exposure multiplier applied while the regime is UNKNOWN. */
+  unknownRegimeExposure?: number;
+  /** Model portfolio weights, in `symbols` order. Required by optimizerMethod 'static'. */
+  staticWeights?: number[];
 }
 
 export interface PortfolioSnapshot {
@@ -71,6 +88,8 @@ export function computeTargetWeights(
   priceArrays: number[][],
   method: OptimizerMethod,
   precomputedCov?: number[][],
+  /** Required by `static`: the model portfolio weight per symbol, same order. */
+  staticWeights?: number[],
 ): { weights: number[]; source: string; covMatrix: number[][] } {
   const n = symbols.length;
   if (n === 0) return { weights: [], source: 'empty', covMatrix: [] };
@@ -85,6 +104,23 @@ export function computeTargetWeights(
     const { shrunk } = ledoitWolfShrinkage(aligned);
     covMatrix = shrunk;
   }
+  // `static` still returns the covariance it computed above. It does not NEED it
+  // to pick weights, but callers do: the backtest engine skips any day where the
+  // covariance is empty, and computeExposure derives the regime's correlation
+  // signal from it. Returning [] here silently turned every static run into a
+  // no-trade buy-and-hold — identical numbers, no error.
+  if (method === 'static') {
+    if (!staticWeights || staticWeights.length !== n) {
+      return { weights: new Array(n).fill(1 / n), source: 'equal_weight (no static weights supplied)', covMatrix };
+    }
+    const sum = staticWeights.reduce((a, b) => a + b, 0);
+    return {
+      weights: sum > 0 ? staticWeights.map(w => w / sum) : new Array(n).fill(1 / n),
+      source: 'static',
+      covMatrix,
+    };
+  }
+
   if (covMatrix.length === 0) return { weights: new Array(n).fill(1 / n), source: 'equal_weight (fallback)', covMatrix: [] };
 
   switch (method) {
@@ -134,7 +170,19 @@ export function computeExposure(
 
   let regimeMult = 1.0;
   let regime: RegimeState | null = null;
-  if (params.enableRegimeOverlay && priceArrays.length > 0) {
+  // Mirror the LIVE gate: quant-analyst only publishes a regime once it holds
+  // `regimeMinHistory` daily samples, and writes null below that. Without this the
+  // backtest always has a regime and is therefore systematically more optimistic
+  // than production, which is exactly the blind spot being measured here.
+  const minHist = params.regimeMinHistory ?? 0;
+  const haveHist = priceArrays[0]?.length ?? 0;
+  const regimeKnown = params.enableRegimeOverlay && priceArrays.length > 0 && haveHist >= minHist;
+  if (params.enableRegimeOverlay && !regimeKnown) {
+    // Unknown is NOT the same as risk-on. Defaulting to 1.0 means the exposure
+    // overlay silently fails OPEN during every blind window.
+    regimeMult = params.unknownRegimeExposure ?? 1.0;
+  }
+  if (regimeKnown) {
     const avgPrices = priceArrays[0].map((_, i) => {
       let sum = 0;
       for (const pa of priceArrays) sum += (pa[i] ?? 0);

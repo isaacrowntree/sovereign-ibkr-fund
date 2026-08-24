@@ -11,6 +11,13 @@
 #   build this repo. It only ever runs what we push.
 #   bezant-client is `import type` only, so nothing needs it at runtime.
 #
+#   That blocks the DEV deps only. bezant-client is a devDependency, so
+#   `pnpm install --prod --frozen-lockfile` never fetches it and does work on
+#   the Pi — which is how the Pi gets its runtime deps (dotenv, @stoqey/ib).
+#   Those are NOT pushed by this script: node_modules is not rsynced, so a
+#   fresh clone has none and every agent dies on MODULE_NOT_FOUND. The verify
+#   step below asserts they are present rather than letting that reach runtime.
+#
 # Pairs with the `.prebuilt` marker in the Pi checkout, which makes
 # scripts/run-agent.sh skip `git pull` + the build and fail loudly if dist/
 # is ever older than src/ (i.e. if someone pulled without redeploying).
@@ -144,6 +151,21 @@ echo "[deploy] verifying (running the Pi's own freshness check)"
 ssh "$HOST" "cd '$REMOTE' && \
   test -f .prebuilt || { echo '[deploy] FAIL: .prebuilt missing'; exit 1; }; \
   test -f dist/.build-stamp || { echo '[deploy] FAIL: no build stamp landed'; exit 1; }; \
+  test -d node_modules/dotenv || { \
+     echo '[deploy] FAIL: runtime deps missing on the host (no node_modules/dotenv).'; \
+     echo '[deploy] node_modules is never rsynced, so a fresh clone has none.'; \
+     echo '[deploy] Fix on the host, in the container, from the repo root:'; \
+     echo '[deploy]   pnpm install --prod --frozen-lockfile'; \
+     echo '[deploy] (--prod skips the bezant-client git dep, which cannot build there.)'; \
+     exit 1; }; \
+  test -f src/portfolios/local.ts || { \
+     echo '[deploy] FAIL: src/portfolios/local.ts is missing on the host.'; \
+     echo '[deploy] That file is the REAL production book. It is gitignored AND'; \
+     echo '[deploy] excluded from this rsync, so a re-clone loses it silently and'; \
+     echo '[deploy] portfolios/index.ts falls back to SAMPLE_PORTFOLIO — i.e. it'; \
+     echo '[deploy] would rebalance a live account toward a sample allocation.'; \
+     echo '[deploy] Copy it across by hand, then redeploy.'; \
+     exit 1; }; \
   remote_fp=\$(sh -c '. ./scripts/fingerprint.sh; source_fingerprint'); \
   stamped=\$(grep '^fingerprint=' dist/.build-stamp | cut -d= -f2); \
   if [ \"\$remote_fp\" != \"\$stamped\" ]; then \

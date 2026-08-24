@@ -16,7 +16,7 @@ import {
 } from '../portfolio/rebalance.js';
 import { regimeExposure, type RegimeState } from '../quant/regime.js';
 import { drawdownExposureMultiplier, type DrawdownState } from '../risk/drawdown.js';
-import { navSanityViolation, priceSanityViolations } from '../risk/data-sanity.js';
+import { navSanityViolation, priceSanityViolations, marketDataFreshness } from '../risk/data-sanity.js';
 import { isStrategistWindow, describeWindow, STRATEGIST_WINDOW } from '../strategy/market-hours.js';
 import { loadState, mergeState } from '../state/store.js';
 import { notify } from '../notify/slack.js';
@@ -101,6 +101,45 @@ async function run(): Promise<void> {
       );
       return;
     }
+    // ── Market-data freshness gate ───────────────────────────────────────
+    // Ordering matters: this runs BEFORE the price sanity check below, because
+    // that check validates live quotes against `priceHistory`'s last element. If
+    // the history is stale, the sanity check is comparing today's prices to old
+    // ones — it stops being able to catch a bad tick exactly when it matters, and
+    // would itself start firing spuriously on legitimate multi-day moves.
+    const freshness = marketDataFreshness({
+      lastQuantAt: state.lastQuantAt as string | undefined,
+      priceHistoryDates: state.priceHistoryDates as string[] | undefined,
+      now: new Date(),
+      maxQuantAgeMs: config.dataSanity.maxQuantAgeMs,
+      maxHistoryGapDays: config.dataSanity.maxHistoryGapDays,
+    });
+    if (!freshness.fresh) {
+      log(`STALE MARKET DATA — skipping order generation: ${freshness.detail}`, AGENT);
+      mergeState({ lastStrategyAt: new Date().toISOString() });
+      await notify(
+        {
+          severity: 'warn',
+          title: 'Strategist skipped — market data is stale',
+          body:
+            `${freshness.detail}. No orders were generated and the existing queue is untouched. ` +
+            'Order sizing derives from quant-analyst\'s price history, so this blocks rather than ' +
+            'trades on a frozen covariance matrix. Check that quant-analyst is still running.',
+          fields: [
+            { label: 'Reason', value: freshness.reason },
+            { label: 'Last quant run', value: (state.lastQuantAt as string | undefined) ?? 'never' },
+          ],
+          agent: AGENT,
+          // Fingerprint on the REASON, not the age: the age changes every run, so
+          // a value-based fingerprint would never dedupe and this would alert on
+          // every 4h cycle instead of re-nagging on its ttl.
+          dedupe: { key: 'strategist:market-data-stale', fingerprint: freshness.reason },
+        },
+        storeHooks,
+      );
+      return;
+    }
+
     const lastPrices = new Map<string, number>(
       Object.entries((state.priceHistory as Record<string, number[]> | undefined) ?? {})
         .map(([s, arr]) => [s, arr[arr.length - 1]])
@@ -138,16 +177,54 @@ async function run(): Promise<void> {
     let targetWeights: number[] = TARGET_PORTFOLIO.map(t => t.pct / 100);
     let weightSource = 'static';
 
-    // HRP / Risk Parity / Black-Litterman gate. Minimum of 20 days (set down
-    // from 30 to let the algorithm fire sooner — when symbols are recently
-    // added, accumulating 30 days takes a full month). Below 60 we emit a
-    // visibility warning since covariance estimates on short windows are
-    // unstable. Proper fix: pre-seed price history from IBKR historical
-    // bars. Tracked separately.
-    const HRP_MIN_DAYS = parseInt(process.env.HRP_MIN_DAYS || '20', 10);
-    const HRP_STABLE_DAYS = parseInt(process.env.HRP_STABLE_DAYS || '60', 10);
+    // HRP / Risk Parity / Black-Litterman gate.
+    //
+    // The floor is the STABILITY floor, not a lower "minimum". It used to admit
+    // 20 days and merely LOG anything under 60 as `thin` — a warning that went to
+    // a log nobody reads while the weights it described moved a live book. On
+    // 2026-08-18 that rebalanced the real account off a covariance matrix built
+    // from ~6 calendar days of 4-hourly samples. Refusing is the safe direction:
+    // the static model portfolio is a deliberate allocation, so falling back to
+    // it is a real answer, not a degraded one.
+    //
+    // RANK_FLOOR is about ESTIMATION ERROR, not singularity. An earlier comment
+    // here claimed the covariance matrix would be singular and its inverse
+    // meaningless; that is wrong for the default optimizer. HRP never inverts the
+    // matrix (it clusters the correlation matrix and weights on inverse VARIANCE,
+    // i.e. the diagonal), and computeTargetWeights always applies Ledoit-Wolf
+    // shrinkage toward a scaled identity, which is non-singular by construction.
+    // Only black_litterman actually inverts. T = 2N is still a floor worth having
+    // — it is far below the conventional T >= 10N rule of thumb — but it is a
+    // backstop, not the binding constraint at default settings.
+    const envInt = (name: string, fallback: number): number => {
+      const raw = process.env[name];
+      if (raw === undefined || raw === '') return fallback;
+      const n = parseInt(raw, 10);
+      // A typo used to poison the gate silently: HRP_MIN_DAYS defaults to
+      // HRP_STABLE_DAYS, so one bad value made both NaN, and `>= NaN` is false
+      // forever — disabling the optimizer permanently with no error.
+      if (!Number.isFinite(n) || n < 0) {
+        log(`${name}='${raw}' is not a valid day count — using ${fallback}`, AGENT);
+        return fallback;
+      }
+      return n;
+    };
+    const HRP_STABLE_DAYS = envInt('HRP_STABLE_DAYS', 60);
+    const HRP_MIN_DAYS = envInt('HRP_MIN_DAYS', HRP_STABLE_DAYS);
+    const RANK_FLOOR = symbols.length * 2;
+    const requiredDays = Math.max(HRP_MIN_DAYS, RANK_FLOOR);
 
-    if (historicalReturns && historicalReturns.length >= 2 && historicalReturns[0].length >= HRP_MIN_DAYS) {
+    // The matrix dimension must match the symbol count, or targetWeightMap ends up
+    // with `undefined` for the unmatched names and computeDrift returns NaN — which
+    // decideRebalance reads as `within-threshold`, silently stopping drift-based
+    // rebalancing. Reachable between adding a holding and the next quant run.
+    const returnsMatchSymbols = historicalReturns?.length === symbols.length;
+    const observations = historicalReturns?.[0]?.length ?? 0;
+
+    if (config.strategy.optimizer === 'static') {
+      // No estimate required, so no gate applies: the model portfolio IS the target.
+      log(`Static model portfolio (${symbols.length} holdings) — optimizer disabled by config`, AGENT);
+    } else if (historicalReturns && returnsMatchSymbols && symbols.length >= 2 && observations >= requiredDays) {
       const priceHistory = state.priceHistory as Record<string, number[]> | undefined;
       const priceArrays = priceHistory
         ? symbols.map(s => priceHistory[s] || [])
@@ -159,15 +236,24 @@ async function run(): Promise<void> {
       targetWeights = result.weights;
       weightSource = result.source;
 
-      const days = historicalReturns[0].length;
-      const stability = days >= HRP_STABLE_DAYS
+      // Do not hardcode the word: with HRP_MIN_DAYS overridden below the stability
+      // floor this is the only signal that the estimate is still short.
+      const stability = observations >= HRP_STABLE_DAYS
         ? 'stable'
-        : `thin (only ${days}d, recommend >=${HRP_STABLE_DAYS}d for stable covariance)`;
-      log(`${weightSource} weights [${stability}]:`, AGENT);
+        : `THIN — under the ${HRP_STABLE_DAYS}d stability floor`;
+      log(`${weightSource} weights [${observations}d, ${stability}]:`, AGENT);
       symbols.forEach((s, i) => log(`  ${s}: ${(targetWeights[i] * 100).toFixed(1)}%`, AGENT));
+    } else if (historicalReturns && !returnsMatchSymbols) {
+      log(
+        `Return matrix covers ${historicalReturns.length} assets but the portfolio has ` +
+          `${symbols.length} — using static target weights until quant-analyst catches up.`,
+        AGENT,
+      );
     } else {
-      const haveDays = historicalReturns?.[0]?.length ?? 0;
-      log(`Insufficient historical data (${haveDays}/${HRP_MIN_DAYS} days) — using static target weights`, AGENT);
+      const detail = RANK_FLOOR > HRP_MIN_DAYS
+        ? `${observations}/${requiredDays} days (rank floor: ${symbols.length} assets need >=${RANK_FLOOR} observations)`
+        : `${observations}/${requiredDays} days`;
+      log(`Insufficient historical data — ${detail}. Using static target weights.`, AGENT);
     }
 
     // Apply regime exposure
@@ -323,13 +409,28 @@ async function run(): Promise<void> {
     }
 
     const updates: Record<string, unknown> = {
-      optimizedWeights: { hrp: targetWeights },
+      // Key by what actually produced these weights. Writing {hrp: ...}
+      // unconditionally meant a static fallback was stored under `hrp`, and
+      // risk-manager could no longer tell optimizer output from the fallback.
+      optimizedWeights: weightSource === 'static'
+        ? { static: targetWeights, hrp: null }
+        : { [weightSource]: targetWeights },
       lastStrategyAt: new Date().toISOString(),
       lastNavUsd: navUsd, // baseline for the next cycle's NAV-move sanity check
     };
     if (pendingOrders.length > 0) {
       updates.pendingOrders = pendingOrders;
-      updates.lastRebalanceAt = new Date().toISOString();
+      // Only a real rebalance restarts the frequencyDays cooldown. This used to
+      // fire for ANY order, including cash_flow_rebalance — which is buy-only
+      // (allocateCashFlow never sells). So a small cash deployment reset the
+      // 45-day clock on the only mechanism that can SELL an overweight, and
+      // because those buys grow the denominator they also push drift further
+      // below the threshold that would have triggered the sell. An overweight
+      // created by a bad rebalance could therefore become permanent, with the
+      // fund quietly buying around it forever.
+      if (decision === 'urgent' || decision === 'regular') {
+        updates.lastRebalanceAt = new Date().toISOString();
+      }
     }
     mergeState(updates);
 

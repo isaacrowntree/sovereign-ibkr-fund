@@ -21,7 +21,7 @@ import {
   getEventsStatus,
 } from '../observability/event-poller.js';
 import type { GapEvent, ObservedEvent } from '../observability/event-types.js';
-import { loadState, mergeState, type ObservedEventState } from '../state/store.js';
+import { loadState, mergeState, appendObservedEvents, type ObservedEventState } from '../state/store.js';
 import { notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
@@ -58,7 +58,9 @@ async function run(): Promise<RunResult> {
   log('Observer poll starting', AGENT);
   const state = loadState();
   const cursors = (state.observerCursors as Record<string, { cursor: number; resetEpoch: number; lastPolledAt?: string }>) ?? {};
-  const buffer = (state.observedEvents as ObservedEventState[]) ?? [];
+  // Only the NEW events for this poll. The history is no longer loaded, mutated
+  // and rewritten to append to it — see appendObservedEvents in state/store.ts.
+  const fresh: ObservedEventState[] = [];
 
   let totalEvents = 0;
   let gaps = 0;
@@ -71,7 +73,7 @@ async function run(): Promise<RunResult> {
       cursors[topic] = result.newCursor;
 
       if (result.gap) {
-        appendToBuffer(buffer, observedToState(result.gap));
+        fresh.push(observedToState(result.gap));
         gaps += 1;
         log(
           `GAP topic=${topic} reason=${result.gap.payload.reason} ` +
@@ -81,7 +83,7 @@ async function run(): Promise<RunResult> {
       }
 
       for (const evt of result.events) {
-        appendToBuffer(buffer, observedToState(evt));
+        fresh.push(observedToState(evt));
         totalEvents += 1;
         log(formatEvent(evt), AGENT);
       }
@@ -91,14 +93,12 @@ async function run(): Promise<RunResult> {
     }
   }
 
-  // Cap the ring.
-  while (buffer.length > OBSERVER_BUFFER_SIZE) {
-    buffer.shift();
-  }
-
+  // Two writes, deliberately: the cursors/timestamp are small and always change,
+  // while the events are appended only when there are any. A poll that finds
+  // nothing — the common case — now writes a few hundred bytes instead of 1.3MB.
+  appendObservedEvents(fresh, OBSERVER_BUFFER_SIZE);
   mergeState({
     observerCursors: cursors,
-    observedEvents: buffer,
     lastObserverAt: new Date().toISOString(),
   });
 

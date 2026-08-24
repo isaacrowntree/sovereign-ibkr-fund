@@ -24,8 +24,18 @@ _fp_hash() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi | cut -d' ' -f1
 }
 
+# src/validation/data/ is EXCLUDED. It holds gitignored Yahoo daily bars fetched
+# by `pnpm fetch-data` for the backtest suites — megabytes of market data that is
+# not a build input (the suites read it with readFileSync at runtime, and tsconfig
+# excludes *.test.ts from the build). Including it meant that merely RUNNING the
+# backtests on a workstation changed the source fingerprint, so the next deploy
+# stamped a hash the Pi could never reproduce — the tree does not rsync there —
+# and every agent hard-failed the prebuilt freshness check. That happened on
+# 2026-08-19. Deleting the data would have unblocked it; excluding it stops the
+# trap being re-armed by the next person who runs a backtest.
 _fp_files() {
-  find src -type f \( -name '*.ts' -o -name '*.json' \) ! -name '*.test.ts' 2>/dev/null | LC_ALL=C sort
+  find src -type f \( -name '*.ts' -o -name '*.json' \) ! -name '*.test.ts' \
+    ! -path 'src/validation/data/*' 2>/dev/null | LC_ALL=C sort
 }
 
 source_fingerprint() {

@@ -9,8 +9,9 @@ import { assessDrawdown, maxDrawdown, type DrawdownLimits, type DrawdownState } 
 import { ewmaVolatility, annualizeVol, volTargetLeverage } from '../risk/volatility.js';
 import { correlationStressTest } from '../risk/stress-test.js';
 import { sampleCovMatrix } from '../portfolio/covariance.js';
+import { marketDate } from '../quant/price-history.js';
 import { computeIntradayDrawdownFromEvents } from '../observability/intraday-pnl.js';
-import { loadState, mergeState, type ObservedEventState } from '../state/store.js';
+import { loadState, mergeState, loadObservedEvents, type ObservedEventState } from '../state/store.js';
 import { notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
@@ -49,6 +50,8 @@ export async function run(): Promise<void> {
     const prices = await getMarketPrices(symbols);
 
     const state = loadState();
+    // Set only when the stress test is genuinely recomputed this run.
+    let stressComputedAt: string | null = null;
     let navHistory = (state.navHistory || []) as number[];
     // Read before we overwrite it below — the recovery alert needs to know what
     // we're recovering FROM.
@@ -72,8 +75,32 @@ export async function run(): Promise<void> {
       }
     }
 
-    navHistory.push(account.netLiquidation);
+    // ONE SAMPLE PER TRADING DAY. This was `navHistory.push(...)` on every run —
+    // the identical run-vs-day conflation fixed in src/quant/price-history.ts, and
+    // missed here when that fix went in. At a 4h cadence it oversampled ~6x, so
+    // annualizeVol()'s sqrt(252) at :103 understated annualized vol by ~sqrt(6)
+    // (the live DB read realizedVol 4.35% for a 17-name single-stock book).
+    //
+    // The 500-entry cap made it worse than a reporting bug: at 6 samples/day it
+    // was a rolling ~83-day window, so `peak` below FORGOT any high-water mark
+    // older than that and the drawdown ladder under-triggered in a slow bear
+    // market. At one sample per day the same cap is ~2 years.
+    const navDate = marketDate();
+    const navDates = (state.navHistoryDates || []) as string[];
+    let dates = phantomReset ? [] : [...navDates];
+    if (navDate !== null) {
+      if (dates[dates.length - 1] !== navDate || navHistory.length === 0) {
+        navHistory.push(account.netLiquidation);
+        dates.push(navDate);
+      } else {
+        navHistory[navHistory.length - 1] = account.netLiquidation;
+      }
+    } else if (navHistory.length === 0) {
+      // Weekend with no history at all — seed one point so the peak exists.
+      navHistory.push(account.netLiquidation);
+    }
     if (navHistory.length > 500) navHistory.splice(0, navHistory.length - 500);
+    if (dates.length > 500) dates = dates.slice(-500);
 
     log(`NAV: $${account.netLiquidation.toFixed(2)}`, AGENT);
 
@@ -115,11 +142,22 @@ export async function run(): Promise<void> {
 
       // Correlation stress test using portfolio weights and covariance
       const historicalReturns = state.historicalReturns as number[][] | undefined;
-      const optimizedWeights = state.optimizedWeights as { hrp?: number[]; riskParity?: number[] } | undefined;
+      // Keyed by weightSource since 2026-08-19, so `static` appears here when the
+      // optimizer is gated off. Stress the weights the fund is ACTUALLY targeting
+      // — a static book is just as stressable, and reading only `hrp` meant the
+      // test silently stopped running whenever the gate closed.
       // Prefer HRP — backtest shows Risk Parity degenerates with high vol dispersion
-      const weights = optimizedWeights?.hrp || optimizedWeights?.riskParity;
+      const optimizedWeights = state.optimizedWeights as
+        { hrp?: number[] | null; riskParity?: number[] | null; static?: number[] | null } | undefined;
+      const weights = optimizedWeights?.hrp || optimizedWeights?.riskParity || optimizedWeights?.static;
 
-      if (historicalReturns && historicalReturns.length >= 2 && weights) {
+      // `historicalReturns.length` is the ASSET count, not the observation count —
+      // this used to build a 17x17 covariance from 3 observations, exactly the
+      // input portfolio-strategist now refuses.
+      const stressObs = historicalReturns?.[0]?.length ?? 0;
+      const STRESS_MIN_OBS = Math.max(30, symbols.length * 2);
+
+      if (historicalReturns && historicalReturns.length >= 2 && stressObs >= STRESS_MIN_OBS && weights) {
         const cov = sampleCovMatrix(historicalReturns);
         const stress = correlationStressTest(weights, cov, account.netLiquidation);
         log(`Stress test: baseline VaR $${stress.baselineVaR.toFixed(2)} → stressed VaR $${stress.stressedVaR.toFixed(2)} (corr=0.9)`, AGENT);
@@ -129,7 +167,7 @@ export async function run(): Promise<void> {
           baselineVaR: stress.baselineVaR,
           stressedVaR: stress.stressedVaR,
           portfolioValue: stress.portfolioValue,
-          timestamp: new Date().toISOString(),
+          timestamp: (stressComputedAt = new Date().toISOString()),
         };
       }
     }
@@ -137,7 +175,9 @@ export async function run(): Promise<void> {
     // WS-derived intraday drawdown enrichment. Only used when the
     // observer agent has been populating state.observedEvents — when
     // empty, we fall back to the snapshot-based DD above.
-    const observed = (state.observedEvents as ObservedEventState[] | undefined) ?? [];
+    // Rows now, and only the topic this needs — previously it deserialised the
+    // entire 1.3MB history to filter for 'pnl'.
+    const observed = loadObservedEvents({ topic: 'pnl' });
     if (observed.length > 0) {
       const sessionStart = new Date();
       sessionStart.setUTCHours(13, 30, 0, 0); // 09:30 ET as a reasonable session anchor
@@ -202,8 +242,20 @@ export async function run(): Promise<void> {
       navHistory,
       lastRiskAt: new Date().toISOString(),
     };
+    updates.navHistoryDates = dates;
     if (state.riskMetrics) updates.riskMetrics = state.riskMetrics;
-    if (state.stressTest) updates.stressTest = state.stressTest;
+    // Carry a stressTest forward only if it was recomputed THIS run; otherwise
+    // CLEAR it. It used to be re-persisted unconditionally, and since its gate
+    // requires historicalReturns (null while the optimizer is gated off) it could
+    // never self-correct — the daily Slack digest kept reporting VaR derived from
+    // the bad 2026-08-18 run. Explicit null matters: mergeState is a per-key
+    // upsert, so simply omitting the key leaves the stale row in place forever.
+    // daily-summary.ts:108 checks the fields, so null drops the line entirely —
+    // no number is better than a wrong one.
+    updates.stressTest =
+      state.stressTest && (state.stressTest as { timestamp?: string }).timestamp === stressComputedAt
+        ? state.stressTest
+        : null;
     mergeState(updates);
 
     // A capital withdrawal silently wipes NAV history and rebuilds the peak —

@@ -20,10 +20,41 @@ import { DatabaseSync } from 'node:sqlite';
 import { existsSync, mkdirSync, readFileSync, renameSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 
-const STATE_DIR = process.env.STATE_DIR || '.';
-const DB_FILE = resolve(STATE_DIR, 'bot-state.db');
-const LEGACY_STATE_FILE = resolve(STATE_DIR, 'bot-state.json');
-const LEGACY_TRADES_FILE = resolve(STATE_DIR, 'trade-history.json');
+/**
+ * STATE_DIR is resolved LAZILY, on first use, not at module load.
+ *
+ * It used to be read at import time, which made the ledger's location depend on
+ * MODULE IMPORT ORDER: `STATE_DIR` reaches the process via `dotenv/config` (a
+ * side-effect import in ../config.js), so any agent that reached this module
+ * before config.js silently got `'.'` and opened a fresh bot-state.db in its cwd.
+ * Eight of ten agent entrypoints only imported dotenv TRANSITIVELY via
+ * connection/gateway.js -> config.js; execution-bot.js required state/store.js at
+ * import position 5 and config.js at position 9, and was correct only because
+ * gateway.js happened to come first. Reordering one import line would have
+ * silently split the ledger in two — which is exactly the failure that hit this
+ * fund on 2026-08-11 and went unnoticed for eight days because the nightly backup
+ * kept snapshotting the abandoned half and reporting it healthy.
+ *
+ * Resolving on first call means dotenv has always run by then, whatever the
+ * import graph looks like.
+ */
+let _paths: { db: string; legacyState: string; legacyTrades: string } | null = null;
+function paths(): { db: string; legacyState: string; legacyTrades: string } {
+  if (_paths === null) {
+    const dir = process.env.STATE_DIR || '.';
+    _paths = {
+      db: resolve(dir, 'bot-state.db'),
+      legacyState: resolve(dir, 'bot-state.json'),
+      legacyTrades: resolve(dir, 'trade-history.json'),
+    };
+  }
+  return _paths;
+}
+
+/** Absolute path of the ledger this process will use. Exported for diagnostics. */
+export function stateDbPath(): string {
+  return paths().db;
+}
 
 export interface FundState {
   lastSnapshot?: unknown;
@@ -123,10 +154,31 @@ let _db: DatabaseSync | null = null;
 const BUSY_PRIMARY_CODES = new Set([5, 6]);
 const isBusy = (code: unknown): boolean =>
   typeof code === 'number' && BUSY_PRIMARY_CODES.has(code & 0xff);
-const OPEN_ATTEMPTS = 10;
+
+/**
+ * Retry budgets, in wall-clock ms, on top of what busy_timeout absorbs inside
+ * each attempt. Both are deadlines rather than attempt counts: an attempt count
+ * silently encodes a duration via whatever backoff it happens to use, and that
+ * duration was far too short here.
+ *
+ * OPEN matters as much as TX because openDb() issues DDL (`CREATE TABLE IF NOT
+ * EXISTS`), which takes the write lock. A fixed 10 attempts at 20-80ms gave up
+ * after roughly 800ms — less than one observer poll spends rewriting its blob
+ * under `synchronous = FULL`. So an agent starting while the observer held the
+ * lock died on open, which for risk-manager means the drawdown gate is never
+ * written and the hard stop silently does not fire.
+ */
+const OPEN_RETRY_BUDGET_MS = parseInt(process.env.STATE_OPEN_RETRY_MS || '15000', 10);
+
+/** Jittered backoff. Unjittered retries from N processes just re-collide. */
+function backoff(attempt: number): void {
+  const base = Math.min(50 * 2 ** Math.min(attempt, 5), 800);
+  const until = Date.now() + base + Math.floor(Math.random() * base);
+  while (Date.now() < until) { /* sync spin: DatabaseSync gives us no async seam */ }
+}
 
 function openDb(): DatabaseSync {
-  const d = new DatabaseSync(DB_FILE);
+  const d = new DatabaseSync(paths().db);
   // busy_timeout FIRST. It arms the busy handler, and everything below can
   // need the write lock — including `journal_mode = WAL` itself. Setting it
   // after (as this used to) leaves the riskiest statement unprotected: SQLite
@@ -134,7 +186,10 @@ function openDb(): DatabaseSync {
   // open threw SQLITE_BUSY outright. With agents running as separate processes
   // that meant an agent could die on startup; for risk-manager, dying means the
   // drawdown gate is never written and the hard stop silently doesn't fire.
-  d.exec('PRAGMA busy_timeout = 5000');
+  // Tunable so contention behaviour is testable without a multi-second hold,
+  // and so a slow disk can be given more headroom without a code change.
+  const busyMs = parseInt(process.env.STATE_BUSY_TIMEOUT_MS || '5000', 10);
+  d.exec(`PRAGMA busy_timeout = ${Number.isFinite(busyMs) && busyMs > 0 ? busyMs : 5000}`);
   // Only set WAL when it isn't already — journal_mode is persistent, so on an
   // existing db this is a no-op read instead of a lock acquisition.
   const mode = d.prepare('PRAGMA journal_mode').get() as { journal_mode?: string } | undefined;
@@ -155,6 +210,24 @@ function openDb(): DatabaseSync {
   // two agent processes could interleave.
   //   expires_at NULL ≡ never expires (a once-ever alert).
   // Never bind Infinity here — SQLite silently stores it and reads back null.
+  // Observed events as ROWS, not one JSON blob in state_kv.
+  //
+  // As a blob it was a 5000-entry array around 1.3MB that the observer had to
+  // load, mutate and rewrite IN FULL to append a single event — every five
+  // minutes, under `synchronous = FULL`, holding the database-wide write lock on
+  // a file now shared with the trading agents. Skipping unchanged writes removed
+  // the idle cost, but a real event burst still rewrote the entire history to add
+  // a handful of entries. As rows an append costs the size of the append.
+  //
+  // The (topic, id) index serves the only query shape the readers use: the most
+  // recent N of one topic (risk-manager wants 'pnl' for intraday drawdown).
+  d.exec(
+    'CREATE TABLE IF NOT EXISTS observed_events (' +
+      'id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, cursor INTEGER NOT NULL, ' +
+      'reset_epoch INTEGER NOT NULL, received_at TEXT NOT NULL, observed_at TEXT NOT NULL, ' +
+      'payload TEXT NOT NULL)',
+  );
+  d.exec('CREATE INDEX IF NOT EXISTS observed_events_topic_id_idx ON observed_events (topic, id)');
   d.exec(
     'CREATE TABLE IF NOT EXISTS notify_dedupe (' +
       'key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, sent_at INTEGER NOT NULL, expires_at INTEGER)',
@@ -164,39 +237,71 @@ function openDb(): DatabaseSync {
 
 function db(): DatabaseSync {
   if (_db) return _db;
-  const dir = dirname(DB_FILE);
+  const dir = dirname(paths().db);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   // Retry the whole open on BUSY/LOCKED. busy_timeout covers contention *within*
   // an open connection, but the first-ever open of a fresh db still races other
   // processes creating the WAL, and that window is not covered by the handler.
+  const deadline = Date.now() + (Number.isFinite(OPEN_RETRY_BUDGET_MS) ? OPEN_RETRY_BUDGET_MS : 15000);
   let lastErr: unknown;
-  for (let attempt = 0; attempt < OPEN_ATTEMPTS; attempt++) {
+  for (let attempt = 0; ; attempt++) {
     try {
       const d = openDb();
       _db = d;
       migrateLegacy(d);
+      // Fold any pre-rows observedEvents blob across on first open after upgrade.
+      // Cheap after the first run: a single indexed lookup that finds nothing.
+      migrateObservedEventsOn(d);
       return d;
     } catch (err) {
       lastErr = err;
       if (!isBusy((err as { errcode?: number }).errcode)) throw err;
-      // Jittered backoff — unjittered retries from N processes just re-collide.
-      const until = Date.now() + 20 + Math.floor(Math.random() * 60);
-      while (Date.now() < until) { /* sync spin: DatabaseSync gives us no async seam */ }
+      if (Date.now() >= deadline) break;
+      backoff(attempt);
     }
   }
   throw lastErr;
 }
 
+/**
+ * Total wall-clock budget for retrying a busy transaction, on top of whatever
+ * busy_timeout already absorbs inside each attempt.
+ *
+ * db() retried the OPEN on busy; nothing retried the TRANSACTION. Since the
+ * observer and the trading agents were merged onto one ledger they contend for
+ * the same write lock, and the observer holds it while rewriting a large blob
+ * under `synchronous = FULL`. A BEGIN IMMEDIATE that waits out busy_timeout
+ * throws, and an agent dying is not neutral: risk-manager dying means the
+ * drawdown gate is never written and the hard stop silently does not fire.
+ */
+const TX_RETRY_BUDGET_MS = parseInt(process.env.STATE_TX_RETRY_MS || '15000', 10);
+
 function tx(d: DatabaseSync, fn: () => void): void {
-  d.exec('BEGIN IMMEDIATE');
-  try {
-    fn();
-    d.exec('COMMIT');
-  } catch (e) {
-    try { d.exec('ROLLBACK'); } catch { /* ignore */ }
-    throw e;
+  const deadline = Date.now() + (Number.isFinite(TX_RETRY_BUDGET_MS) ? TX_RETRY_BUDGET_MS : 15000);
+  let attempt = 0;
+  for (;;) {
+    try {
+      d.exec('BEGIN IMMEDIATE');
+    } catch (e) {
+      // Nothing was opened, so there is nothing to roll back. Retry while the
+      // budget lasts; a lock held beyond it is a real fault worth surfacing.
+      if (!isBusy((e as { errcode?: number }).errcode) || Date.now() >= deadline) throw e;
+      backoff(attempt++);
+      continue;
+    }
+    try {
+      fn();
+      d.exec('COMMIT');
+      return;
+    } catch (e) {
+      try { d.exec('ROLLBACK'); } catch { /* ignore */ }
+      // A COMMIT can also lose the race in WAL mode.
+      if (!isBusy((e as { errcode?: number }).errcode) || Date.now() >= deadline) throw e;
+      backoff(attempt++);
+    }
   }
 }
+
 
 /**
  * One-time import of the legacy JSON files. Guarded by a `meta` flag inside a
@@ -206,6 +311,7 @@ function migrateLegacy(d: DatabaseSync): void {
   const already = d.prepare("SELECT v FROM meta WHERE k = 'legacy_migrated'").get();
   if (already) return;
 
+  const { legacyState: LEGACY_STATE_FILE, legacyTrades: LEGACY_TRADES_FILE } = paths();
   const hasState = existsSync(LEGACY_STATE_FILE);
   const hasTrades = existsSync(LEGACY_TRADES_FILE);
 
@@ -266,18 +372,56 @@ export function saveState(state: FundState): void {
  * each other. A value of `undefined` deletes its key (matching the old
  * object-spread semantics); `null` is stored as JSON null.
  */
-export function mergeState(updates: Partial<FundState>): void {
+export interface MergeStateResult {
+  /** Keys whose stored value actually changed (or were deleted). */
+  written: number;
+  /** Keys skipped because the serialised value was byte-identical. */
+  skipped: number;
+}
+
+/**
+ * Upsert state keys, skipping any whose serialised value is unchanged.
+ *
+ * The skip is not a micro-optimisation. The observer runs every 5 minutes and
+ * usually finds nothing — its own logs read `events=0` — yet it rewrote
+ * `observedEvents`, a JSON array at a 5000-entry cap around 1.3MB, on every one
+ * of those polls. Under `synchronous = FULL` each rewrite is an fsync holding
+ * the database-wide write lock, ~288 times a day, on an SD-backed Pi, now
+ * contending with the trading agents that share this file since the two ledgers
+ * were merged. Comparing first turns the common case into a read.
+ *
+ * Returns counts so the behaviour is observable — it is otherwise invisible,
+ * which is exactly how the write amplification survived unnoticed.
+ */
+export function mergeState(updates: Partial<FundState>): MergeStateResult {
   const d = db();
+  let written = 0;
+  let skipped = 0;
   tx(d, () => {
+    const get = d.prepare('SELECT value FROM state_kv WHERE key = ?');
     const put = d.prepare(
       'INSERT INTO state_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
     );
     const del = d.prepare('DELETE FROM state_kv WHERE key = ?');
     for (const [k, v] of Object.entries(updates)) {
-      if (v === undefined) del.run(k);
-      else put.run(k, JSON.stringify(v));
+      if (v === undefined) {
+        // Only counts as a write if the row was actually there.
+        const existing = get.get(k) as { value?: string } | undefined;
+        if (existing === undefined) { skipped++; continue; }
+        del.run(k);
+        written++;
+        continue;
+      }
+      const next = JSON.stringify(v);
+      const existing = get.get(k) as { value?: string } | undefined;
+      // Byte comparison of the serialised form: JSON.stringify is deterministic
+      // for a given object shape, so an unchanged value serialises identically.
+      if (existing !== undefined && existing.value === next) { skipped++; continue; }
+      put.run(k, next);
+      written++;
     }
   });
+  return { written, skipped };
 }
 
 /**
@@ -404,4 +548,130 @@ export function closeDb(): void {
     try { _db.close(); } catch { /* already closed */ }
     _db = null;
   }
+}
+
+// ---------- Observed events ----------
+
+/** Default ring size; mirrors OBSERVER_BUFFER_SIZE in the observer agent. */
+const OBSERVED_EVENTS_CAP = 5000;
+
+interface ObservedEventRow {
+  id: number;
+  topic: string;
+  cursor: number;
+  reset_epoch: number;
+  received_at: string;
+  observed_at: string;
+  payload: string;
+}
+
+const rowToEvent = (r: ObservedEventRow): ObservedEventState => ({
+  cursor: r.cursor,
+  topic: r.topic,
+  receivedAt: r.received_at,
+  resetEpoch: r.reset_epoch,
+  payload: JSON.parse(r.payload) as unknown,
+  observedAt: r.observed_at,
+});
+
+/**
+ * Append events and trim to `cap`, oldest first. Returns the number inserted.
+ *
+ * One transaction for the whole batch: a burst is one lock acquisition and one
+ * fsync rather than one per event.
+ */
+export function appendObservedEvents(
+  events: ObservedEventState[],
+  cap: number = OBSERVED_EVENTS_CAP,
+): number {
+  if (events.length === 0) return 0;
+  const d = db();
+  tx(d, () => {
+    const ins = d.prepare(
+      'INSERT INTO observed_events (topic, cursor, reset_epoch, received_at, observed_at, payload) ' +
+        'VALUES (?, ?, ?, ?, ?, ?)',
+    );
+    for (const e of events) {
+      ins.run(e.topic, e.cursor, e.resetEpoch, e.receivedAt, e.observedAt, JSON.stringify(e.payload ?? null));
+    }
+    // Trim by id, which is monotonic — not by received_at, which comes from
+    // bezant-server's clock and can go backwards across a reset.
+    d.prepare(
+      'DELETE FROM observed_events WHERE id <= ' +
+        '(SELECT id FROM observed_events ORDER BY id DESC LIMIT 1 OFFSET ?)',
+    ).run(cap);
+  });
+  return events.length;
+}
+
+/** Rows as stored, including ids. Exposed so tests can assert append semantics. */
+export function loadObservedEventRows(): Array<{ id: number; topic: string; cursor: number }> {
+  const d = db();
+  return d.prepare('SELECT id, topic, cursor FROM observed_events ORDER BY id ASC').all() as
+    Array<{ id: number; topic: string; cursor: number }>;
+}
+
+/**
+ * Most recent events, returned oldest-first.
+ *
+ * `limit` selects the most RECENT n but the result stays chronological, because
+ * every consumer walks a time series forward (intraday drawdown, fill matching).
+ */
+export function loadObservedEvents(opts?: { topic?: string; limit?: number }): ObservedEventState[] {
+  const d = db();
+  const { topic, limit } = opts ?? {};
+  const where = topic ? 'WHERE topic = ?' : '';
+  const args: unknown[] = topic ? [topic] : [];
+  if (limit !== undefined) args.push(limit);
+  const rows = d
+    .prepare(
+      `SELECT * FROM (SELECT * FROM observed_events ${where} ORDER BY id DESC` +
+        `${limit !== undefined ? ' LIMIT ?' : ''}) ORDER BY id ASC`,
+    )
+    .all(...(args as [])) as unknown as ObservedEventRow[];
+  return rows.map(rowToEvent);
+}
+
+/**
+ * Move a legacy `observedEvents` blob into rows and delete the blob.
+ *
+ * Idempotent and transactional: the blob is removed in the SAME transaction that
+ * inserts the rows, so a crash mid-migration leaves either the old shape or the
+ * new one, never both. Leaving both would double the history on the next run.
+ */
+export function migrateObservedEvents(cap: number = OBSERVED_EVENTS_CAP): number {
+  return migrateObservedEventsOn(db(), cap);
+}
+
+/** Same, against an explicit connection — used during open, before `_db` is live. */
+function migrateObservedEventsOn(d: DatabaseSync, cap: number = OBSERVED_EVENTS_CAP): number {
+  let moved = 0;
+  tx(d, () => {
+    const row = d.prepare("SELECT value FROM state_kv WHERE key = 'observedEvents'").get() as
+      { value?: string } | undefined;
+    if (!row?.value) return;
+    let legacy: ObservedEventState[];
+    try {
+      legacy = JSON.parse(row.value) as ObservedEventState[];
+    } catch {
+      // Unparseable: drop it rather than wedging every future open on it.
+      d.prepare("DELETE FROM state_kv WHERE key = 'observedEvents'").run();
+      return;
+    }
+    if (Array.isArray(legacy)) {
+      const ins = d.prepare(
+        'INSERT INTO observed_events (topic, cursor, reset_epoch, received_at, observed_at, payload) ' +
+          'VALUES (?, ?, ?, ?, ?, ?)',
+      );
+      for (const e of legacy.slice(-cap)) {
+        ins.run(
+          String(e.topic), Number(e.cursor) || 0, Number(e.resetEpoch) || 0,
+          String(e.receivedAt), String(e.observedAt ?? e.receivedAt), JSON.stringify(e.payload ?? null),
+        );
+        moved++;
+      }
+    }
+    d.prepare("DELETE FROM state_kv WHERE key = 'observedEvents'").run();
+  });
+  return moved;
 }

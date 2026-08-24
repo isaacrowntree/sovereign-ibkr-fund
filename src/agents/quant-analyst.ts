@@ -9,6 +9,7 @@ import { realizedVolatility, annualizeVol } from '../risk/volatility.js';
 import { sampleCovMatrix, covToCorr } from '../portfolio/covariance.js';
 import { olsRegression } from '../quant/regression.js';
 import { loadState, mergeState } from '../state/store.js';
+import { recordDailySample, marketDate } from '../quant/price-history.js';
 import { log, logError } from '../log.js';
 
 const AGENT = 'QuantAnalyst';
@@ -23,13 +24,30 @@ async function run(): Promise<void> {
     const prices = await getMarketPrices(symbols);
 
     const state = loadState();
-    const priceHistory = (state.priceHistory || {}) as Record<string, number[]>;
+    // Set only when a regression is genuinely computed this run; see mergeState below.
+    let regressionComputed: Record<string, unknown> | null = null;
 
-    // Update price history
-    for (const [sym, price] of prices) {
-      if (!priceHistory[sym]) priceHistory[sym] = [];
-      priceHistory[sym].push(price);
-      if (priceHistory[sym].length > 500) priceHistory[sym] = priceHistory[sym].slice(-500); // ~2yr at daily
+    // One sample per TRADING DAY, not per run — see src/quant/price-history.ts.
+    // Every downstream consumer reads the array index as a day.
+    const today = marketDate();
+    const sampled = recordDailySample(
+      (state.priceHistory || {}) as Record<string, number[]>,
+      (state.priceHistoryDates || []) as string[],
+      prices,
+      today,
+    );
+    const priceHistory = sampled.priceHistory;
+    const priceHistoryDates = sampled.priceHistoryDates;
+    if (sampled.migrated) {
+      log('Migrated priceHistory to one-sample-per-day — discarded undated intraday samples', AGENT);
+    }
+    if (today === null) {
+      log('Not a US trading day — price history not extended', AGENT);
+    } else {
+      log(`Price history: ${priceHistoryDates.length} trading days (${sampled.isNewDay ? 'new day appended' : 'today updated'})`, AGENT);
+    }
+    if (sampled.carriedForward.length > 0) {
+      log(`Carried forward (no quote): ${sampled.carriedForward.join(', ')}`, AGENT);
     }
 
     // Compute regime signals from portfolio-wide average (not single proxy)
@@ -109,7 +127,7 @@ async function run(): Promise<void> {
               log(`  Beta(${s}): ${reg.betas[i].toFixed(3)} (t=${reg.tStatistics[i + 1].toFixed(2)})`, AGENT);
             });
 
-            state.factorRegression = {
+            regressionComputed = {
               dependent: symbols[0],
               factors: factorSymbols,
               alpha: reg.alpha,
@@ -131,10 +149,14 @@ async function run(): Promise<void> {
     const minLen = Math.min(...symbols.map(s => (priceHistory[s] || []).length));
     let historicalReturns: number[][] | undefined;
     if (minLen >= 3) {
+      // Right-anchored, matching the regime and factor-regression blocks below and
+      // the invariant in src/quant/price-history.ts: every series ends on the same
+      // trading day, but a recently added holding has a SHORTER one. Taking ph[0..n]
+      // would pair one asset's oldest days against another's most recent.
       historicalReturns = symbols.map(s => {
-        const ph = priceHistory[s];
+        const ph = (priceHistory[s] || []).slice(-minLen);
         const returns: number[] = [];
-        for (let i = 1; i < minLen; i++) {
+        for (let i = 1; i < ph.length; i++) {
           returns.push((ph[i] - ph[i - 1]) / ph[i - 1]);
         }
         return returns;
@@ -143,9 +165,14 @@ async function run(): Promise<void> {
 
     mergeState({
       priceHistory,
+      priceHistoryDates,
       regime: regime || null,
       historicalReturns: historicalReturns || null,
-      ...(state.factorRegression ? { factorRegression: state.factorRegression } : {}),
+      // Same sticky-stale trap as stressTest: this used to re-persist whatever was
+      // loaded, so a regression from the bad 2026-08-18 run would sit in the daily
+      // digest indefinitely once the input gate stopped being satisfiable. It
+      // carries no timestamp, so there is no way for a reader to judge its age.
+      factorRegression: regressionComputed ?? null,
       lastQuantAt: new Date().toISOString(),
     });
 

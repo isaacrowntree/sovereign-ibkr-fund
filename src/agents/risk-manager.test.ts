@@ -33,6 +33,9 @@ vi.mock('../connection/gateway.js', () => ({
 
 vi.mock('../state/store.js', () => ({
   loadState: vi.fn(() => ({ navHistory: [100_000] })),
+  // Rows now, not a state blob. Empty is the meaningful default here: the
+  // intraday-drawdown enrichment is skipped and the snapshot path is used.
+  loadObservedEvents: vi.fn(() => []),
   mergeState: vi.fn((u: Record<string, unknown>) => { calls.push('mergeState'); merged.push(u); }),
 }));
 
