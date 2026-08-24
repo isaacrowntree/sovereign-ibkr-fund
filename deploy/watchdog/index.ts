@@ -2,9 +2,18 @@
  * ibkr-fund-watchdog
  *
  * Pi-side liveness watchdog for the bezant Docker container. Runs once per
- * minute via systemd timer. Restarts the container when `/health` returns
- * 5xx or unreachable for 5 consecutive probes — the only failure mode that
- * empirically requires a `docker restart bezant` to recover from.
+ * minute via systemd timer. Restarts the container on either of two failures:
+ *
+ *   1. `/health` 5xx or unreachable for 5 consecutive probes.
+ *   2. The event feed is wedged for 10 consecutive probes WHILE `/health`
+ *      still reports `authenticated` (see STREAM_URL below).
+ *
+ * (2) exists because (1) was not enough. `/health` describes the GATEWAY, not
+ * the feed. On 2026-08-08 the upstream websocket died and stayed dead for four
+ * days: /health answered `authenticated` the whole time, this watchdog logged
+ * "(healthy)" every minute, and nothing restarted anything. The outage was
+ * found by hand. Fill confirmation and intraday drawdown both derive from that
+ * feed, so "authenticated but silent" is an outage, not a curiosity.
  *
  * IMPORTANT: this watchdog does NOT restart on `ibkr-fund-relogin` having
  * disabled itself. The disabled sentinel is the user's "I'm not around to
@@ -53,6 +62,19 @@ const POST_RESTART_HEALTH_PROBES = 12; // wait up to 60s for /health to come bac
 const POST_RESTART_PROBE_INTERVAL_MS = 5_000;
 // Silent-outage backstop: if the fund stays logged out this long AND relogin
 // has disabled itself, alert (the condition that caused a ~2-week outage).
+// Stream liveness. /health only reports whether the GATEWAY is authenticated,
+// which is not the same thing as the event feed working: on 2026-08-08 the
+// upstream websocket died and stayed dead for four days while /health kept
+// answering `authenticated` and this watchdog kept logging "(healthy)". The
+// feed is what execution-bot's fill confirmation and risk-manager's intraday
+// drawdown are built on, so a wedged stream is a real outage, not a warning.
+const STREAM_URL = process.env.BEZANT_STREAM_URL ?? 'http://localhost:8080/events/_status';
+// Wedged = not connected, OR connected but silent. Both are needed: during the
+// August outage the connector flapped — it would reconnect for ~90s before a
+// heartbeat timeout killed it — so `connected` alone kept resetting the counter
+// while `last_message_at` stayed pinned to the day it actually broke.
+const STREAM_STALE_MS = 15 * 60 * 1000; // observed cadence is ~60s, so 15min of silence is anomalous
+const STREAM_WEDGED_THRESHOLD = 10; // ≈10 consecutive probes (≈10 min) before bouncing
 const NOT_AUTH_ALERT_THRESHOLD = 30; // ≈30 consecutive not_authenticated probes (≈30 min)
 const DOWN_ALERT_INTERVAL_MS = 6 * 60 * 60 * 1000; // re-alert at most every 6h while down
 const ALERT_WEBHOOK = process.env.IBKR_FUND_ALERT_WEBHOOK; // optional Slack/Discord/ntfy {"text"} webhook
@@ -65,6 +87,7 @@ interface WatchdogState {
   lastHealthState: HealthState | null;
   consecutiveServerErrors: number;
   consecutiveNotAuthenticated: number;
+  consecutiveStreamWedged: number;
   lastRestartAt: string | null;
   lastRestartReason: string | null;
   totalRestarts: number;
@@ -75,6 +98,7 @@ const DEFAULT_STATE: WatchdogState = {
   lastHealthState: null,
   consecutiveServerErrors: 0,
   consecutiveNotAuthenticated: 0,
+  consecutiveStreamWedged: 0,
   lastRestartAt: null,
   lastRestartReason: null,
   totalRestarts: 0,
@@ -112,6 +136,37 @@ async function probeHealth(): Promise<HealthState> {
     return 'server_error';
   } catch {
     return 'unreachable';
+  }
+}
+
+/**
+ * Is the event feed actually delivering?
+ *
+ * Returns null when we cannot tell (endpoint unreachable or malformed) — the
+ * caller treats "unknown" as not-wedged on purpose. A restart is a blunt act on
+ * a live book, so it should require positive evidence of a wedge, never the
+ * mere absence of evidence of health.
+ */
+async function probeStream(): Promise<{ wedged: boolean; detail: string } | null> {
+  try {
+    const res = await fetch(STREAM_URL, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { connected?: unknown; last_message_at?: unknown };
+    if (typeof body.connected !== 'boolean') return null;
+
+    const lastAt = typeof body.last_message_at === 'string' ? Date.parse(body.last_message_at) : NaN;
+    // A never-connected-since-boot feed reports null; that is genuinely silent,
+    // so treat an unparseable timestamp as stale rather than as unknown.
+    const silentMs = Number.isNaN(lastAt) ? Infinity : Date.now() - lastAt;
+    const stale = silentMs > STREAM_STALE_MS;
+
+    const age = silentMs === Infinity ? 'never' : `${Math.floor(silentMs / 60_000)}min`;
+    return {
+      wedged: !body.connected || stale,
+      detail: `connected=${body.connected} last_message=${age}`,
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -214,6 +269,18 @@ async function main(): Promise<void> {
     state.consecutiveNotAuthenticated = 0;
   }
 
+  // Stream wedge is only OUR problem when the gateway is otherwise fine. If the
+  // gateway is unauthenticated the feed cannot work by definition, and that is
+  // relogin's job — restarting would be both useless and actively harmful. We
+  // learned this the hard way on 2026-08-12: bouncing the container dropped the
+  // gateway to `not authenticated`, and only a relogin brought the feed back.
+  const stream = currentHealth === 'authenticated' ? await probeStream() : null;
+  if (stream?.wedged) {
+    state.consecutiveStreamWedged += 1;
+  } else {
+    state.consecutiveStreamWedged = 0;
+  }
+
   const sinceLastRestart = state.lastRestartAt
     ? now.getTime() - new Date(state.lastRestartAt).getTime()
     : Infinity;
@@ -231,8 +298,16 @@ async function main(): Promise<void> {
     );
   } else if (state.consecutiveServerErrors >= SERVER_ERROR_THRESHOLD) {
     restartReason = `${state.consecutiveServerErrors} consecutive server_error/unreachable probes`;
+  } else if (state.consecutiveStreamWedged >= STREAM_WEDGED_THRESHOLD) {
+    restartReason =
+      `event stream wedged for ${state.consecutiveStreamWedged} consecutive probes ` +
+      `(${stream?.detail ?? 'no detail'}) while /health reported authenticated`;
   } else {
-    log(`status: health=${currentHealth} relogin_failures=${reloginFailures} relogin_disabled=${reloginDisabled} (healthy)`);
+    log(
+      `status: health=${currentHealth} stream=${stream ? stream.detail : 'n/a'} ` +
+        `stream_wedged=${state.consecutiveStreamWedged} relogin_failures=${reloginFailures} ` +
+        `relogin_disabled=${reloginDisabled} (healthy)`,
+    );
   }
 
   if (restartReason) {
@@ -252,6 +327,12 @@ async function main(): Promise<void> {
     }
     state.lastHealthState = await probeHealth();
     state.consecutiveNotAuthenticated = 0;
+    // The restart itself usually drops the gateway to `not authenticated`; the
+    // 5-minute relogin tick re-establishes it, and only then can the feed come
+    // back. So do not re-probe the stream here and do not expect it healthy yet
+    // — just clear the counter so we re-measure from the new baseline rather
+    // than immediately re-triggering once the cooldown lapses.
+    state.consecutiveStreamWedged = 0;
   }
 
   // Silent-outage backstop: fund logged out for a sustained period AND relogin

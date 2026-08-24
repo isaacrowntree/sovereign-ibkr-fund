@@ -10,6 +10,10 @@
  * times out after 2 minutes if the user doesn't tap "Approve".
  *
  * Recovery built in:
+ *  - Dropped brokerage session, SSO still valid: recovered silently via
+ *    /iserver/reauthenticate (then ssodh/init) with NO push. This is the
+ *    common case — CPGateway keeps two sessions and only the iserver half
+ *    drops, several times a day. See "silent recovery" below.
  *  - Wedged gateway (login stuck on /sso/Login, no 2FA push sent): auto
  *    `docker restart bezant` to clear it, then retry the login once. Sends no
  *    extra push. This is the exact manual fix for a ~2-week silent outage.
@@ -29,6 +33,11 @@ import os from 'node:os';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium, type Browser } from 'playwright';
+import {
+  trySilentRecovery,
+  SSODH_INIT_PATH,
+  type SilentRecoveryDeps,
+} from './silent-recovery.js';
 
 const execAsync = promisify(exec);
 
@@ -52,6 +61,11 @@ const USERNAME = process.env.IBKR_USERNAME;
 const PASSWORD = process.env.IBKR_PASSWORD;
 const POST_LOGIN_TIMEOUT_MS = 2 * 60 * 1000; // 2 min for IB Key tap
 const HEALTH_POLL_INTERVAL_MS = 5_000;
+// Silent recovery (no push) runs before any credential login. Each rung gets
+// its own budget; when the SSO session really is dead both rungs fail fast and
+// we've spent ~30s before falling back — cheap next to a phone buzz.
+const SILENT_RECOVERY_BUDGET_MS = 15_000;
+const SILENT_POLL_INTERVAL_MS = 2_500;
 // One push per session-expiry, then disabled until manual reset.
 //
 // We tried 3 here originally on the assumption "user might miss the first
@@ -151,6 +165,10 @@ async function probeHealth(): Promise<HealthResponse | null> {
   }
 }
 
+function gatewayBase(): string {
+  return HEALTH_URL.replace(/\/health$/, '');
+}
+
 /**
  * Nudge CPGateway to bridge the SSO session into the iserver/CPAPI
  * session. After the user taps IB Key, IBKR validates the SSO half but
@@ -163,18 +181,42 @@ async function probeHealth(): Promise<HealthResponse | null> {
  * after every relogin.
  */
 async function nudgeSsoBridge(): Promise<void> {
+  // Same endpoint the silent-recovery ladder uses as its second rung; the
+  // difference is only when we call it (during the post-tap poll, vs before
+  // ever sending a push).
+  await postRecovery(SSODH_INIT_PATH);
+}
+
+// ---------- silent recovery (no push) ----------
+
+/**
+ * POST a recovery endpoint. Best-effort: a 401 (no live SSO session) or a
+ * network error is not the verdict — the /health poll that follows is.
+ */
+async function postRecovery(pathname: string): Promise<void> {
   try {
-    const base = HEALTH_URL.replace(/\/health$/, '');
-    await fetch(`${base}/v1/api/iserver/auth/ssodh/init`, {
+    await fetch(`${gatewayBase()}${pathname}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      // ssodh/init wants a body; reauthenticate ignores one.
       body: JSON.stringify({ publish: true, compete: true }),
-      signal: AbortSignal.timeout(5_000),
+      signal: AbortSignal.timeout(10_000),
     });
   } catch {
-    // Best-effort; the next poll will retry. Failures here are expected
-    // when there's no SSO session yet (CPGateway returns 401).
+    // Swallowed on purpose — see above.
   }
+}
+
+/** Wire the ladder (see silent-recovery.ts) to this script's effects. */
+function silentRecoveryDeps(): SilentRecoveryDeps {
+  return {
+    probeHealth,
+    post: postRecovery,
+    sleep,
+    log,
+    budgetMs: SILENT_RECOVERY_BUDGET_MS,
+    pollIntervalMs: SILENT_POLL_INTERVAL_MS,
+  };
 }
 
 // ---------- login flow ----------
@@ -382,10 +424,22 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  log(`Session unhealthy (authenticated=${health.authenticated} connected=${health.connected}) — starting login`);
+  log(`Session unhealthy (authenticated=${health.authenticated} connected=${health.connected})`);
 
   const state = await loadState();
   state.lastAttemptAt = new Date().toISOString();
+
+  // Most "unhealthy" ticks are a dropped iserver session with a live SSO
+  // session behind it — recoverable in place, with no push. Only escalate to
+  // a credential login (and a phone buzz) once that has actually failed.
+  if (await trySilentRecovery(silentRecoveryDeps())) {
+    state.consecutiveFailures = 0;
+    state.lastSuccessAt = new Date().toISOString();
+    await saveState(state);
+    process.exit(0);
+  }
+
+  log('Starting credential login — an IB Key push is about to be sent');
 
   const browser = await chromium.launch({ headless: true });
   let outcome: LoginOutcome = 'error';
