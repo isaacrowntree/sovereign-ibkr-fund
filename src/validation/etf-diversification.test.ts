@@ -89,6 +89,11 @@ function printTable(rows: Row[]) {
 }
 
 describe.skipIf(!BACKTEST_DATA_AVAILABLE)('ETF diversification impact', () => {
+  // 30s, not vitest's default 5s. This runs a full HRP backtest over six
+  // candidate universes: ~1.5s alone, but >5s when the rest of the validation
+  // suite is running in parallel, so it failed only in full-suite runs and
+  // passed on every re-run in isolation. Generous enough that a genuine hang
+  // still fails rather than being papered over.
   it('compares stocks-only vs ETF-augmented universes (HRP)', () => {
     const rows: Row[] = [];
 
@@ -124,8 +129,7 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('ETF diversification impact', () => {
 
     // ETF augmentation should at minimum not destroy risk-adjusted returns
     expect(best.sharpe).toBeGreaterThan(0);
-  });
-
+  }, 30_000);
   it('measures correlation of each ETF vs existing portfolio', () => {
     const data = loadHistoricalData();
     const ETFS_TO_MEASURE = ['SMH', 'QQQ', 'VXUS', 'TLT', 'VNQ', 'XLE', 'AVGO', 'JNJ', 'GS'];
