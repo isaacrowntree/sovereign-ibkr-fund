@@ -17,6 +17,12 @@ trade-history.json
 # Private portfolio override (real book) — public repo ships only sample.ts
 src/portfolios/local.ts
 
+# Private research notes. Same reason as local.ts: this is a PUBLIC repo, and
+# anything discussing the real book's holdings, weights, NAV or performance
+# belongs beside the code but must never be published with it. Committed
+# analysis in docs/ is methodology only, with no portfolio figures.
+docs/private/
+
 # Backtest data
 src/validation/data/
 
