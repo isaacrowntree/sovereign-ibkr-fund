@@ -77,7 +77,16 @@ const STREAM_STALE_MS = 15 * 60 * 1000; // observed cadence is ~60s, so 15min of
 const STREAM_WEDGED_THRESHOLD = 10; // ≈10 consecutive probes (≈10 min) before bouncing
 const NOT_AUTH_ALERT_THRESHOLD = 30; // ≈30 consecutive not_authenticated probes (≈30 min)
 const DOWN_ALERT_INTERVAL_MS = 6 * 60 * 60 * 1000; // re-alert at most every 6h while down
-const ALERT_WEBHOOK = process.env.IBKR_FUND_ALERT_WEBHOOK; // optional Slack/Discord/ntfy {"text"} webhook
+// Optional Slack/Discord/ntfy {"text"} webhook.
+//
+// SILENCING THIS FOR A TEST: set it EMPTY (`IBKR_FUND_ALERT_WEBHOOK= npx tsx
+// index.ts`), never unset. `import 'dotenv/config'` above reads .env from the
+// working directory and fills in any variable that is ABSENT — so `env -u`
+// removes it and dotenv immediately puts it back, while an empty value is
+// "present" and survives. Getting this backwards fires a real
+// "manual intervention needed" page from a self-test, which is exactly what
+// happened on 2026-08-12.
+const ALERT_WEBHOOK = process.env.IBKR_FUND_ALERT_WEBHOOK;
 
 // ---------- types ----------
 
