@@ -5,9 +5,13 @@ Wants=docker.service
 
 [Service]
 Type=oneshot
+# RETENTION_DAYS only — the DB credential comes from the container, not from a
+# second copy here. That copy went stale on the move to a local Postgres and
+# this unit failed silently for days; see the agent-health unit.
 EnvironmentFile=%h/sovereign-ibkr-fund/deploy/db-retention/.env
+# $$DATABASE_URL is an escaped literal $ — systemd passes it through unexpanded,
+# so the container's own DATABASE_URL is what gets read.
 ExecStart=/usr/bin/docker exec -u node \
-  -e PAPERCLIP_DATABASE_URL \
   -e RETENTION_DAYS \
   -w /paperclip/instances/default/projects/COMPANY_ID/PROJECT_ID/sovereign-ibkr-fund \
-  paperclip node deploy/db-retention/prune.mjs
+  paperclip sh -c 'PAPERCLIP_DATABASE_URL="$$DATABASE_URL" exec node deploy/db-retention/prune.mjs'

@@ -5,13 +5,20 @@ Wants=docker.service
 
 [Service]
 Type=oneshot
-# PAPERCLIP_DATABASE_URL + IBKR_FUND_ALERT_WEBHOOK
+# IBKR_FUND_ALERT_WEBHOOK only. The DB credential deliberately does NOT live
+# here. It used to, as a second copy of paperclip's own URL — and when paperclip
+# moved to a local Postgres, this copy was left pointing at the retired managed
+# host. Every run then died on `relation "paperclip.agents" does not exist`, so
+# the unit that alarms on dead agents was itself the thing that went quiet, for
+# a week, while eight agents were failing.
 EnvironmentFile=%h/sovereign-ibkr-fund/deploy/agent-health/.env
 # Runs inside the paperclip container: it has node 24 and the `postgres` driver,
 # and /fund-state (durable, outside deploy churn) for the dedupe state file.
+# $$DATABASE_URL is an escaped literal $ — systemd passes it through unexpanded,
+# so the value read is the container's own DATABASE_URL. One source of truth:
+# this check now cannot address a different database than paperclip does.
 ExecStart=/usr/bin/docker exec -u node \
-  -e PAPERCLIP_DATABASE_URL \
   -e IBKR_FUND_ALERT_WEBHOOK \
   -e AGENT_HEALTH_STATE_DIR=/fund-state/state \
   -w /paperclip/instances/default/projects/COMPANY_ID/PROJECT_ID/sovereign-ibkr-fund \
-  paperclip node deploy/agent-health/check.mjs
+  paperclip sh -c 'PAPERCLIP_DATABASE_URL="$$DATABASE_URL" exec node deploy/agent-health/check.mjs'
