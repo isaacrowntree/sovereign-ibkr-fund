@@ -1,0 +1,20 @@
+[Unit]
+Description=Poll the bezant event stream every 5 minutes (observer)
+
+[Timer]
+# 300s matches SCHED_OBSERVER_SEC's default in src/scheduler/index.ts. The
+# cadence is not arbitrary: the observer advances a cursor over a BOUNDED
+# upstream buffer, so falling behind means the buffer rolls past unread events
+# and those gaps are unrecoverable. Polling far more often than the 4-hourly
+# agents is the point.
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Loose accuracy so this cheap job can be batched with other wakeups rather than
+# waking the Pi on its own every five minutes.
+AccuracySec=30s
+# Deliberately NOT Persistent: a missed poll cannot be made up. The events it
+# would have read are gone from the upstream buffer either way, so replaying a
+# backlog of missed timer runs on boot would just be noise.
+
+[Install]
+WantedBy=timers.target

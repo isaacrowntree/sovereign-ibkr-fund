@@ -6,8 +6,9 @@ your own host.
 
 | Unit | What it does | Cadence |
 |---|---|---|
-| `ibkr-fund-watchdog` | probes the bezant gateway, restarts it if unhealthy | ~1 min |
+| `ibkr-fund-watchdog` | probes the bezant gateway **and the event feed**, restarts it if either is wedged | ~1 min |
 | `ibkr-fund-relogin` | re-authenticates the IBKR session (Playwright) | ~5 min |
+| `ibkr-fund-observer` | polls the bezant event stream; the only writer of `state.observedEvents` | ~5 min |
 | `ibkr-fund-digest` | daily summary to Slack | Mon–Fri |
 | `ibkr-fund-backup` | uploads the SQLite ledger to Slack | daily |
 | `ibkr-fund-agent-health` | alerts on failing **or silent** agents | hourly |

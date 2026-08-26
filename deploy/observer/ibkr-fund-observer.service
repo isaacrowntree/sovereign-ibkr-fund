@@ -1,0 +1,29 @@
+[Unit]
+Description=IBKR fund — poll bezant event stream (observer)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+# IBKR_FUND_ALERT_WEBHOOK so stream-health alerts actually reach Slack, and
+# TRADING_MODE so they are labelled with the right book. Without the webhook the
+# agent runs fine but logs "no notifier configured" and the alert goes nowhere —
+# which is indistinguishable from a healthy stream.
+EnvironmentFile=%h/sovereign-ibkr-fund/deploy/observer/.env
+# Runs through run-agent.sh, not `node dist/...` directly, so the prebuilt-host
+# freshness contract applies here too: a dist/ that does not match src/ refuses
+# to run rather than quietly polling with stale code.
+#
+# WHY THIS UNIT EXISTS. The observer was orchestrated by nothing: paperclip has
+# no Observer agent, the repo's internal scheduler (which does list it, at 300s)
+# is not enabled here, and no timer ran it. execution-bot's fill confirmation
+# and risk-manager's intraday drawdown both read state.observedEvents, which
+# ONLY this agent writes — so both were silently degrading. It is also the only
+# thing that watches the event stream itself, which is why bezant being down
+# from 2026-08-08 to 2026-08-09 went unnoticed for four days.
+ExecStart=/usr/bin/docker exec -u node \
+  -e IBKR_FUND_ALERT_WEBHOOK \
+  -e TRADING_MODE \
+  -e STATE_DIR=/fund-state/state \
+  -w /paperclip/instances/default/projects/COMPANY_ID/PROJECT_ID/sovereign-ibkr-fund \
+  paperclip bash scripts/run-agent.sh observer
