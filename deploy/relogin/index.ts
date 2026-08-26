@@ -46,6 +46,7 @@ import os from 'node:os';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium, type Browser } from 'playwright';
+import { planRecovery } from './recovery-plan.js';
 import {
   trySilentRecovery,
   SSODH_INIT_PATH,
@@ -502,24 +503,25 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const healthy = health.authenticated && health.connected;
+  // The decision itself lives in recovery-plan.ts, where it is unit-testable.
+  // It used to be inline here, which is how --force shipped as a silent no-op.
+  const plan = planRecovery(health, FORCE);
 
-  if (healthy && !FORCE) {
+  if (plan.action === 'nothing-to-do') {
     log('IBKR session healthy — nothing to do');
     process.exit(0);
   }
 
-  if (healthy) {
-    // --force: deliberately re-authenticate a session that still works.
-    //
-    // A healthy session is REPLACED here — IBKR ends the old one as soon as the
-    // new credential login starts — so an untapped push leaves the fund logged
-    // OUT when it was logged in. That is strictly worse than doing nothing, so
-    // the caller must have a reason. The intended one is ibkr-fund-preflight,
-    // which gates this on session age and on the US market being shut, to move
-    // the unavoidable IB Key tap to an hour a human is actually awake.
-    log('IBKR session healthy, but --force given — re-authenticating anyway');
-    log('WARNING: the current session ends now; an untapped push leaves the fund logged out');
+  if (plan.action === 'credential-only') {
+    log('--force given — going straight to a credential login; only a new SSO session will do');
+    if (health.authenticated && health.connected) {
+      // Replacing a session that currently works: IBKR ends the old one the
+      // moment this login starts, so an untapped push leaves the fund logged
+      // OUT when it was logged in. ibkr-fund-preflight only asks for this once
+      // the session is old enough to be likely to die unattended anyway, and
+      // only while the US market is shut.
+      log('WARNING: the current session ends now; an untapped push leaves the fund logged out');
+    }
   } else {
     log(`Session unhealthy (authenticated=${health.authenticated} connected=${health.connected})`);
   }
@@ -531,16 +533,9 @@ async function main(): Promise<void> {
   // Most "unhealthy" ticks are a dropped iserver session with a live SSO
   // session behind it — recoverable in place, with no push. Only escalate to
   // a credential login (and a phone buzz) once that has actually failed.
-  //
-  // NOT under --force. The silent rungs re-arm the iserver session from the
-  // EXISTING SSO session — they cannot mint a new one. On an already-healthy
-  // session waitForHealthy() therefore returns true on the first rung without
-  // anything having happened, and the run exits 0 reporting "no push needed"
-  // while the SSO session is exactly as old as before. A caller that asked to
-  // replace a session it knows is about to die would get a green log and the
-  // same 2am expiry. --force means "mint a new SSO session", so it must go
-  // straight to the credential login.
-  if (!FORCE && (await trySilentRecovery(silentRecoveryDeps()))) {
+  // Skipped entirely under 'credential-only' — see recovery-plan.ts for why the
+  // silent rungs cannot satisfy a forced refresh.
+  if (plan.action === 'silent-then-credential' && (await trySilentRecovery(silentRecoveryDeps()))) {
     await finalizeSuccess();
     process.exit(0);
   }
