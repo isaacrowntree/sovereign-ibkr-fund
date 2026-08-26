@@ -24,10 +24,23 @@
  *      rm ~/.local/state/bezant-relogin/disabled
  *      systemctl --user start ibkr-fund-relogin.service
  *
- * Run via: npx tsx index.ts
+ * Flags:
+ *  --force   Re-authenticate even when /health reports healthy. Used by a
+ *            scheduled pre-market refresh to move the unavoidable IB Key tap
+ *            to an hour the operator is awake, rather than waiting for the
+ *            session to die unattended overnight. DESTRUCTIVE: it replaces a
+ *            working session, so an untapped push logs the fund out.
+ *
+ * Run via: npx tsx index.ts [--force]
  */
 import 'dotenv/config';
 import fs from 'node:fs/promises';
+
+/**
+ * Re-authenticate even when /health is already healthy. Destructive by design;
+ * see the note at the healthy early-exit below.
+ */
+const FORCE = process.argv.includes('--force');
 import path from 'node:path';
 import os from 'node:os';
 import { exec } from 'node:child_process';
@@ -490,8 +503,20 @@ async function main(): Promise<void> {
   }
 
   if (health.authenticated && health.connected) {
-    log('IBKR session healthy — nothing to do');
-    process.exit(0);
+    if (!FORCE) {
+      log('IBKR session healthy — nothing to do');
+      process.exit(0);
+    }
+    // --force: deliberately re-authenticate a session that still works.
+    //
+    // A healthy session is REPLACED here — IBKR ends the old one as soon as the
+    // new credential login starts — so an untapped push leaves the fund logged
+    // OUT when it was logged in. That is strictly worse than doing nothing, so
+    // the caller must have a reason. The intended one is ibkr-fund-preflight,
+    // which gates this on session age and on the US market being shut, to move
+    // the unavoidable IB Key tap to an hour a human is actually awake.
+    log('IBKR session healthy, but --force given — re-authenticating anyway');
+    log('WARNING: the current session ends now; an untapped push leaves the fund logged out');
   }
 
   log(`Session unhealthy (authenticated=${health.authenticated} connected=${health.connected})`);
