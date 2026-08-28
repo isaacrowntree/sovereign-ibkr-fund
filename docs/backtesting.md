@@ -78,3 +78,91 @@ and those are the real book's numbers; see docs/private/.)
 Production does not behave that way: at `stopped` the strategist declines to
 generate orders and holds what it has. When the harness and production disagree,
 the harness is wrong by definition.
+
+## The 2026-08-29 truthfulness audit
+
+Four flaws were confirmed by proof tests before being fixed (the pre-fix
+proofs live in the git history of `src/validation/flaw-proofs.test.ts`; the
+file now holds the inverted regression locks L1–L5):
+
+1. **Silent window fallback.** A `startDate`/`endDate` the dataset couldn't
+   serve was silently ignored and the full period ran instead. The "2022 Bear
+   Market" scenario had actually been testing 2024→2026 for its whole life.
+   The engine now throws; the 2022/2023 scenarios point `config.dataFile` at
+   `historical-long.json`.
+2. **Regime parity.** The backtest computed regimes from `lookbackDays` (180)
+   samples, where production's quant-analyst requires ≥200 and publishes null
+   below that — and null means NO multiplier (fails open at 1.0), not
+   "extrapolate from a short window". `trendSignal` also silently shrank its
+   200-day MA to fit the short window. The engine now feeds the regime
+   overlay its own `regimeLookbackDays` (200) window, and DEFAULT_CONFIG
+   mirrors the production gate. Measured on the default window: 84 regime
+   actions production would never have taken.
+3. **Frictionless fills.** Production measures per-fill implementation
+   shortfall (`execution/shortfall.ts`); the backtest paid $1 commission but
+   zero spread. Fills now pay `slippagePctPerSide` (default 5 bps) in the
+   adverse direction.
+4. **Dividend blindness.** Returns used raw closes, so distributions
+   vanished. TLT over the bundled window: −6.1% price-only vs +5.9%
+   total-return — a sign flip on the primary hedge candidate, which had been
+   poisoning every hedge-composition comparison. Prices are now
+   dividend-adjusted (`useTotalReturn`) throughout, including the OHLC bars
+   fed to ADX.
+
+One flaw can only be measured, not fixed: **survivorship**. The 7-name core
+universe is today's holdings — names selected partly because they performed.
+Lock L5 quantifies the inflation against a no-hindsight benchmark on the
+identical window (three-digit percentage points). Treat every absolute return
+from this universe as inflated; only comparisons *within* the same universe
+are meaningful.
+
+## Walk-forward (src/validation/walk-forward.test.ts)
+
+Rolling 300-trading-day train / 150-day test folds over the long dataset,
+27-config grid (drift 5/10/15% × cadence 30/45/60d × vol target 15/20/25%),
+selection on train Calmar, applied out-of-sample. Verdict from the first run
+(synthetic $30k, 7-name universe, six folds spanning 2022-09→2026-04):
+
+- OOS positive in **all six folds**, including the 2022 bear fold where
+  buy-and-hold was double-digit negative — the drawdown-management story is
+  real and survives out-of-sample.
+- Walk-forward selection beat the fixed production defaults only modestly;
+  parameters are stable across folds. Notable: **drift 5% won 5 of 6 folds**
+  (production runs 10%), cadence 45–60d and vol target 15–20% match
+  production. If anything earns a live change it's the drift band, and only
+  after the after-tax lens (a tighter band means more disposals inside the
+  12-month CGT line — see "Compare after tax").
+- Buy-and-hold beat the managed strategy on absolute return over the span, as
+  expected in a bull-heavy window with a survivorship-inflated universe; the
+  managed strategy's worst fold drawdown was less than half of B&H's.
+
+## Algorithm options (researched 2026-08-29, ranked by fit)
+
+1. **Keep band-based rebalancing; consider tightening drift toward 5% after
+   tax modeling.** The literature agrees with what this repo already does:
+   tolerance bands beat calendar rebalancing on turnover-for-tracking-error,
+   and calendar rebalancing "rebalances too soon" in trends. The walk-forward
+   independently picked tighter bands than production runs.
+2. **Momentum tilt on the existing book (overweight recent 6–12m winners
+   within the universe, don't add names).** Volatility-managed momentum is
+   the one factor where vol-scaling evidence stays positive out-of-sample.
+   Cheap to trial: the engine's `black_litterman` path already consumes
+   momentum views.
+3. **Volatility-managed exposure (already implemented as vol targeting) —
+   keep, but don't expect alpha from it.** Moreira & Muir's in-sample alphas
+   largely evaporate in broader out-of-sample studies (53 win / 50 lose of
+   103 portfolios); its honest value here is drawdown shaping, which the
+   walk-forward confirms.
+4. **HRP vs equal-weight: re-examine.** Recent studies find 1/N beats HRP
+   out-of-sample in small universes; HRP's edge is variance reduction, not
+   return. Worth a head-to-head in the honest engine before assuming the
+   optimizer earns its complexity at this portfolio size (n < 20).
+5. **Skip:** minimum-variance optimizers (concentration blowups at this n),
+   ML/RL allocation (overfitting at one-book scale), anything requiring
+   shorting or options (long-only spot mandate).
+
+Sources: Kitces on opportunistic rebalancing; Dimensional "Finding Your
+Balance"; FPA Journal "Opportunistic Rebalancing"; Moreira & Muir 2017
+"Volatility-Managed Portfolios" (J. Finance) and the contrary evidence in
+"On the performance of volatility-managed portfolios" (JFE 2020); López de
+Prado 2016 on HRP and later comparative studies (e.g. arXiv 2210.00984).

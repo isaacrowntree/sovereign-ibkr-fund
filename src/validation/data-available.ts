@@ -10,3 +10,12 @@ import { resolve } from 'node:path';
 export const BACKTEST_DATA_AVAILABLE = existsSync(
   resolve(__dirname, 'data', 'historical-daily.json'),
 );
+
+/**
+ * The long-window dataset (reaches back through the 2022 bear; built with
+ * FETCH_START/FETCH_OUT). The 2022/2023 scenario tests need it — the default
+ * file starts 2023-10 and the engine now refuses out-of-range windows.
+ */
+export const LONG_DATA_AVAILABLE = existsSync(
+  resolve(__dirname, 'data', 'historical-long.json'),
+);

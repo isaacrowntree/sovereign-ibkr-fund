@@ -16,7 +16,7 @@
  * 7. Full 2.5-year backtest with $30,000 starting capital
  */
 import { describe, it, expect } from 'vitest';
-import { BACKTEST_DATA_AVAILABLE } from './data-available';
+import { BACKTEST_DATA_AVAILABLE, LONG_DATA_AVAILABLE } from './data-available';
 import {
   runBacktest,
   formatResult,
@@ -197,22 +197,34 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Strategy comparison on full 2.5 years
 });
 
 describe.skipIf(!BACKTEST_DATA_AVAILABLE)('MECE scenario tests', () => {
-  it('Scenario: 2022 Bear Market (tech crash)', () => {
-    const result = runBacktest(DEFAULT_CONFIG, STARTING_NLV, undefined, '2022-01-01', '2022-12-31');
+  // These two scenarios predate the default dataset (starts 2023-10). For
+  // their whole pre-audit life the engine silently ran the FULL 2023→2026
+  // window instead — the "2022 Bear Market" test had never seen 2022. They
+  // now use the long dataset, and the engine throws rather than substitutes.
+  it.skipIf(!LONG_DATA_AVAILABLE)('Scenario: 2022 Bear Market (tech crash)', () => {
+    const result = runBacktest(
+      { ...DEFAULT_CONFIG, dataFile: 'historical-long.json' },
+      STARTING_NLV, undefined, '2022-01-01', '2022-12-31',
+    );
 
     console.log(`\n--- 2022 Bear Market ---`);
     console.log(formatResult(result));
 
+    expect(result.startDate.startsWith('2022')).toBe(true);
     // Drawdown controls should limit losses in a crash
     expect(result.maxDrawdownPct).toBeLessThan(25);
   });
 
-  it('Scenario: 2023 Recovery', () => {
-    const result = runBacktest(DEFAULT_CONFIG, STARTING_NLV, undefined, '2023-01-01', '2023-12-31');
+  it.skipIf(!LONG_DATA_AVAILABLE)('Scenario: 2023 Recovery', () => {
+    const result = runBacktest(
+      { ...DEFAULT_CONFIG, dataFile: 'historical-long.json' },
+      STARTING_NLV, undefined, '2023-01-01', '2023-12-31',
+    );
 
     console.log(`\n--- 2023 Recovery ---`);
     console.log(formatResult(result));
 
+    expect(result.startDate.startsWith('2023')).toBe(true);
     expect(result.finalPortfolioValue).toBeGreaterThan(0);
   });
 

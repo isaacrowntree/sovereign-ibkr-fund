@@ -59,6 +59,32 @@ export interface BacktestConfig {
   enableVolTargeting: boolean;
   lookbackDays: number;
   commissionPerTrade: number;
+  /**
+   * Per-side slippage as a fraction of price (2026-08-29 audit). Production
+   * measures real implementation shortfall per fill (execution/shortfall.ts);
+   * the backtest used to fill at the exact close for free. 5 bps/side is a
+   * conservative half-spread + impact figure for liquid US large caps at
+   * retail size. 0 restores the legacy frictionless fills.
+   */
+  slippagePctPerSide: number;
+  /**
+   * Days of history handed to the REGIME overlay, independent of the
+   * optimizer's `lookbackDays` (2026-08-29 audit). Production computes the
+   * regime on >= 200 daily samples while the optimizer covariance uses a
+   * shorter window; the engine used to feed both from `lookbackDays`, so at
+   * the default 180 the regime's "200-day" MA silently shrank to 181 days.
+   */
+  regimeLookbackDays: number;
+  /**
+   * Use dividend-adjusted closes (total return) for all prices
+   * (2026-08-29 audit). Raw closes discard distributions entirely — TLT's
+   * return over the bundled window is -6.1% price-only vs +5.9% total —
+   * which poisoned every hedge-composition conclusion. false restores the
+   * legacy price-only behaviour.
+   */
+  useTotalReturn: boolean;
+  /** Alternate dataset in data/ (e.g. 'historical-long.json'). */
+  dataFile?: string;
 }
 
 export interface TradeRecord {
@@ -97,17 +123,20 @@ export interface BacktestResult {
 
 // ---------- Data Loading ----------
 
-let _cachedData: Record<string, DailyBar[]> | null = null;
+const _cachedData = new Map<string, Record<string, DailyBar[]>>();
 
-export function loadHistoricalData(): Record<string, DailyBar[]> {
-  if (_cachedData) return _cachedData;
+export function loadHistoricalData(dataFile?: string): Record<string, DailyBar[]> {
   // BACKTEST_DATA_FILE lets a study point at a longer or differently-scoped
   // dataset (e.g. one reaching back through a bear market) without disturbing
-  // the default file the test suites assert against.
-  const file = process.env.BACKTEST_DATA_FILE || 'historical-daily.json';
+  // the default file the test suites assert against; `dataFile` does the same
+  // per-call (scenario tests use it to reach the 2022 bear).
+  const file = dataFile || process.env.BACKTEST_DATA_FILE || 'historical-daily.json';
+  const cached = _cachedData.get(file);
+  if (cached) return cached;
   const dataPath = resolve(__dirname, 'data', file);
-  _cachedData = JSON.parse(readFileSync(dataPath, 'utf8'));
-  return _cachedData!;
+  const data = JSON.parse(readFileSync(dataPath, 'utf8')) as Record<string, DailyBar[]>;
+  _cachedData.set(file, data);
+  return data;
 }
 
 export const SYMBOLS = ['PLTR', 'AMZN', 'TWLO', 'ARM', 'TSLA', 'BRK-B', 'NET'];
@@ -143,9 +172,12 @@ function buildDateIndex(allData: Record<string, DailyBar[]>, symbols: string[]):
   return { dates, symbolDateMap };
 }
 
-function getPrice(allData: Record<string, DailyBar[]>, sym: string, dateMap: Map<string, number>, date: string): number {
+function getPrice(allData: Record<string, DailyBar[]>, sym: string, dateMap: Map<string, number>, date: string, useTotalReturn: boolean): number {
   const idx = dateMap.get(date);
-  return idx !== undefined ? (allData[sym][idx]?.close ?? 0) : 0;
+  if (idx === undefined) return 0;
+  const bar = allData[sym][idx];
+  if (!bar) return 0;
+  return useTotalReturn ? (bar.adjClose || bar.close) : bar.close;
 }
 
 function getActiveSymbols(symbols: string[], symbolDateMap: Map<string, Map<string, number>>, date: string): string[] {
@@ -170,6 +202,14 @@ export const DEFAULT_CONFIG: BacktestConfig = {
   enableVolTargeting: appConfig.strategy.enableVolTargeting,
   lookbackDays: appConfig.strategy.lookbackDays,
   commissionPerTrade: 1.0,
+  slippagePctPerSide: 0.0005, // 5 bps/side; see BacktestConfig
+  regimeLookbackDays: 200,    // production quant-analyst's history requirement
+  // Production parity (2026-08-29 audit): quant-analyst publishes null below
+  // 200 samples and portfolio-strategist then applies NO regime multiplier —
+  // unknown fails open at 1.0, it does not extrapolate from a short window.
+  regimeMinHistory: 200,
+  unknownRegimeExposure: 1.0,
+  useTotalReturn: true,
 };
 
 // ---------- Core Backtest ----------
@@ -181,20 +221,31 @@ export function runBacktest(
   startDate?: string,
   endDate?: string,
 ): BacktestResult {
-  const allData = loadHistoricalData();
+  const allData = loadHistoricalData(config.dataFile);
   const symbols = config.symbols ?? SYMBOLS;
 
   const { dates, symbolDateMap } = buildDateIndex(allData, symbols);
 
+  // A requested window the dataset cannot serve must be an ERROR, not a
+  // fallback (2026-08-29 audit): the "2022 Bear Market" scenario silently ran
+  // 2024→2026 for its whole life because 2022 wasn't in the default file.
+  const outsideDataset = (which: string, d: string): Error =>
+    new Error(
+      `${which} ${d} is outside the dataset (${dates[0]} → ${dates[dates.length - 1]}). ` +
+      `Point config.dataFile at a longer file (e.g. 'historical-long.json') instead of silently running a different window.`,
+    );
   let startIdx = config.lookbackDays;
   let endIdx = dates.length;
   if (startDate) {
-    const idx = dates.indexOf(startDate);
-    if (idx >= 0) startIdx = Math.max(idx, config.lookbackDays);
+    const idx = dates.findIndex(x => x >= startDate); // first trading day on/after
+    if (idx < 0 || dates[0] > startDate) throw outsideDataset('startDate', startDate);
+    startIdx = Math.max(idx, config.lookbackDays);
   }
   if (endDate) {
-    const idx = dates.indexOf(endDate);
-    if (idx >= 0) endIdx = idx + 1;
+    if (endDate < dates[0] || endDate > dates[dates.length - 1]) throw outsideDataset('endDate', endDate);
+    let idx = dates.length - 1;
+    while (idx > 0 && dates[idx] > endDate) idx--; // last trading day on/before
+    endIdx = idx + 1;
   }
 
   let positions: Position[] = initialPositions ? initialPositions.map(p => ({ ...p })) : [];
@@ -205,7 +256,7 @@ export function runBacktest(
     let posValue = 0;
     for (const p of positions) {
       const dm = symbolDateMap.get(p.symbol);
-      posValue += dm ? p.shares * getPrice(allData, p.symbol, dm, date0) : 0;
+      posValue += dm ? p.shares * getPrice(allData, p.symbol, dm, date0, config.useTotalReturn) : 0;
     }
     cash = Math.max(0, startingCapital - posValue);
   }
@@ -241,7 +292,7 @@ export function runBacktest(
 
     const prices = new Map<string, number>();
     for (const s of activeSymbols) {
-      prices.set(s, getPrice(allData, s, symbolDateMap.get(s)!, date));
+      prices.set(s, getPrice(allData, s, symbolDateMap.get(s)!, date, config.useTotalReturn));
     }
 
     const nav = portfolioValue(positions, prices, cash);
@@ -261,11 +312,12 @@ export function runBacktest(
         for (const s of activeSymbols) {
           const price = prices.get(s) ?? 0;
           if (price <= 0) continue;
-          const shares = Math.floor(perStock / price);
+          const fillPrice = price * (1 + config.slippagePctPerSide);
+          const shares = Math.floor(perStock / fillPrice);
           if (shares > 0) {
-            positions.push({ symbol: s, shares, avgCost: price });
-            cash -= shares * price + config.commissionPerTrade;
-            trades.push({ day: dayIdx, date, symbol: s, action: 'BUY', shares, price, commission: config.commissionPerTrade, reason: 'Initial equal-weight buy' });
+            positions.push({ symbol: s, shares, avgCost: fillPrice });
+            cash -= shares * fillPrice + config.commissionPerTrade;
+            trades.push({ day: dayIdx, date, symbol: s, action: 'BUY', shares, price: fillPrice, commission: config.commissionPerTrade, reason: 'Initial equal-weight buy' });
           }
         }
       }
@@ -275,29 +327,43 @@ export function runBacktest(
     // Rebalance frequency gate
     if (dayIdx - lastRebalanceIdx < config.rebalanceFreqDays) continue;
 
-    // Build returns matrix for active symbols with enough lookback
-    const lookbackDates = dates.slice(Math.max(0, dayIdx - config.lookbackDays), dayIdx + 1);
-    const optimSymbols: string[] = [];
-    const returnsMatrix: number[][] = [];
-    const priceArrays: number[][] = [];
-    const ohlcBarArrays: { high: number; low: number; close: number }[][] = [];
-    for (const s of activeSymbols) {
+    // Build returns matrix for active symbols with enough lookback.
+    // The optimizer window (`lookbackDays`) and the regime window
+    // (`regimeLookbackDays`) are built separately: production computes its
+    // regime on >= 200 daily samples while the covariance uses a shorter
+    // window, and feeding both from `lookbackDays` silently shrank the
+    // regime's 200-day MA to whatever the optimizer used (2026-08-29 audit).
+    const collectWindow = (s: string, days: number) => {
       const dm = symbolDateMap.get(s)!;
+      const windowDates = dates.slice(Math.max(0, dayIdx - days), dayIdx + 1);
       const closes: number[] = [];
       const bars: { high: number; low: number; close: number }[] = [];
-      for (const d of lookbackDates) {
+      for (const d of windowDates) {
         const idx = dm.get(d);
         if (idx !== undefined) {
           const bar = allData[s][idx];
-          closes.push(bar.close);
-          bars.push({ high: bar.high, low: bar.low, close: bar.close });
+          const px = config.useTotalReturn ? (bar.adjClose || bar.close) : bar.close;
+          const scale = bar.close > 0 ? px / bar.close : 1;
+          closes.push(px);
+          bars.push({ high: bar.high * scale, low: bar.low * scale, close: px });
         }
       }
-      if (closes.length >= 30) {
+      return { closes, bars };
+    };
+    const optimSymbols: string[] = [];
+    const returnsMatrix: number[][] = [];
+    const priceArrays: number[][] = [];
+    const regimePriceArrays: number[][] = [];
+    const regimeOhlcArrays: { high: number; low: number; close: number }[][] = [];
+    for (const s of activeSymbols) {
+      const optim = collectWindow(s, config.lookbackDays);
+      if (optim.closes.length >= 30) {
         optimSymbols.push(s);
-        priceArrays.push(closes);
-        ohlcBarArrays.push(bars);
-        returnsMatrix.push(dailyReturns(closes));
+        priceArrays.push(optim.closes);
+        returnsMatrix.push(dailyReturns(optim.closes));
+        const regime = collectWindow(s, config.regimeLookbackDays);
+        regimePriceArrays.push(regime.closes);
+        regimeOhlcArrays.push(regime.bars);
       }
     }
 
@@ -317,9 +383,9 @@ export function runBacktest(
     );
     if (covMatrix.length === 0) continue;
 
-    // Use shared module for exposure — pass OHLC bars for proper ADX
+    // Use shared module for exposure — regime-length arrays, OHLC for proper ADX
     const { exposure, regime, drawdown } = computeExposure(
-      priceArrays, covMatrix, dailyReturnsList, nav, peakValue, rebalParams, ohlcBarArrays,
+      regimePriceArrays, covMatrix, dailyReturnsList, nav, peakValue, rebalParams, regimeOhlcArrays,
     );
 
     if (regime) regimeCounts[regime] = (regimeCounts[regime] ?? 0) + 1;
@@ -369,8 +435,9 @@ export function runBacktest(
 
     // Execute orders (sells first, then buys — generateRebalanceOrders already sorts this way)
     for (const order of rebalOrders) {
-      const price = prices.get(order.symbol) ?? 0;
+      const mid = prices.get(order.symbol) ?? 0;
       if (order.action === 'SELL') {
+        const price = mid * (1 - config.slippagePctPerSide);
         const pos = positions.find(p => p.symbol === order.symbol);
         if (pos && pos.shares >= order.shares) {
           pos.shares -= order.shares;
@@ -378,6 +445,7 @@ export function runBacktest(
           trades.push({ day: dayIdx, date, symbol: order.symbol, action: 'SELL', shares: order.shares, price, commission: config.commissionPerTrade, reason: order.reason });
         }
       } else {
+        const price = mid * (1 + config.slippagePctPerSide);
         const cost = order.shares * price + config.commissionPerTrade;
         if (cost > cash) continue;
         cash -= cost;
@@ -400,7 +468,7 @@ export function runBacktest(
   const finalPrices = new Map<string, number>();
   for (const s of symbols) {
     const dm = symbolDateMap.get(s)!;
-    finalPrices.set(s, getPrice(allData, s, dm, finalDate));
+    finalPrices.set(s, getPrice(allData, s, dm, finalDate, config.useTotalReturn));
   }
   const finalNav = portfolioValue(positions, finalPrices, cash);
   dailyValues.push(finalNav);
