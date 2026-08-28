@@ -166,3 +166,32 @@ Balance"; FPA Journal "Opportunistic Rebalancing"; Moreira & Muir 2017
 "Volatility-Managed Portfolios" (J. Finance) and the contrary evidence in
 "On the performance of volatility-managed portfolios" (JFE 2020); López de
 Prado 2016 on HRP and later comparative studies (e.g. arXiv 2210.00984).
+
+## Drift band × AU CGT (src/validation/drift-band-tax.test.ts, 2026-08-29)
+
+The walk-forward picked drift 5% in 5 of 6 folds; production runs 10%. The
+feared mechanism ("tighter band → more disposals inside the 12-month line →
+misses the 50% discount") was tested directly on the honest engine, synthetic
+$30k, marginal 47% (sensitivity 32%), reporting both the deferral figure and
+the terminal-liquidation bookend per the rule above.
+
+Result: **5% beat 10% on every column, on both windows.** On the long window
+(includes the 2022 bear) it wasn't close — roughly 25pp better after tax at
+either rate and both bookends, with lower max drawdown. On the short default
+window 5% and 15% tie after tax and 10% is the *worst* of the three.
+
+The warned mechanism did not materialise: the 5% band produced MORE total
+disposals but FEWER short-term ones than 10% (long window: 54 of 119 inside
+12 months vs 68 of 109). A tight band trims small, often stale lots
+continuously; the wide band waits, then sells bigger slices of younger lots.
+Trade count is indeed the wrong thing to reason from — but in the direction
+opposite to the intuition recorded above.
+
+Re-scoring the walk-forward with an after-tax train metric keeps the same
+answer: drift 5% wins 4 of 6 folds, 10% the other two.
+
+Verdict offered (decision is the operator's, config untouched): the evidence
+supports moving REBALANCE_DRIFT_THRESHOLD from 10 to 5. Caveats: the universe
+is survivorship-inflated so only the relative ranking matters; the default
+window's three-way spread is small; and 10% being worst of three says the
+drift dimension carries noise — the long-window margin is what makes the case.
