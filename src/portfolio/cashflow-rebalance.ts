@@ -10,6 +10,27 @@ export interface CashFlowOrder {
 }
 
 /**
+ * Names the strategy itself sold within the rebuy-guard window, for
+ * `allocateCashFlow`'s `excludeSymbols`. Pure so it is trivially testable;
+ * the caller feeds it the trade ledger.
+ */
+export function recentlySoldSymbols(
+  trades: ReadonlyArray<{ symbol: string; action: 'BUY' | 'SELL'; timestamp: string }>,
+  guardDays: number,
+  nowMs: number = Date.now(),
+): Set<string> {
+  const out = new Set<string>();
+  if (guardDays <= 0) return out;
+  const cutoff = nowMs - guardDays * 24 * 60 * 60 * 1000;
+  for (const t of trades) {
+    if (t.action !== 'SELL') continue;
+    const ts = new Date(t.timestamp).getTime();
+    if (Number.isFinite(ts) && ts >= cutoff && ts <= nowMs) out.add(t.symbol);
+  }
+  return out;
+}
+
+/**
  * Allocate a cash deposit across holdings to move toward target weights.
  * Only buys underweight assets; never sells.
  */

@@ -53,6 +53,15 @@ export const config = {
      */
     cashBufferPct: parseFloat(process.env.REBALANCE_CASH_BUFFER_PCT || '1.0'),
     /**
+     * Rebuy guard (2026-08-29 churn study, docs/backtesting.md): cash-flow
+     * deployment skips names the strategy itself SOLD within this many days.
+     * Without it, a regime-downgrade or band-trim sell is rebought by the
+     * buy-only cash-flow path days later — measured at 70% of all cash-flow
+     * fills, every leg a short-term disposal. The excluded names' share of
+     * the deposit stays in cash. 0 disables the guard (legacy behavior).
+     */
+    cashFlowRebuyGuardDays: parseInt(process.env.CASH_FLOW_REBUY_GUARD_DAYS || '0', 10),
+    /**
      * Fill mode when buy notional exceeds available cash:
      *   'greedy' — sort by drift desc, fully fill largest gaps first, drop
      *     the lowest-priority buys when cash runs out. Decisive — moves the

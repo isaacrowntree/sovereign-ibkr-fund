@@ -5,7 +5,7 @@
  */
 import { connect, disconnect, getAccountSummary, getUsdBalances, getMarketPrices, requestDelayedData } from '../connection/gateway.js';
 import { TARGET_PORTFOLIO, validateTargets, config } from '../config.js';
-import { allocateCashFlow } from '../portfolio/cashflow-rebalance.js';
+import { allocateCashFlow, recentlySoldSymbols } from '../portfolio/cashflow-rebalance.js';
 import {
   computeTargetWeights,
   computeDrift,
@@ -18,7 +18,7 @@ import { regimeExposure, type RegimeState } from '../quant/regime.js';
 import { drawdownExposureMultiplier, type DrawdownState } from '../risk/drawdown.js';
 import { navSanityViolation, priceSanityViolations, marketDataFreshness } from '../risk/data-sanity.js';
 import { isStrategistWindow, describeWindow, STRATEGIST_WINDOW } from '../strategy/market-hours.js';
-import { loadState, mergeState } from '../state/store.js';
+import { loadState, mergeState, loadTradeHistory } from '../state/store.js';
 import { notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
@@ -395,7 +395,15 @@ async function run(): Promise<void> {
           targetPct: adjustedWeights[i] * 100,
         }));
 
-        const cashOrders = allocateCashFlow(holdings, cashUsd - CASH_THRESHOLD, 100, prices);
+        // Rebuy guard: don't let buy-only cash flow round-trip a name the
+        // strategy sold within the guard window (churn study 2026-08-29).
+        const guardDays = config.rebalance.cashFlowRebuyGuardDays;
+        const excluded = recentlySoldSymbols(loadTradeHistory(), guardDays);
+        if (excluded.size > 0) {
+          log(`Rebuy guard (${guardDays}d): excluding ${[...excluded].sort().join(', ')} from cash-flow deployment`, AGENT);
+        }
+
+        const cashOrders = allocateCashFlow(holdings, cashUsd - CASH_THRESHOLD, 100, prices, excluded);
         for (const o of cashOrders) {
           log(`  Cash flow: BUY ${o.shares} ${o.symbol} ($${o.amountUsd.toFixed(2)})`, AGENT);
           pendingOrders.push({

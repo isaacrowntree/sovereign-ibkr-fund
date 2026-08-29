@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { allocateCashFlow } from './cashflow-rebalance';
+import { allocateCashFlow, recentlySoldSymbols } from './cashflow-rebalance';
 
 describe('allocateCashFlow', () => {
   it('equal underweight → split by target ratios', () => {
@@ -96,5 +96,35 @@ describe('allocateCashFlow rebuy guard', () => {
     const orders = allocateCashFlow(holdings, 2000, 100, prices);
     expect(orders.map(o => o.symbol).sort()).toEqual(['AAA', 'BBB']);
     expect(orders.reduce((s, o) => s + o.amountUsd, 0)).toBeCloseTo(2000, 0);
+  });
+});
+
+describe('recentlySoldSymbols', () => {
+  const now = Date.parse('2026-08-29T00:00:00Z');
+  const day = 24 * 60 * 60 * 1000;
+  const t = (sym: string, action: 'BUY' | 'SELL', daysAgo: number) => ({
+    symbol: sym, action, timestamp: new Date(now - daysAgo * day).toISOString(),
+  });
+
+  it('collects only SELLs inside the window', () => {
+    const trades = [t('NET', 'SELL', 5), t('AMZN', 'SELL', 29), t('TSLA', 'SELL', 31), t('PLTR', 'BUY', 2)];
+    const out = recentlySoldSymbols(trades, 30, now);
+    expect([...out].sort()).toEqual(['AMZN', 'NET']);
+  });
+
+  it('guardDays 0 disables the guard entirely', () => {
+    expect(recentlySoldSymbols([t('NET', 'SELL', 1)], 0, now).size).toBe(0);
+  });
+
+  it('boundary: a sell exactly guardDays old is still excluded', () => {
+    expect(recentlySoldSymbols([t('NET', 'SELL', 30)], 30, now).has('NET')).toBe(true);
+  });
+
+  it('ignores unparseable and future timestamps', () => {
+    const trades = [
+      { symbol: 'GE', action: 'SELL' as const, timestamp: 'not-a-date' },
+      t('KO', 'SELL', -1), // future
+    ];
+    expect(recentlySoldSymbols(trades, 30, now).size).toBe(0);
   });
 });
