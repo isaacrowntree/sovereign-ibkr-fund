@@ -15,11 +15,13 @@ import {
   computeTargetWeights,
   computeExposure,
   computeDrift,
+  decideRebalance,
   generateRebalanceOrders,
   dailyReturns,
   type RebalanceParams,
   type PortfolioSnapshot,
 } from '../portfolio/rebalance';
+import { allocateCashFlow } from '../portfolio/cashflow-rebalance';
 
 // ---------- Types ----------
 
@@ -85,6 +87,23 @@ export interface BacktestConfig {
   useTotalReturn: boolean;
   /** Alternate dataset in data/ (e.g. 'historical-long.json'). */
   dataFile?: string;
+  /**
+   * Per-name drift that bypasses the frequencyDays cooldown, mirroring
+   * production's `decideRebalance` urgent path (2026-08-29 gate-fidelity
+   * fix). The engine previously modeled NO urgent path and applied the
+   * cooldown as TRADING days (45 ≈ 63 calendar days) where production
+   * counts CALENDAR days — and it skipped the drift computation entirely
+   * during cooldown, so it could not distinguish 'too-soon' from
+   * 'within-threshold' and never modeled the cash-flow deployment that
+   * production runs in the within-threshold state.
+   */
+  urgentDriftPct: number;
+  /**
+   * Model the production cash-flow path: in 'within-threshold', idle cash
+   * above $1,000 is deployed buy-only into underweights (allocateCashFlow),
+   * WITHOUT resetting the rebalance cooldown.
+   */
+  modelCashFlowPath: boolean;
 }
 
 export interface TradeRecord {
@@ -199,7 +218,13 @@ export const DEFAULT_CONFIG: BacktestConfig = {
   targetVol: appConfig.risk.targetVol,
   maxLeverage: appConfig.risk.maxLeverage,
   enableRegimeOverlay: appConfig.strategy.enableRegimeOverlay,
-  enableVolTargeting: appConfig.strategy.enableVolTargeting,
+  // OFF for production parity (2026-08-29 gate audit): risk-manager computes
+  // volTargetLeverage and writes it to state, but portfolio-strategist never
+  // reads it — no live order path applies a vol multiplier. Simulating one
+  // means backtesting a strategy that is not running, and because it
+  // recomputes from the trailing 60d daily it swings targets (and therefore
+  // drift, urgent triggers, and cash-flow churn) that production never sees.
+  enableVolTargeting: false,
   lookbackDays: appConfig.strategy.lookbackDays,
   commissionPerTrade: 1.0,
   slippagePctPerSide: 0.0005, // 5 bps/side; see BacktestConfig
@@ -210,6 +235,8 @@ export const DEFAULT_CONFIG: BacktestConfig = {
   regimeMinHistory: 200,
   unknownRegimeExposure: 1.0,
   useTotalReturn: true,
+  urgentDriftPct: appConfig.rebalance.urgentDriftThreshold,
+  modelCashFlowPath: true,
 };
 
 // ---------- Core Backtest ----------
@@ -267,7 +294,10 @@ export function runBacktest(
   const regimeCounts: Record<string, number> = {};
   let rebalanceCount = 0;
   let hardStopDays = 0;
-  let lastRebalanceIdx = -Infinity;
+  // CALENDAR ms of the last real rebalance — production's cooldown counts
+  // calendar days (Date.now() - lastRebalanceAt), not trading days. The old
+  // trading-day-index cooldown stretched 45 configured days to ~63 real ones.
+  let lastRebalanceMs = -Infinity;
   let peakValue = startingCapital;
 
   // Build rebalance params from config (same shape the shared module expects)
@@ -324,8 +354,11 @@ export function runBacktest(
       continue;
     }
 
-    // Rebalance frequency gate
-    if (dayIdx - lastRebalanceIdx < config.rebalanceFreqDays) continue;
+    // No early cooldown short-circuit: production computes drift every run
+    // and routes through decideRebalance, where urgent drift bypasses the
+    // cooldown and 'within-threshold' (distinct from 'too-soon') unlocks the
+    // cash-flow deployment path. Skipping the computation during cooldown
+    // made those three states indistinguishable (2026-08-29 gate fix).
 
     // Build returns matrix for active symbols with enough lookback.
     // The optimizer window (`lookbackDays`) and the regime window
@@ -422,15 +455,57 @@ export function runBacktest(
 
     const snapshot: PortfolioSnapshot = { symbols: optimSymbols, prices, currentShares, nav, cash, peakNav: peakValue };
 
-    // Use shared drift calculation
+    // Use shared drift calculation and the PRODUCTION gate. An empty book is
+    // the backtest bootstrap (production seeds real positions), so day one
+    // deploys unconditionally.
     const drift = computeDrift(snapshot, targetWeightMap);
-    if (drift < config.rebalanceDriftPct && positions.length > 0) continue;
+    const dateMs = new Date(`${date}T20:00:00Z`).getTime();
+    const daysSince = (dateMs - lastRebalanceMs) / 86400000;
+    const decision = positions.length === 0
+      ? 'regular'
+      : decideRebalance(drift, daysSince, {
+          driftThreshold: config.rebalanceDriftPct,
+          urgentDriftThreshold: config.urgentDriftPct,
+          frequencyDays: config.rebalanceFreqDays,
+        });
 
-    // Use shared order generation
+    if (decision === 'within-threshold') {
+      // Production deploys idle cash buy-only into underweights here, and it
+      // does NOT reset the rebalance cooldown (a cash deployment must never
+      // silence the only mechanism that can SELL an overweight).
+      const CASH_THRESHOLD = 1000;
+      if (config.modelCashFlowPath && cash > CASH_THRESHOLD) {
+        const holdings = optimSymbols.map((s, i) => ({
+          symbol: s,
+          currentValue: (currentShares.get(s) ?? 0) * (prices.get(s) ?? 0),
+          targetPct: adjustedWeights[i] * 100,
+        }));
+        const cashOrders = allocateCashFlow(holdings, cash - CASH_THRESHOLD, 100, prices);
+        for (const o of cashOrders) {
+          const price = (prices.get(o.symbol) ?? 0) * (1 + config.slippagePctPerSide);
+          const cost = o.shares * price + config.commissionPerTrade;
+          if (o.shares <= 0 || cost > cash) continue;
+          cash -= cost;
+          const existing = positions.find(p => p.symbol === o.symbol);
+          if (existing) {
+            const totalCost = existing.avgCost * existing.shares + price * o.shares;
+            existing.shares += o.shares;
+            existing.avgCost = totalCost / existing.shares;
+          } else {
+            positions.push({ symbol: o.symbol, shares: o.shares, avgCost: price });
+          }
+          trades.push({ day: dayIdx, date, symbol: o.symbol, action: 'BUY', shares: o.shares, price, commission: config.commissionPerTrade, reason: 'cash_flow_rebalance' });
+        }
+      }
+      continue;
+    }
+    if (decision === 'too-soon') continue;
+
+    // 'urgent' or 'regular' — full rebalance
     const rebalOrders = generateRebalanceOrders(snapshot, targetWeightMap, weightSource, 50);
     if (rebalOrders.length === 0) continue;
 
-    lastRebalanceIdx = dayIdx;
+    lastRebalanceMs = dateMs;
     rebalanceCount++;
 
     // Execute orders (sells first, then buys — generateRebalanceOrders already sorts this way)

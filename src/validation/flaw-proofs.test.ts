@@ -54,11 +54,15 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Audit regression locks', () => {
 
   it('L3: fills pay slippage in the adverse direction', () => {
     expect(DEFAULT_CONFIG.slippagePctPerSide).toBeGreaterThan(0);
-    const withSlip = runBacktest({ ...DEFAULT_CONFIG, name: 'slip' }, 30000);
-    const noSlip = runBacktest({ ...DEFAULT_CONFIG, name: 'no slip', slippagePctPerSide: 0 }, 30000);
-    console.log(`L3: return with 5bps/side ${withSlip.totalReturn}% vs frictionless ${noSlip.totalReturn}% (${withSlip.trades.length} trades)`);
-    // Slippage can only cost money on the same trade sequence; allow equality
-    // in case rounding produces an identical path.
+    // Compare on buy_and_hold: one initial deployment, so slippage cannot
+    // change the subsequent trade PATH (on managed configs a different fill
+    // price cascades into different drift/cash-flow decisions and the two
+    // runs stop being like-for-like — observed when the production gate
+    // landed: 88.3% with slippage vs 83.0% without, on divergent paths).
+    const cfg = { ...DEFAULT_CONFIG, optimizerMethod: 'buy_and_hold' as const };
+    const withSlip = runBacktest({ ...cfg, name: 'slip' }, 30000);
+    const noSlip = runBacktest({ ...cfg, name: 'no slip', slippagePctPerSide: 0 }, 30000);
+    console.log(`L3: B&H with 5bps/side ${withSlip.totalReturn}% vs frictionless ${noSlip.totalReturn}%`);
     expect(withSlip.totalReturn).toBeLessThanOrEqual(noSlip.totalReturn);
   });
 

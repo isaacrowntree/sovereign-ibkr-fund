@@ -195,3 +195,70 @@ supports moving REBALANCE_DRIFT_THRESHOLD from 10 to 5. Caveats: the universe
 is survivorship-inflated so only the relative ranking matters; the default
 window's three-way spread is small; and 10% being worst of three says the
 drift dimension carries noise — the long-window margin is what makes the case.
+
+## AMENDMENT (2026-08-29, later): the drift-band verdict above is WITHDRAWN
+
+The "5% beats 10%" section above was measured on an engine whose rebalance
+gate did not match production, and it is superseded by the gate-fidelity work
+in this amendment. What was wrong, in order of impact:
+
+1. **Wrong optimizer.** The study ran HRP; production has run `static` since
+   the 2026-08-19 operational study. Under HRP, re-optimized weights blow
+   through any drift band and the cadence binds — which is exactly why its
+   5% and 10% rows traded almost identically (154 vs 144). Under static
+   weights the band is the binding constraint and the comparison changes
+   entirely.
+2. **Cooldown counted trading days.** Production counts CALENDAR days since
+   the last rebalance; 45 trading days is ~63 calendar days. The engine's
+   cooldown was ~40% too long.
+3. **No urgent path, no within-threshold/too-soon distinction.** The engine
+   skipped the drift computation during cooldown, so it could not model the
+   urgent bypass (25%) or the cash-flow deployment that production runs in
+   the within-threshold state. All three states now route through the SAME
+   `decideRebalance` production uses, and idle cash above $1,000 deploys
+   buy-only into underweights without resetting the cooldown — as live.
+4. **Vol targeting was fiction.** risk-manager computes `volTargetLeverage`
+   and writes it to state, but no order path reads it. The engine applied it
+   as a daily target multiplier; DEFAULT_CONFIG now disables it for parity.
+
+**Gate validation.** With the paths above ablated back to the 2026-08-19
+operational study's shape, this engine reproduces its trade-count regime
+(116 vs its 118 at drift 5% over the long window) — so the counts in that
+study are evidence about the gate it modeled, and neither of the two prior
+studies (that one: no urgent/cash-flow/calendar-cooldown, dividend-blind,
+frictionless; this doc's earlier section: HRP + the same gate gaps) measured
+the strategy production actually runs.
+
+**Result under the faithful gate: INCONCLUSIVE on 5 vs 10.** The ranking is
+non-monotonic in the band and flips sign across windows (10% wins the
+default and full long windows; 10% is the worst of the three on the
+2020→2023-09 out-of-sample cut). The dominant driver is not the band at all:
+the interaction of exposure-scaled drift, the urgent bypass, and buy-only
+cash-flow redeployment generates hundreds of extra fills (vs tens without
+those paths) and, with the regime overlay ON, ~25pp of extra drawdown in the
+long window (sell-low on a regime flip, rebuy-high via cash-flow days
+later). Almost every disposal it forces is short-term, so none of it earns
+the CGT discount.
+
+**The real finding is a design hazard, not a tuning answer.** Production's
+own code path can churn: a regime downgrade scales targets and can fire an
+urgent (or post-cooldown regular) sell; the resulting cash then re-deploys
+into the same names through the cash-flow path on later within-threshold
+days; a regime upgrade completes the round trip. The 2026-08-19 engine could
+not see this because it modeled neither path. Reviewing that interaction
+(e.g. hysteresis on regime-driven target changes, or excluding
+regime-scaling from the drift that feeds the gate) matters more than the
+band choice.
+
+**Operational fact (independent of any backtest):** the cash-flow deployment
+runs ONLY in the `within-threshold` state. At drift 10% with current drift
+below the threshold, idle cash deploys. Moving the threshold to 5% while
+drift sits above it puts the gate in `too-soon` until the 45-day cooldown
+lapses (2026-10-02) — re-blocking deployment, which is the exact condition
+the 2026-08-19 change was made to escape.
+
+**Verdict: keep 10%.** Not because 10% is proven better after tax — the
+faithful-gate evidence is inconclusive — but because (a) the case for 5% is
+withdrawn with the engine that produced it, (b) 5% would re-block cash-flow
+deployment until at least 2026-10-02, and (c) the churn hazard should be
+understood before any band tuning. Revisit after 2026-10-02.

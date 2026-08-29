@@ -30,11 +30,37 @@ const RATE = 0.47;      // top AU marginal rate incl. Medicare — after-tax.tes
 const RATE_LOW = 0.32;  // middle-bracket sensitivity
 const CAPITAL = 30000;
 
-function lastPrices(dataFile: string | undefined, useTotalReturn: boolean): Map<string, number> {
+// Production runs OPTIMIZER=static since 2026-08-19: the model portfolio IS
+// the target, no optimizer. The first version of this study ran the drift
+// comparison under HRP, where re-optimized weights blow through any band and
+// the cadence binds — flattening the very difference being measured (5% vs
+// 10% traded 154 vs 144). Under static weights the band actually binds.
+// The weight vector is the public EXAMPLE book valued at the default
+// dataset's first day — fixed across windows, like production's model book.
+const EXAMPLE_POSITIONS = [
+  { symbol: 'AMZN', shares: 5 }, { symbol: 'ARM', shares: 5 },
+  { symbol: 'BRK-B', shares: 10 }, { symbol: 'NET', shares: 50 },
+  { symbol: 'PLTR', shares: 10 }, { symbol: 'TSLA', shares: 10 },
+  { symbol: 'TWLO', shares: 20 },
+];
+
+function modelWeights(): { symbols: string[]; weights: number[] } {
+  const data = loadHistoricalData();
+  const values = EXAMPLE_POSITIONS.map(p => {
+    const bar = data[p.symbol][0];
+    return { symbol: p.symbol, value: p.shares * (bar.adjClose || bar.close) };
+  });
+  const total = values.reduce((s, v) => s + v.value, 0);
+  return { symbols: values.map(v => v.symbol), weights: values.map(v => v.value / total) };
+}
+
+function pricesAt(dataFile: string | undefined, useTotalReturn: boolean, date: string): Map<string, number> {
   const data = loadHistoricalData(dataFile);
   const prices = new Map<string, number>();
   for (const [sym, bars] of Object.entries(data)) {
-    const b = bars[bars.length - 1];
+    // last bar on/before `date` — the run may end before the dataset does
+    let b = bars[0];
+    for (const bar of bars) { if (bar.date > date) break; b = bar; }
     prices.set(sym, useTotalReturn ? (b.adjClose || b.close) : b.close);
   }
   return prices;
@@ -42,7 +68,7 @@ function lastPrices(dataFile: string | undefined, useTotalReturn: boolean): Map<
 
 /** Records incl. a synthetic final-day liquidation of everything still held. */
 function withTerminalLiquidation(result: BacktestResult, records: TradeRecord[], dataFile?: string): TradeRecord[] {
-  const prices = lastPrices(dataFile, true);
+  const prices = pricesAt(dataFile, true, result.endDate);
   const extra: TradeRecord[] = result.finalPositions.map((p, i) => ({
     timestamp: new Date(`${result.endDate}T21:00:00Z`).toISOString(), // after the last real fill
     symbol: p.symbol,
@@ -65,14 +91,18 @@ interface Row {
   disposals: number; shortTermDisposals: number;
 }
 
-function study(drift: number, dataFile: string | undefined, window: string): Row {
+function study(drift: number, dataFile: string | undefined, window: string, endDate?: string): Row {
+  const model = modelWeights();
   const config: BacktestConfig = {
     ...DEFAULT_CONFIG,
     name: `drift ${drift}%`,
+    optimizerMethod: 'static',
+    symbols: model.symbols,
+    staticWeights: model.weights,
     rebalanceDriftPct: drift,
     ...(dataFile ? { dataFile } : {}),
   };
-  const r = runBacktest(config, CAPITAL);
+  const r = runBacktest(config, CAPITAL, undefined, undefined, endDate);
   const records = toTradeRecords(r, [], r.startDate);
   const deferral = evaluateAfterTax(r, records, RATE);
   const deferralLow = evaluateAfterTax(r, records, RATE_LOW);
@@ -104,6 +134,10 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Drift band under AU CGT', () => {
     for (const drift of [5, 10, 15]) rows.push(study(drift, undefined, 'default'));
     if (LONG_DATA_AVAILABLE) {
       for (const drift of [5, 10, 15]) rows.push(study(drift, 'historical-long.json', 'long   '));
+      // The 2026-08-19 operational study's OOS convention: long data cut at
+      // 2023-09 (genuinely out-of-sample for configs selected on 2023-10 →).
+      // Its trade counts are the sanity check that the gate is modeled right.
+      for (const drift of [5, 10, 15]) rows.push(study(drift, 'historical-long.json', 'oos<23 ', '2023-09-29'));
     }
 
     console.log('\n=== DRIFT BAND × AU CGT (synthetic $30k, marginal 47%) ===');
@@ -146,11 +180,13 @@ describe.skipIf(!LONG_DATA_AVAILABLE)('Walk-forward re-scored after tax', () => 
       const trainEnd = trainStart + TRAIN;
       const dTrainStart = dates[trainStart], dTrainEnd = dates[trainEnd - 1];
 
+      const model = modelWeights();
       let best = GRID[0];
       let bestScore = -Infinity;
       for (const g of GRID) {
         const r = runBacktest({
           ...DEFAULT_CONFIG, name: 'train', dataFile: DATA_FILE,
+          optimizerMethod: 'static', symbols: model.symbols, staticWeights: model.weights,
           rebalanceDriftPct: g.drift, rebalanceFreqDays: g.freq, targetVol: g.vol,
         }, CAPITAL, undefined, dTrainStart, dTrainEnd);
         const at = evaluateAfterTax(r, toTradeRecords(r, [], r.startDate), RATE);
