@@ -159,7 +159,17 @@ export const config = {
     optimizer: (process.env.OPTIMIZER || 'hrp') as 'hrp' | 'black_litterman' | 'equal_weight' | 'static',
     lookbackDays: parseInt(process.env.LOOKBACK_DAYS || '180', 10),
     enableRegimeOverlay: process.env.ENABLE_REGIME !== 'false',
-    enableVolTargeting: process.env.ENABLE_VOL_TARGET !== 'false',
+    /**
+     * Vol targeting is NOT applied by the live strategist — its sizing is
+     * targetWeights × regimeExposure × drawdownMultiplier, deliberately.
+     * `volTargetLeverage` in riskMetrics is telemetry, and the volMult path
+     * in computeExposure() is a backtest-engine research lever (the engine
+     * defaults it off to mirror production). This flag defaulted to `true`
+     * for months while nothing read it — a risk control that existed only
+     * in the config's imagination (2026-08-29 audit). Default now matches
+     * reality; flip to 'true' only alongside actually wiring the strategist.
+     */
+    enableVolTargeting: process.env.ENABLE_VOL_TARGET === 'true',
   },
   port: parseInt(process.env.PORT || '3001', 10),
   logLevel: process.env.LOG_LEVEL || 'info',

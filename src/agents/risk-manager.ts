@@ -126,7 +126,10 @@ export async function run(): Promise<void> {
       const cvar95 = conditionalVaR(returns, 0.95);
       log(`VaR(95%): ${(var95 * 100).toFixed(2)}% | CVaR(95%): ${(cvar95 * 100).toFixed(2)}%`, AGENT);
 
-      // Volatility targeting
+      // Volatility-target leverage — TELEMETRY ONLY. Nothing reads this back
+      // into sizing: the strategist's exposure is regimeExposure × drawdown
+      // multiplier, deliberately (see config.strategy.enableVolTargeting).
+      // Logged so a vol spike is visible in the run feed, not so it acts.
       const vol = ewmaVolatility(returns.slice(-60));
       const annVol = annualizeVol(vol);
       const leverage = volTargetLeverage(annVol, TARGET_VOL, config.risk.maxLeverage);
