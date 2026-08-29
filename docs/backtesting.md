@@ -262,3 +262,58 @@ faithful-gate evidence is inconclusive — but because (a) the case for 5% is
 withdrawn with the engine that produced it, (b) 5% would re-block cash-flow
 deployment until at least 2026-10-02, and (c) the churn hazard should be
 understood before any band tuning. Revisit after 2026-10-02.
+
+## Churn fix study (2026-08-29, later still)
+
+The churn hazard flagged in the amendment above was diagnosed, guarded, and
+re-measured. All numbers: honest engine + faithful gate, static model
+weights, synthetic $30k, locked metric fixed before the runs (after-tax
+liquidation-bookend return at 47%, and max drawdown).
+
+**Diagnosis.** The loop is: exposure-scaled targets (regime multiplier
+inside the drift signal) trigger a sell via `decideRebalance`; the freed
+cash redeploys into the SAME names through the buy-only `allocateCashFlow`
+path on later within-threshold days. Measured at drift 10 on the long
+window: 71 of 101 cash-flow fills rebought a name sold within the prior 30
+days, median gap 5 days, ~18x the account's capital round-tripped over the
+window, every leg a short-term disposal.
+
+**Guards implemented** (both in production code paths, config-gated,
+DEFAULT OFF — merging changes no live behaviour):
+- `dampExposure` dead-band (rebalance.ts): a new exposure multiplier only
+  applies once it moves ≥ deadBand from the last APPLIED one.
+- `allocateCashFlow` rebuy guard (cashflow-rebalance.ts): cash-flow skips
+  names the strategy sold within N days; their share of the deposit stays
+  in cash rather than over-filling other names.
+
+**Validation (churn-fix.test.ts).** The rebuy guard ALONE is the fix:
+- churn zeroed (71 → 0 rebuy-within-30d fills; short-term disposals down);
+- the overlay's protective function is RESTORED: long-window max drawdown
+  66% → 35%, and overlay ON is now better than overlay OFF on drawdown —
+  before the guard it was 25pp WORSE (sell-low/rebuy-high sequencing);
+- the 2020→2023-09 OOS cut goes from -33% to -1% liq@47, beating overlay
+  OFF as well.
+The dead-band was not robust (helps one window, hurts another; combined
+config dominated by guard-only) — implemented and unit-tested, not
+recommended. And the honest cost, locked in the tests: the churn had been
+accidentally PROFITABLE in bull windows (rebuys kept the book more invested
+while prices rose) — removing it costs ~6pp liq@47 on the long window and
+~30pp on the 2023→2026 window. The OOS cut shows that profit was
+uncompensated bear risk: the same mechanism produced the -33%.
+
+**Re-tune on the fixed system.** After-tax walk-forward (guard 0/14/30/60 ×
+drift 5/10/15, liq@47-Calmar train metric): fold winners scatter across the
+grid, and chained OOS keeps the unfixed config ahead (five of six folds are
+bull-era). No parameter is robustly better — the tuning inconclusiveness
+from the previous amendment persists. The guard is a RISK decision, not a
+return optimization: it buys a halved worst-case drawdown and bear-window
+survival at the price of bull-window after-tax return.
+
+**Recommendation to the operator** (nothing enabled in production; the
+adoption decision is yours): enable `cashFlowRebuyGuardDays=30` if the
+fund's mandate weights drawdown control and bear survivability over
+maximal bull capture — that is the stated reason the regime overlay exists,
+and the guard is what makes the overlay actually deliver it. Leave the
+dead-band off. Keep drift at 10% (unchanged conclusion). If enabled, watch
+the first weeks around the cash-flow path: with the guard active, recently
+trimmed names will sit in cash longer by design.

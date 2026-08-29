@@ -15,6 +15,7 @@ import {
   computeTargetWeights,
   computeExposure,
   computeDrift,
+  dampExposure,
   decideRebalance,
   generateRebalanceOrders,
   dailyReturns,
@@ -104,6 +105,16 @@ export interface BacktestConfig {
    * WITHOUT resetting the rebalance cooldown.
    */
   modelCashFlowPath: boolean;
+  /**
+   * Churn guard A (2026-08-29 study): exposure dead-band width passed to
+   * dampExposure. 0 = off (current production behaviour).
+   */
+  exposureDeadBand: number;
+  /**
+   * Churn guard B: cash-flow deployment skips names the strategy sold within
+   * this many calendar days. 0 = off (current production behaviour).
+   */
+  cashFlowRebuyGuardDays: number;
 }
 
 export interface TradeRecord {
@@ -237,6 +248,8 @@ export const DEFAULT_CONFIG: BacktestConfig = {
   useTotalReturn: true,
   urgentDriftPct: appConfig.rebalance.urgentDriftThreshold,
   modelCashFlowPath: true,
+  exposureDeadBand: 0,       // churn guards default OFF — matches live today
+  cashFlowRebuyGuardDays: 0,
 };
 
 // ---------- Core Backtest ----------
@@ -299,6 +312,10 @@ export function runBacktest(
   // trading-day-index cooldown stretched 45 configured days to ~63 real ones.
   let lastRebalanceMs = -Infinity;
   let peakValue = startingCapital;
+  // Churn guards: the exposure actually applied last (dead-band memory), and
+  // when each name was last SOLD by the strategy (rebuy guard).
+  let lastAppliedExposure: number | null = null;
+  const lastSellMs = new Map<string, number>();
 
   // Build rebalance params from config (same shape the shared module expects)
   const rebalParams: RebalanceParams = {
@@ -441,8 +458,10 @@ export function runBacktest(
       continue;
     }
 
-    // Scale weights by exposure
-    const adjustedWeights = rawWeights.map(w => w * exposure);
+    // Scale weights by exposure, through the dead-band (churn guard A)
+    const effExposure = dampExposure(exposure, lastAppliedExposure, config.exposureDeadBand);
+    lastAppliedExposure = effExposure;
+    const adjustedWeights = rawWeights.map(w => w * effExposure);
     const targetWeightMap = new Map<string, number>();
     optimSymbols.forEach((s, i) => targetWeightMap.set(s, adjustedWeights[i]));
 
@@ -480,7 +499,15 @@ export function runBacktest(
           currentValue: (currentShares.get(s) ?? 0) * (prices.get(s) ?? 0),
           targetPct: adjustedWeights[i] * 100,
         }));
-        const cashOrders = allocateCashFlow(holdings, cash - CASH_THRESHOLD, 100, prices);
+        // Rebuy guard (guard B): don't redeploy into names we just sold
+        const guardMs = config.cashFlowRebuyGuardDays * 86400000;
+        const exclude = new Set<string>();
+        if (guardMs > 0) {
+          for (const [sym, ms] of lastSellMs) {
+            if (dateMs - ms <= guardMs) exclude.add(sym);
+          }
+        }
+        const cashOrders = allocateCashFlow(holdings, cash - CASH_THRESHOLD, 100, prices, exclude);
         for (const o of cashOrders) {
           const price = (prices.get(o.symbol) ?? 0) * (1 + config.slippagePctPerSide);
           const cost = o.shares * price + config.commissionPerTrade;
@@ -516,6 +543,7 @@ export function runBacktest(
         const pos = positions.find(p => p.symbol === order.symbol);
         if (pos && pos.shares >= order.shares) {
           pos.shares -= order.shares;
+          lastSellMs.set(order.symbol, dateMs);
           cash += order.shares * price - config.commissionPerTrade;
           trades.push({ day: dayIdx, date, symbol: order.symbol, action: 'SELL', shares: order.shares, price, commission: config.commissionPerTrade, reason: order.reason });
         }

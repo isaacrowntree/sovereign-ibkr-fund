@@ -70,3 +70,31 @@ describe('allocateCashFlow', () => {
     expect(() => allocateCashFlow(holdings, -500, 10, prices)).toThrow('non-negative');
   });
 });
+
+describe('allocateCashFlow rebuy guard', () => {
+  const holdings = [
+    { symbol: 'AAA', currentValue: 4000, targetPct: 50 },
+    { symbol: 'BBB', currentValue: 4000, targetPct: 50 },
+  ];
+  const prices = new Map([['AAA', 100], ['BBB', 100]]);
+
+  it('skips excluded names and leaves their share in cash', () => {
+    // $2,000 deposit; both names have a $1,000 deficit. AAA excluded → only
+    // BBB's $1,000 deficit is fillable, and only $1,000 deploys — AAA's
+    // share stays in cash rather than over-filling BBB past target.
+    const orders = allocateCashFlow(holdings, 2000, 100, prices, new Set(['AAA']));
+    expect(orders.map(o => o.symbol)).toEqual(['BBB']);
+    expect(orders[0].amountUsd).toBeCloseTo(1000, 0);
+  });
+
+  it('returns nothing when every deficit name is excluded', () => {
+    const orders = allocateCashFlow(holdings, 2000, 100, prices, new Set(['AAA', 'BBB']));
+    expect(orders).toEqual([]);
+  });
+
+  it('unchanged without exclusions (guard off)', () => {
+    const orders = allocateCashFlow(holdings, 2000, 100, prices);
+    expect(orders.map(o => o.symbol).sort()).toEqual(['AAA', 'BBB']);
+    expect(orders.reduce((s, o) => s + o.amountUsd, 0)).toBeCloseTo(2000, 0);
+  });
+});

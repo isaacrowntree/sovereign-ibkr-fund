@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { generateRebalanceOrders, decideRebalance, computeExposure, computeTargetWeights, type PortfolioSnapshot, type RebalanceParams } from './rebalance';
+import { generateRebalanceOrders, decideRebalance, computeExposure, computeTargetWeights, dampExposure, type PortfolioSnapshot, type RebalanceParams } from './rebalance';
 
 const PRICE = 100;
 
@@ -548,5 +548,31 @@ describe('computeTargetWeights — static', () => {
     const r = computeTargetWeights(returns, ['A', 'B'], prices, 'static');
     expect(r.source).toContain('no static weights');
     expect(r.weights).toEqual([0.5, 0.5]);
+  });
+});
+
+describe('dampExposure (churn dead-band)', () => {
+  it('holds the last applied exposure through a one-notch regime flap', () => {
+    // risk_on (1.0) → neutral (0.85) is a 0.15 move — inside a 0.2 dead-band
+    expect(dampExposure(0.85, 1.0, 0.2)).toBe(1.0);
+    // ...and the flap back also does not trade
+    expect(dampExposure(1.0, 0.85, 0.2)).toBe(0.85);
+  });
+
+  it('passes genuine de-risking through immediately', () => {
+    expect(dampExposure(0.6, 1.0, 0.2)).toBe(0.6);  // risk_off
+    expect(dampExposure(0.3, 0.85, 0.2)).toBe(0.3); // crisis from neutral
+  });
+
+  it('is disabled at deadBand 0 (current production behaviour)', () => {
+    expect(dampExposure(0.85, 1.0, 0)).toBe(0.85);
+  });
+
+  it('applies raw on the first run (no last applied exposure)', () => {
+    expect(dampExposure(0.85, null, 0.2)).toBe(0.85);
+  });
+
+  it('exact-boundary moves apply (>= deadBand trades)', () => {
+    expect(dampExposure(0.8, 1.0, 0.2)).toBe(0.8);
   });
 });

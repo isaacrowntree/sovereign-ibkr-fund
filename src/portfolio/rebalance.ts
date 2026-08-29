@@ -281,6 +281,28 @@ export interface RebalanceGateConfig {
  *   2. Regular — max drift exceeds `driftThreshold` (default 10%) AND we're
  *      past the `frequencyDays` cooldown.
  */
+/**
+ * Exposure dead-band (2026-08-29 churn study). The regime multiplier feeds
+ * the exposure-scaled targets that BOTH the drift gate and order sizing see,
+ * so a one-notch regime flap (risk_on 1.0 ↔ neutral 0.85 is crossed
+ * constantly) manufactures ~15% of drift, fires a sell, and the buy-only
+ * cash-flow path completes the round trip days later — every leg a
+ * short-term disposal. The dead-band keeps applying the LAST exposure until
+ * the newly computed one moves at least `deadBand` away from it, so
+ * one-notch flaps stop trading while genuine de-risking (risk_off 0.6,
+ * crisis 0.3 — two notches or more from full) still applies immediately.
+ *
+ * `deadBand <= 0` disables (current production behaviour). `lastApplied`
+ * null means no exposure has ever been applied (first run): apply raw.
+ * Callers persist the value they actually applied, not the raw computation.
+ */
+export function dampExposure(raw: number, lastApplied: number | null, deadBand: number): number {
+  if (deadBand <= 0 || lastApplied === null) return raw;
+  // Epsilon: |1.0 - 0.8| floats to 0.1999...96, which would make an
+  // exactly-deadBand-sized move hold instead of apply.
+  return Math.abs(raw - lastApplied) < deadBand - 1e-9 ? lastApplied : raw;
+}
+
 export function decideRebalance(
   maxDrift: number,
   daysSinceLast: number,
