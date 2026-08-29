@@ -346,11 +346,15 @@ async function login(browser: Browser): Promise<LoginOutcome> {
         lastSnapshot = Date.now();
       }
     }
-    // If we never reached the 2FA prompt (no push), or we're still stuck on the
-    // login page, the gateway is wedged — a bezant restart clears it. If we DID
-    // reach 2FA, a push was sent and the user simply didn't approve in time.
-    const stuckOnLogin = /\/sso\/Login/i.test(page.url());
-    const outcome: LoginOutcome = reached2FA && !stuckOnLogin ? 'push_timeout' : 'wedged';
+    // If we reached the 2FA device prompt, a push WAS sent and the user simply
+    // didn't approve in time — that is push_timeout regardless of the URL:
+    // IBKR renders the 2FA prompt without leaving /sso/Login, so checking
+    // "still on the login page" here misclassified every missed tap as
+    // "wedged", which restarted bezant and fired a SECOND push before the
+    // failure latch tripped (observed 2026-08-28, ~25h outage). Wedged means
+    // exactly one thing: credentials submitted but the 2FA prompt never
+    // appeared — only then does a bezant restart help.
+    const outcome: LoginOutcome = reached2FA ? 'push_timeout' : 'wedged';
     log(`Timed out (final URL: ${page.url()}) — classified "${outcome}" (reached2FA=${reached2FA})`);
     await page.screenshot({ path: `${debugDir}/04-timeout.png` });
     return outcome;
