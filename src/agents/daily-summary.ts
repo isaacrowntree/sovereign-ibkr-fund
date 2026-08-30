@@ -178,6 +178,12 @@ export function buildDigest(
       ? ` · ${realised > 0 ? '+' : ''}${usd(realised)} realised`
       : '';
 
+  // Live-view pointer (2026-08-30): the hub dashboard shows all of this and
+  // more in real time. URL comes from env — this repo is public, LAN names
+  // stay out of it. No env, no line.
+  const dashboard = process.env.FUND_DASHBOARD_URL;
+  if (dashboard) body.push(`<${dashboard}|Live dashboard>`);
+
   return {
     title: `Daily summary ${date} — ${nav !== undefined ? usd(nav) : 'NAV unknown'}${pnlSuffix}`,
     body: body.join('\n\n'),
