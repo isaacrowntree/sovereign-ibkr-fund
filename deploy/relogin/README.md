@@ -30,6 +30,84 @@ It does **not** automate the IB Key approval — by design. That stays a
 human-in-the-loop step so the Pi can't be silently logged in if the
 credentials leak.
 
+## When IBKR asks for a challenge code instead
+
+Approving the IB Key push does not always finish the login. Sometimes IBKR
+follows it with a **challenge/response** screen:
+
+```
+Enter the challenge code below into the IBKR Mobile app to generate a response code.
+Challenge: 111 222    [ Enter Response Code ]    [Login]
+```
+
+There is no push left to tap. The login can only be completed by a human reading
+the challenge into IBKR Mobile (Avatar → Two-Factor Authentication) and typing
+the response code back. `index.ts` now recognises this screen, classifies the
+run `challenge` rather than `push_timeout`, and alerts with instructions — the
+generic "clear the sentinel and tap a push" advice cannot fix it.
+
+To complete one, run the operator-assisted login:
+
+```bash
+ssh your-pi 'cd ~/sovereign-ibkr-fund/deploy/relogin && setsid nohup npx tsx assisted-login.ts > /tmp/assisted.log 2>&1 &'
+```
+
+It holds the browser open (20 min) and posts the challenge digits to the alert
+webhook. Answer it from **the phone that generates the code**:
+
+### http://pi.lan:8777
+
+While the login is waiting, the run serves a one-page form on the LAN. Open it
+on your phone, read the challenge off it, generate the response in IBKR Mobile,
+type it in, submit. No SSH, no reading digits off someone else's screen — which
+is the step that burned two valid single-use codes on 2026-09-02.
+
+The listener exists only for the life of the login: it starts with the run, dies
+with it, and there is nothing listening between logins. It shows one challenge
+and accepts one response code — never credentials.
+
+The terminal route still works and writes to the same file:
+
+```bash
+ssh your-pi 'echo <RESPONSE-CODE> > /tmp/bezant-assisted/response.txt'
+```
+
+Port and hostname are `ASSISTED_WEB_PORT` (8777) and `ASSISTED_WEB_HOST`
+(`pi.lan`, used only to build the URL printed in logs and alerts).
+
+It submits **once** — the code is single-use, and a second submission is
+rejected whatever the first did. On success it clears the `disabled` sentinel
+and resets `state.json`, so the timers see an honest last-success time.
+
+### Testing it without touching production
+
+```bash
+node test/run-assisted-tests.mjs     # 20 cases, ~2 min
+```
+
+`test/fake-ibkr.mjs` is a fake gateway reproducing the parts that actually
+broke: the challenge form inside a (optionally cross-origin) iframe, a
+single-use response code, and the optional challenge. Every earlier iteration of
+this script was debugged against the live fund, at a cost of one IB Key push,
+one operator interruption and one burned response code per attempt — and three
+broken versions still shipped. If Playwright's browsers are not installed,
+point `ASSISTED_BROWSER_PATH` at any Chromium build on the machine.
+
+### Do not use `page.evaluate` with a function here
+
+`tsx` compiles with esbuild's `keepNames`, which rewrites named functions —
+including arrows inside an `evaluate()` callback — into `__name(fn, "fn")`.
+`__name` does not exist in the browser, so **every such call throws
+`ReferenceError: __name is not defined`** the moment it runs. Caught and
+defaulted to `''`, that makes a perfectly normal page look empty.
+
+This one mistake produced three "fixes" for imaginary problems: a main-frame CSS
+selector, a frame-by-frame `innerText` scan, and a shadow-piercing DOM walk —
+each shipped to the Pi, each failing while the screenshots showed the form
+plainly. `assisted-login.ts` therefore evaluates **source strings**, which the
+compiler cannot rewrite. Playwright's own locator API is unaffected and is fine
+to use.
+
 ## Architecture
 
 ```

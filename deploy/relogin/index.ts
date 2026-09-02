@@ -65,7 +65,15 @@ const execAsync = promisify(exec);
  *                    wedged and NO push was sent. Cleared by restarting bezant.
  *  - error:          unexpected exception during the flow
  */
-type LoginOutcome = 'authenticated' | 'push_timeout' | 'wedged' | 'error';
+type LoginOutcome = 'authenticated' | 'push_timeout' | 'challenge' | 'wedged' | 'error';
+
+/**
+ * The challenge digits IBKR displayed, if it fell back to challenge/response.
+ * Module-level so finalizeFailure() can put them in the alert: they are the one
+ * piece of the message the operator cannot get any other way, and they are only
+ * discoverable while the browser that rendered them is still alive.
+ */
+let lastChallenge: string | null = null;
 
 // ---------- config ----------
 
@@ -335,6 +343,37 @@ async function login(browser: Browser): Promise<LoginOutcome> {
         await page.screenshot({ path: `${debugDir}/04-success.png` });
         return 'authenticated';
       }
+      // IBKR does not merely fail an unapproved push: after ~2 min it swaps
+      // the "tap the notification" screen for a challenge/response form —
+      // "Challenge: 416 346", type the response code from IBKR Mobile. There
+      // is no push left to tap at that point, so no amount of waiting here can
+      // succeed and a retry only mints another dead push. Observed 2026-09-01,
+      // where three runs in a row reported `push_timeout` while the page had
+      // actually been asking for six digits nobody knew about.
+      // Searched frame by frame: the challenge form is inside an iframe, so the
+      // main document's body is empty and a page-level locator finds nothing.
+      // (Note for anyone extending this: do NOT reach for page.evaluate here.
+      // tsx's esbuild transform injects a `__name` helper into any named
+      // function it serialises, which does not exist in the page — every such
+      // call throws ReferenceError. assisted-login.ts evaluates source strings
+      // for exactly this reason. Playwright's own locator API is unaffected.)
+      let challengeFrameText: string | null = null;
+      for (const frame of page.frames()) {
+        const responseBox = frame.locator(
+          'input[placeholder*="Response" i], input[name*="response" i], input[name*="challenge" i], #chlginput',
+        ).first();
+        if (await responseBox.count() > 0 && await responseBox.isVisible().catch(() => false)) {
+          challengeFrameText = await frame.locator('body').innerText().catch(() => '');
+          break;
+        }
+      }
+      if (challengeFrameText !== null) {
+        lastChallenge = challengeFrameText.match(/Challenge:?\s*([0-9][0-9 ]{4,})/i)?.[1].trim() ?? null;
+        log(`IBKR switched to challenge/response (challenge: ${lastChallenge ?? 'unparsed'}) — ` +
+            `no push remains to approve; this needs assisted-login.ts`);
+        await page.screenshot({ path: `${debugDir}/04-challenge.png` });
+        return 'challenge';
+      }
       if (Date.now() - lastSnapshot >= SNAPSHOT_INTERVAL_MS) {
         snapshotCounter += 1;
         log(`Snapshot (URL: ${page.url()})`);
@@ -456,11 +495,26 @@ async function finalizeFailure(outcome: LoginOutcome | 'terminated', reason: str
       `Hit ${MAX_CONSECUTIVE_FAILURES} consecutive failure(s) (last outcome: ${outcome}) — ` +
         `disabling further automatic attempts. Manual reset required (see top-of-file comment).`,
     );
-    await alert(
-      `IBKR re-login failed (${outcome}: ${reason}) — auto-relogin is now DISABLED and the fund ` +
-        `is logged out. Reset when you can tap an IB Key push:\n` +
-        `ssh your-pi 'rm -f ~/.local/state/bezant-relogin/disabled && systemctl --user start ibkr-fund-relogin.service'`,
-    );
+    // A challenge needs a different message AND a different command: clearing
+    // the sentinel and re-running relogin cannot fix it, because relogin has no
+    // way to type a response code. Sending the generic "tap a push" text here
+    // is what makes this failure a surprise twice.
+    if (outcome === 'challenge') {
+      await alert(
+        `IBKR asked for a CHALLENGE/RESPONSE code, not a push — automatic re-login cannot finish ` +
+          `this and the fund is logged out.${lastChallenge ? ` Challenge shown: ${lastChallenge} (now expired).` : ''}\n` +
+          `Generate the response in IBKR Mobile (Avatar -> Two-Factor Authentication) against the ` +
+          `challenge THIS run prints:\n` +
+          `ssh your-pi 'cd ~/sovereign-ibkr-fund/deploy/relogin && npx tsx assisted-login.ts'\n` +
+          `It waits for you; write the response code to /tmp/bezant-assisted/response.txt.`,
+      );
+    } else {
+      await alert(
+        `IBKR re-login failed (${outcome}: ${reason}) — auto-relogin is now DISABLED and the fund ` +
+          `is logged out. Reset when you can tap an IB Key push:\n` +
+          `ssh your-pi 'rm -f ~/.local/state/bezant-relogin/disabled && systemctl --user start ibkr-fund-relogin.service'`,
+      );
+    }
   }
 
   await saveState(state);
@@ -468,6 +522,9 @@ async function finalizeFailure(outcome: LoginOutcome | 'terminated', reason: str
 
 async function finalizeSuccess(): Promise<void> {
   if (finalized) return;
+  // The other half of the announcement above: a push that is never mentioned
+  // again leaves the operator unsure whether their tap actually landed.
+  await alert(':white_check_mark: *IBKR session is back* — login succeeded, the fund is trading again.');
   finalized = true;
 
   const state = activeState ?? (await loadState());
@@ -545,6 +602,17 @@ async function main(): Promise<void> {
   }
 
   log('Starting credential login — an IB Key push is about to be sent');
+  // Say so on Slack, before the phone buzzes. Until now the only messages this
+  // sent were failures, so an IB Key prompt arriving out of nowhere gave the
+  // operator no way to tell an expected re-login from someone else trying to
+  // get into the account — and "was that me?" is not a question you want to be
+  // guessing at while a 2-minute approval window runs down.
+  await alert(
+    `:key: *IBKR session expired — logging in now.* An IB Key push is on its way; ` +
+      `*tap Approve*. (Automatic re-login, triggered by ${process.env.INVOCATION_ID ? 'the relogin timer' : 'a manual run'} ` +
+      `at ${new Date().toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney' })}.) ` +
+      `If you did NOT expect this, do not approve it.`,
+  );
 
   const browser = await chromium.launch({ headless: true });
   let outcome: LoginOutcome = 'error';
