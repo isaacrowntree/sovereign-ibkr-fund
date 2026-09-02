@@ -15,6 +15,7 @@
  * so the natural harness is a process and some files.
  */
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -48,9 +49,29 @@ async function until(predicate, budgetMs, label) {
  * Run one scenario end to end: fake gateway + the real script + a fixture state
  * dir, with the operator's half of the conversation supplied by `respondWith`.
  */
-async function scenario({ mode = 'challenge', crossOrigin = false, respondWith = null, viaWeb = false, name }) {
-  const port = 8100 + Math.floor(Math.random() * 800) * 2;
-  const webPort = port + 1000;
+/**
+ * A port pair the OS says is free, rather than a random guess.
+ *
+ * The first version picked `8100 + random`, which collides often enough to be
+ * seen: one run in a handful died with a bind error mid-suite and reported a
+ * crash instead of a result. A test harness that fails for its own reasons
+ * teaches you to ignore its failures.
+ */
+async function freePort() {
+  return new Promise((resolve, reject) => {
+    const probe = net.createServer();
+    probe.on('error', reject);
+    // The fake gateway also binds port+1 for the cross-origin frame, so reserve
+    // an even port and let the odd neighbour belong to it.
+    probe.listen(0, '127.0.0.1', () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port % 2 === 0 ? port : port + 1));
+    });
+  });
+}
+
+async function scenario({ mode = 'challenge', crossOrigin = false, respondWith = null, name }) {
+  const port = await freePort();
   const work = await fs.mkdtemp(path.join(os.tmpdir(), 'assisted-test-'));
   const stateDir = path.join(work, 'state');
   const ioDir = path.join(work, 'io');
@@ -89,8 +110,7 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
       ASSISTED_IO_DIR: ioDir,
       ASSISTED_DEBUG_DIR: path.join(work, 'shots'),
       ASSISTED_BUDGET_MS: '45000',
-      ASSISTED_WEB_PORT: String(webPort),
-      ASSISTED_WEB_HOST: '127.0.0.1',
+      ASSISTED_WEB_URL: 'http://pi.lan/ibkr',
       // Use whatever chromium build this machine already has: the pinned
       // download is a 150MB detour that tells us nothing about the script.
       ASSISTED_BROWSER_PATH: process.env.ASSISTED_BROWSER_PATH ?? '',
@@ -110,30 +130,15 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
       25_000,
       'the challenge announcement',
     );
+    // The hub writes this file (see pi:test/hub_ibkr_test.py); here we are the
+    // hub's stand-in, exercising the contract rather than the page.
+    await fs.mkdir(ioDir, { recursive: true });
     if (Array.isArray(respondWith)) {
-      // A wrong code, then the right one — the correction path.
       for (const code of respondWith) {
-        await fetch(`http://127.0.0.1:${webPort}/`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ code }).toString(),
-        }).catch(() => {});
+        await fs.writeFile(path.join(ioDir, 'response.txt'), `${code}\n`);
         await sleep(6_000);
       }
-      out += `\n[test] page after retries: ${await fetch(`http://127.0.0.1:${webPort}/`).then((r) => r.text()).catch(() => '')}\n`;
-    } else if (viaWeb) {
-      // Exactly what a phone does: GET the page, then POST the form.
-      const shown = await fetch(`http://127.0.0.1:${webPort}/`).then((r) => r.text()).catch(() => '');
-      out += `\n[test] page showed: ${shown.includes('111 222') ? 'the challenge' : 'NO challenge'}\n`;
-      const posted = await fetch(`http://127.0.0.1:${webPort}/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ code: respondWith }).toString(),
-        redirect: 'follow',
-      }).then((r) => r.status).catch((e) => `error ${e}`);
-      out += `[test] form POST status: ${posted}\n`;
     } else {
-      await fs.mkdir(ioDir, { recursive: true });
       await fs.writeFile(path.join(ioDir, 'response.txt'), `${respondWith}\n`);
     }
     out += announced ? '\n[test] challenge was announced\n' : '\n[test] challenge was NOT announced\n';
@@ -145,11 +150,13 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
   });
 
   const serverState = await fetch(`http://localhost:${port}/_test/state`).then((r) => r.json());
+  const status = await fs.readFile(path.join(ioDir, 'status.json'), 'utf8')
+    .then((t) => JSON.parse(t)).catch(() => null);
   const stateJson = JSON.parse(await fs.readFile(path.join(stateDir, 'state.json'), 'utf8'));
   const sentinel = await fs.access(path.join(stateDir, 'disabled')).then(() => 'present', () => 'gone');
   server.kill('SIGKILL');
   console.log(`\n${name}`);
-  return { out, exit, serverState, stateJson, sentinel, challengeFile: path.join(ioDir, 'challenge.txt') };
+  return { out, exit, serverState, stateJson, sentinel, status };
 }
 
 // ── 1. the challenge path, cross-origin iframe (what production actually is) ──
@@ -204,20 +211,20 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
   want('  ...without falsely recording a success', r.stateJson.consecutiveFailures, 4);
 }
 
-// ── 5. the response code arrives from the phone, not from a file ────────────
+// ── 5. the status the operator's page renders ───────────────────────────────
+// The page itself lives in the hub (pi repo). What this script owes it is an
+// accurate, fresh status file — everything the page shows comes from here.
 {
   const r = await scenario({
-    name: 'response code entered on the LAN page',
+    name: 'status published for the hub page',
     crossOrigin: true,
     respondWith: '99887766',
-    viaWeb: true,
   });
-  wantIncludes('the page shows the challenge to the phone', r.out, '[test] page showed: the challenge');
-  wantIncludes('  ...and accepts the posted code', r.out, '[test] form POST status: 200');
-  want('  ...submitting it to IBKR exactly once', r.serverState.submissions.length, 1);
-  want('  ...with the code the phone sent', r.serverState.submissions[0], '99887766');
-  want('  ...and the session comes back', r.serverState.authenticated, true);
-  want('  ...with the sentinel cleared', r.sentinel, 'gone');
+  want('publishes a final status', r.status?.status, 'authenticated');
+  want('  ...having carried the challenge for the page to show', r.status?.challenge, '111 222');
+  want('  ...and a timestamp, so a stale file can be spotted', typeof r.status?.updatedAt, 'string');
+  want('  ...the code reached IBKR once', r.serverState.submissions.length, 1);
+  want('  ...and the session came back', r.serverState.authenticated, true);
 }
 
 // ── 6. a typo must be correctable ───────────────────────────────────────────
@@ -236,20 +243,18 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
   wantIncludes('  ...having told the operator it was rejected', r.out, 'rejected the submitted code');
 }
 
-// ── 7. junk from the LAN never reaches IBKR ─────────────────────────────────
+// ── 7. junk in the response file never reaches IBKR ─────────────────────────
+// The hub validates too, but this is the boundary that decides what a broker
+// ever sees — including when the file is written by hand over SSH.
 {
   const r = await scenario({
-    name: 'malformed submissions are refused at the door',
+    name: 'malformed codes are refused at the boundary',
     crossOrigin: true,
     respondWith: ['<script>alert(1)</script>', 'not-a-code', '99887766'],
   });
   want('only the real code is sent to IBKR', r.serverState.submissions.length, 1);
   want('  ...and it is the valid one', r.serverState.submissions[0], '99887766');
-  wantIncludes('  ...the junk is logged as refused', r.out, 'not sent to IBKR');
-  wantIncludes('  ...and never echoed unescaped into the page', r.out, '[test] page after retries:');
-  const echoedRaw = r.out.includes('<script>alert(1)</script>');
-  (echoedRaw ? no : ok)('  ...no raw script tag survives into the HTML',
-    'the page echoed an unescaped <script> tag');
+  want('  ...the session comes back', r.serverState.authenticated, true);
 }
 
 // ── 8. the form is up, and the TAP wins ─────────────────────────────────────
@@ -264,6 +269,7 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
   want('  ...exit code 0', r.exit, 0);
   want('  ...and the sentinel is cleared', r.sentinel, 'gone');
   wantIncludes('  ...having still told the operator the challenge exists', r.out, 'CHALLENGE CODE');
+  want('  ...and published it for the page', r.status?.challenge, '111 222');
 }
 
 console.log(`\n${PASS} passed, ${FAIL} failed`);

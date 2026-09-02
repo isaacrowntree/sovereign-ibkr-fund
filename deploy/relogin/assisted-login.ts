@@ -47,7 +47,6 @@
 import 'dotenv/config';
 import { chromium, type Browser, type Frame, type Page } from 'playwright';
 import fs from 'node:fs/promises';
-import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -67,6 +66,8 @@ const DISABLED_FILE = path.join(STATE_DIR, 'disabled');
 const IO_DIR = process.env.ASSISTED_IO_DIR ?? '/tmp/bezant-assisted';
 const CHALLENGE_FILE = path.join(IO_DIR, 'challenge.txt');
 const RESPONSE_FILE = path.join(IO_DIR, 'response.txt');
+// Read by the hub to render the page; see publishStatus().
+const STATUS_FILE = path.join(IO_DIR, 'status.json');
 const DEBUG_DIR = process.env.ASSISTED_DEBUG_DIR ?? '/tmp/bezant-assisted-shots';
 
 // Generous by design. The whole point is that a human is in the loop, and the
@@ -84,14 +85,11 @@ const SSODH_INIT_PATH = '/v1/api/iserver/auth/ssodh/init';
 const ALERT_WEBHOOK = process.env.IBKR_FUND_ALERT_WEBHOOK;
 
 // The phone that generates the response code should be the phone that enters
-// it. Relaying six digits through SSH — or through a third party reading them
-// off a screenshot — is the slowest and most error-prone part of this flow, and
-// it is the part that burned two valid codes on 2026-09-02. So the run serves a
-// one-page form on the LAN for as long as it is waiting, and nothing longer:
-// the server dies with the process, and there is no listener between logins.
-const WEB_PORT = Number(process.env.ASSISTED_WEB_PORT ?? 8777);
-const WEB_HOST = process.env.ASSISTED_WEB_HOST ?? 'pi.lan';
-const WEB_URL = `http://${WEB_HOST}:${WEB_PORT}`;
+// it: relaying six digits through SSH is the slowest and most error-prone part
+// of this flow, and it burned two valid codes on 2026-09-02. That page is the
+// hub's `/ibkr`, not this script's — see AssistedStatus below. This URL is only
+// for telling the operator where to go.
+const WEB_URL = process.env.ASSISTED_WEB_URL ?? 'http://pi.lan/ibkr';
 
 const log = (m: string) => console.log(`[${new Date().toISOString()}] [assisted] ${m}`);
 
@@ -273,161 +271,56 @@ async function submitResponse(page: Page, code: string): Promise<boolean> {
 }
 
 /**
- * Everything the page needs to know, kept in one place so the HTTP handler and
- * the browser loop cannot disagree about what is happening.
+ * The state the operator's page renders, published as a file.
+ *
+ * This used to be an HTTP server and hand-written HTML inside this script,
+ * which meant a second web surface on the Pi: its own port, its own CSS, its
+ * own HTML escaping, no nav, and no existence except during a login. The Pi
+ * already has a web framework — the hub on :80, Jinja2 templates with
+ * autoescape, one shared layout — so the page belongs there and this script
+ * publishes state for it to render. The file is the whole contract: this repo
+ * knows nothing about the hub, and the hub knows nothing about Playwright.
  */
-const ui = {
-  challenge: null as string | null,
-  status: 'waiting' as 'waiting' | 'challenge' | 'submitting' | 'rejected' | 'authenticated' | 'failed',
-  lastCode: null as string | null,
-  note: null as string | null,
+interface AssistedStatus {
+  status: 'waiting' | 'challenge' | 'submitting' | 'rejected' | 'authenticated' | 'failed';
+  challenge: string | null;
+  attemptsLeft: number;
+  note: string | null;
+  updatedAt: string;
+}
+
+const ui: AssistedStatus = {
+  status: 'waiting',
+  challenge: null,
   attemptsLeft: 0,
+  note: null,
+  updatedAt: new Date().toISOString(),
 };
 
 /**
- * A response code is digits. Rejecting anything else at the door means a stray
- * or malicious POST from the LAN costs nothing: it never reaches IBKR, so it
- * cannot spend one of the few wrong answers an account tolerates.
+ * A response code is digits. Checked here as well as in the page that collects
+ * it: the page is the convenience, this is the boundary that decides what is
+ * ever sent to IBKR, and wrong answers are not free with a broker.
  */
 const CODE_RE = /^[0-9]{4,12}$/;
 
 /**
  * How many codes one run will send to IBKR. More than one because a typo must
- * be correctable — see the retry loop in run() — and not many, because wrong
- * answers are not free with a broker.
+ * be correctable; few, for the reason above.
  */
 const MAX_SUBMISSIONS = 3;
 
 /**
- * Everything interpolated into the page is escaped. `lastCode` and `note` come
- * from a POST body, so a LAN device could otherwise inject script into a page
- * the operator opens on their phone while logging into a brokerage account.
+ * Written on every state change, and polled by the hub. Written whole and
+ * frequently: a reader that sees a stale file must be able to tell, so
+ * `updatedAt` is what marks a login as no longer in progress.
  */
-function esc(value: string): string {
-  return value.replace(/[&<>"']/g, (c) => (
-    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string
-  ));
-}
-
-const page_css = `
-  body{font-family:-apple-system,system-ui,sans-serif;margin:0;padding:24px;background:#f6f7f9;color:#111}
-  .card{max-width:420px;margin:8vh auto;background:#fff;border-radius:14px;padding:24px;box-shadow:0 1px 3px rgba(0,0,0,.12)}
-  h1{font-size:17px;margin:0 0 4px} p{color:#555;font-size:14px;line-height:1.45}
-  .challenge{font-size:40px;font-weight:600;letter-spacing:3px;text-align:center;margin:18px 0;font-variant-numeric:tabular-nums}
-  input{width:100%;box-sizing:border-box;font-size:26px;padding:14px;border:2px solid #cbd2d9;border-radius:10px;text-align:center;letter-spacing:2px}
-  button{width:100%;margin-top:14px;padding:15px;font-size:17px;border:0;border-radius:10px;background:#0b5fff;color:#fff;font-weight:600}
-  .ok{color:#0a7a3d;font-weight:600} .wait{color:#8a6d00;font-weight:600} .bad{color:#b00020;font-weight:600}
-`;
-
-function form(buttonLabel: string): string {
-  return `<form method="POST" action="/">
-      <input name="code" inputmode="numeric" autocomplete="one-time-code" autofocus placeholder="response code">
-      <button type="submit">${buttonLabel}</button>
-    </form>
-    <p>${ui.attemptsLeft} attempt${ui.attemptsLeft === 1 ? '' : 's'} left this login.</p>`;
-}
-
-function renderPage(): string {
-  const note = ui.note ? `<p class="bad">${esc(ui.note)}</p>` : '';
-  const challenge = ui.challenge
-    ? `<p>In IBKR Mobile: <b>Avatar → Two-Factor Authentication</b>, enter this challenge:</p>
-       <div class="challenge">${esc(ui.challenge)}</div>`
-    : '';
-
-  switch (ui.status) {
-    case 'authenticated':
-      return html('Logged in', '<p class="ok">✅ Session restored — the fund is trading again. You can close this.</p>');
-    case 'failed':
-      // A terminal page, not a dead socket: the run is over and the phone must
-      // be told, or the last thing it ever said is "waiting for IBKR".
-      return html('Login did not complete', `<p class="bad">❌ This login has ended without a session.</p>${note}
-        <p>Start another from the Pi:<br><code>npx tsx assisted-login.ts</code></p>`);
-    case 'submitting':
-      return html('Submitting…', `<p class="wait">Sent <b>${esc(ui.lastCode ?? '')}</b> — waiting for IBKR.</p>
-        <p>This page refreshes itself.</p>`);
-    case 'rejected':
-      return html('IBKR rejected that code', `${note}
-        <p>Response codes are single-use — generate a <b>new</b> one for the challenge below.</p>
-        ${challenge}${ui.attemptsLeft > 0 ? form('Try again') : '<p class="bad">No attempts left this login.</p>'}`);
-    case 'challenge':
-      return html('Enter response code', `${note}${challenge}${form('Submit')}`);
-    default:
-      return html('Waiting for IBKR', `${note}<p class="wait">Login started. Approve the IB Key push if it arrives.</p>
-        <p>If IBKR asks for a challenge code instead, it will appear here automatically.</p>`);
-  }
-}
-
-// A refresh keeps the page honest without a websocket: the states it moves
-// between are seconds apart and it is one form on a phone, not an app.
-function html(title: string, body: string): string {
-  const settled = ui.status === 'authenticated' || ui.status === 'failed';
-  const refresh = settled ? '' : '<meta http-equiv="refresh" content="3">';
-  return `<!doctype html><html><head><meta charset="utf-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-    <title>IBKR login</title><style>${page_css}</style></head>
-    <body><div class="card"><h1>${esc(title)}</h1>${body}</div></body></html>`;
-}
-
-/**
- * Serves the form for the life of the run. Bound to every interface because the
- * point is to reach it from the phone; it exposes one challenge and accepts
- * response codes, never credentials, and only while a login this host started
- * is already in flight.
- */
-function startWebServer(onCode: (code: string) => void): http.Server {
-  const server = http.createServer((req, res) => {
-    if (req.method === 'POST') {
-      let body = '';
-      let aborted = false;
-      req.on('data', (c) => {
-        body += c;
-        // A form field is a few bytes. Anything larger is not an operator, and
-        // an unbounded string on a listening socket is a way to exhaust the
-        // memory of the process holding the login open.
-        if (body.length > 4096 && !aborted) {
-          aborted = true;
-          res.writeHead(413).end();
-          req.destroy();
-        }
-      });
-      req.on('end', () => {
-        if (aborted) return;
-        const code = (new URLSearchParams(body).get('code') ?? '').replace(/\s+/g, '');
-        if (!CODE_RE.test(code)) {
-          ui.note = code ? 'That does not look like a response code — it should be 6 to 8 digits.' : 'Enter the code from IBKR Mobile.';
-          log(`Rejected a malformed submission from the form (${code.length} chars) — not sent to IBKR`);
-        } else {
-          ui.note = null;
-          ui.lastCode = code;
-          ui.status = 'submitting';
-          onCode(code);
-          log(`Response code received from ${WEB_URL} (${code.length} chars)`);
-        }
-        res.writeHead(303, { Location: '/' });
-        res.end();
-      });
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-    res.end(renderPage());
+async function publishStatus(patch: Partial<AssistedStatus> = {}): Promise<void> {
+  Object.assign(ui, patch, { updatedAt: new Date().toISOString() });
+  await fs.mkdir(IO_DIR, { recursive: true });
+  await fs.writeFile(STATUS_FILE, `${JSON.stringify(ui, null, 2)}\n`).catch((e) => {
+    log(`could not publish status: ${e}`);
   });
-  server.listen(WEB_PORT, '0.0.0.0', () => log(`Response form: ${WEB_URL}`));
-  // Never let an idle socket hold the process open past the login it serves.
-  server.unref();
-  return server;
-}
-
-/**
- * Let a phone mid-refresh see the terminal page before the socket goes away.
- * Without this the last thing the operator sees is a connection error, which
- * reads as "the Pi broke" rather than "the login ended".
- */
-async function settle(server: http.Server, status: 'authenticated' | 'failed', note?: string): Promise<void> {
-  ui.status = status;
-  if (note) ui.note = note;
-  ui.attemptsLeft = 0;
-  await sleep(4_000);
-  server.close();
 }
 
 async function markSuccess(): Promise<void> {
@@ -451,11 +344,7 @@ async function run(browser: Browser): Promise<boolean> {
   const page = await browser.newPage({ ignoreHTTPSErrors: true });
   await fs.mkdir(DEBUG_DIR, { recursive: true });
 
-  // The web form writes to the SAME file the SSH route uses, so there is one
-  // path into the login and one place to look when asking what was submitted.
-  const server = startWebServer((code) => {
-    void fs.writeFile(RESPONSE_FILE, `${code}\n`).catch((e) => log(`could not save response code: ${e}`));
-  });
+  await publishStatus({ status: 'waiting' });
 
   log(`Opening ${LOGIN_URL}`);
   await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
@@ -485,7 +374,7 @@ async function run(browser: Browser): Promise<boolean> {
   log('Waiting: approve the push. IBKR may then ask for a challenge/response code — watching for both.');
 
   const started = Date.now();
-  ui.attemptsLeft = MAX_SUBMISSIONS;
+  await publishStatus({ attemptsLeft: MAX_SUBMISSIONS });
   // Codes already sent to IBKR. A SET, not a boolean: the old latch stopped the
   // same single-use code being submitted twice (right) and also stopped a
   // CORRECTED code being submitted after a rejection (wrong) — one typo ended
@@ -502,7 +391,7 @@ async function run(browser: Browser): Promise<boolean> {
       log('Authenticated — /health.authenticated=true');
       await alert(':white_check_mark: *IBKR session is back* — assisted login succeeded, the fund is trading again.');
       await page.screenshot({ path: `${DEBUG_DIR}/success.png` }).catch(() => {});
-      await settle(server, 'authenticated');
+      await publishStatus({ status: 'authenticated', attemptsLeft: 0, note: null });
       return true;
     }
 
@@ -519,8 +408,10 @@ async function run(browser: Browser): Promise<boolean> {
     // the only place this is visible. Seeing it matters: it is what turns a
     // silent 20-minute wait into "generate another one".
     if (/authentication failed|invalid|incorrect/i.test(text) && ui.status === 'submitting') {
-      ui.status = 'rejected';
-      ui.note = 'IBKR rejected that code. Generate a new one — codes are single-use.';
+      await publishStatus({
+        status: 'rejected',
+        note: 'IBKR rejected that code. Generate a new one — codes are single-use.',
+      });
       log('IBKR rejected the submitted code — waiting for another');
     }
 
@@ -530,8 +421,10 @@ async function run(browser: Browser): Promise<boolean> {
     if (challenge && challenge !== announcedChallenge) {
       await page.screenshot({ path: `${DEBUG_DIR}/challenge.png` }).catch(() => {});
       await fs.writeFile(CHALLENGE_FILE, `${challenge}\n`);
-      ui.challenge = challenge;
-      if (ui.status === 'waiting' || ui.status === 'rejected') ui.status = 'challenge';
+      await publishStatus({
+        challenge,
+        status: ui.status === 'submitting' ? ui.status : 'challenge',
+      });
       log(`CHALLENGE CODE: ${challenge}`);
       await alert(
         `:1234: *IBKR wants a challenge/response code.* Challenge: *${challenge}*\n` +
@@ -577,9 +470,11 @@ async function run(browser: Browser): Promise<boolean> {
           typed = true;
         }
         sentToIbkr.add(code);
-        ui.attemptsLeft = MAX_SUBMISSIONS - sentToIbkr.size;
-        ui.lastCode = code;
-        ui.status = 'submitting';
+        await publishStatus({
+          status: 'submitting',
+          attemptsLeft: MAX_SUBMISSIONS - sentToIbkr.size,
+          note: null,
+        });
         await page.waitForTimeout(3_000);
         await page.screenshot({ path: `${DEBUG_DIR}/post-response.png` }).catch(() => {});
         log(`Submitted (box found: ${typed}). Post-submit URL: ${page.url()}`);
@@ -602,7 +497,11 @@ async function run(browser: Browser): Promise<boolean> {
     ':x: *IBKR assisted login ended without a session* — the push was not approved and no working ' +
       'response code arrived. The fund is still logged out.',
   );
-  await settle(server, 'failed', 'The login timed out before a session was established.');
+  await publishStatus({
+    status: 'failed',
+    attemptsLeft: 0,
+    note: 'The login timed out before a session was established.',
+  });
   return false;
 }
 

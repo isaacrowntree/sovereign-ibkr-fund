@@ -55,25 +55,39 @@ ssh your-pi 'cd ~/sovereign-ibkr-fund/deploy/relogin && setsid nohup npx tsx ass
 It holds the browser open (20 min) and posts the challenge digits to the alert
 webhook. Answer it from **the phone that generates the code**:
 
-### http://pi.lan:8777
+### http://pi.lan/ibkr
 
-While the login is waiting, the run serves a one-page form on the LAN. Open it
-on your phone, read the challenge off it, generate the response in IBKR Mobile,
-type it in, submit. No SSH, no reading digits off someone else's screen — which
-is the step that burned two valid single-use codes on 2026-09-02.
+The page lives in the Pi hub (`pi` repo: `hub.py`, `hub_trading.render_ibkr`,
+`hub_templates/ibkr.html`), not here. Open it on your phone, read the challenge
+off it, generate the response in IBKR Mobile, type it in, submit — the same
+device throughout, which is the point: relaying digits by hand is what burned
+two valid single-use codes on 2026-09-02.
 
-The listener exists only for the life of the login: it starts with the run, dies
-with it, and there is nothing listening between logins. It shows one challenge
-and accepts one response code — never credentials.
+This script publishes what it is waiting for and reads back the answer:
 
-The terminal route still works and writes to the same file:
+| File | Written by | Meaning |
+|---|---|---|
+| `/tmp/bezant-assisted/status.json` | this script, every poll | `status`, `challenge`, `attemptsLeft`, `note`, `updatedAt` |
+| `/tmp/bezant-assisted/response.txt` | the hub (or you) | a response code to submit |
+
+`updatedAt` is what makes a login *live*: the hub treats a status older than 45s
+as no login in progress and offers no form, because a status file outlives the
+process that wrote it.
+
+Those two files are the entire contract — this repo knows nothing about the hub,
+and the hub knows nothing about Playwright. An earlier version served its own
+page on port 8777 from inside this script: a second web surface with its own
+CSS, its own HTML escaping and no nav, duplicating a hub that already does all
+three properly (Jinja autoescape, one shared layout, always reachable).
+
+The terminal route writes the same file:
 
 ```bash
 ssh your-pi 'echo <RESPONSE-CODE> > /tmp/bezant-assisted/response.txt'
 ```
 
-Port and hostname are `ASSISTED_WEB_PORT` (8777) and `ASSISTED_WEB_HOST`
-(`pi.lan`, used only to build the URL printed in logs and alerts).
+`ASSISTED_WEB_URL` (default `http://pi.lan/ibkr`) only sets the link printed in
+logs and alerts.
 
 It submits **once** — the code is single-use, and a second submission is
 rejected whatever the first did. On success it clears the `disabled` sentinel
