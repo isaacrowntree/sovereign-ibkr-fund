@@ -343,36 +343,38 @@ async function login(browser: Browser): Promise<LoginOutcome> {
         await page.screenshot({ path: `${debugDir}/04-success.png` });
         return 'authenticated';
       }
-      // IBKR does not merely fail an unapproved push: after ~2 min it swaps
-      // the "tap the notification" screen for a challenge/response form —
-      // "Challenge: 416 346", type the response code from IBKR Mobile. There
-      // is no push left to tap at that point, so no amount of waiting here can
-      // succeed and a retry only mints another dead push. Observed 2026-09-01,
-      // where three runs in a row reported `push_timeout` while the page had
-      // actually been asking for six digits nobody knew about.
-      // Searched frame by frame: the challenge form is inside an iframe, so the
-      // main document's body is empty and a page-level locator finds nothing.
-      // (Note for anyone extending this: do NOT reach for page.evaluate here.
-      // tsx's esbuild transform injects a `__name` helper into any named
-      // function it serialises, which does not exist in the page — every such
-      // call throws ReferenceError. assisted-login.ts evaluates source strings
-      // for exactly this reason. Playwright's own locator API is unaffected.)
-      let challengeFrameText: string | null = null;
-      for (const frame of page.frames()) {
-        const responseBox = frame.locator(
-          'input[placeholder*="Response" i], input[name*="response" i], input[name*="challenge" i], #chlginput',
-        ).first();
-        if (await responseBox.count() > 0 && await responseBox.isVisible().catch(() => false)) {
-          challengeFrameText = await frame.locator('body').innerText().catch(() => '');
-          break;
+      // The challenge/response form is an ALTERNATIVE to the push, not its
+      // replacement. IBKR shows it within seconds of the device selection,
+      // while the push is still live, and EITHER completes the login. Measured
+      // on 2026-09-02: challenge visible at 23:34:19, authenticated at
+      // 23:34:27 by a tap, no code ever entered.
+      //
+      // So seeing it means nothing on its own and must not end the wait. The
+      // first version returned here the moment the box appeared — which, on
+      // the sequence above, would have abandoned the login three seconds in,
+      // parked the fund and paged the operator, eight seconds before it would
+      // have succeeded by itself. Note the challenge, keep waiting for the tap,
+      // and let the verdict be decided by whether a session appears.
+      //
+      // (Do NOT reach for page.evaluate here: tsx's esbuild transform injects a
+      // `__name` helper into any named function it serialises, which does not
+      // exist in the page, so every such call throws ReferenceError.
+      // assisted-login.ts evaluates source strings for that reason.
+      // Playwright's own locator API is unaffected.)
+      if (lastChallenge === null) {
+        for (const frame of page.frames()) {
+          const responseBox = frame.locator(
+            'input[placeholder*="Response" i], input[name*="response" i], input[name*="challenge" i], #chlginput',
+          ).first();
+          if (await responseBox.count() > 0 && await responseBox.isVisible().catch(() => false)) {
+            const frameText = await frame.locator('body').innerText().catch(() => '');
+            lastChallenge = frameText.match(/Challenge:?\s*([0-9][0-9 ]{4,})/i)?.[1].trim() ?? 'unparsed';
+            log(`IBKR is also offering challenge/response (challenge: ${lastChallenge}) — ` +
+                `still waiting for the push, which completes the login on its own`);
+            await page.screenshot({ path: `${debugDir}/04-challenge.png` });
+            break;
+          }
         }
-      }
-      if (challengeFrameText !== null) {
-        lastChallenge = challengeFrameText.match(/Challenge:?\s*([0-9][0-9 ]{4,})/i)?.[1].trim() ?? null;
-        log(`IBKR switched to challenge/response (challenge: ${lastChallenge ?? 'unparsed'}) — ` +
-            `no push remains to approve; this needs assisted-login.ts`);
-        await page.screenshot({ path: `${debugDir}/04-challenge.png` });
-        return 'challenge';
       }
       if (Date.now() - lastSnapshot >= SNAPSHOT_INTERVAL_MS) {
         snapshotCounter += 1;
@@ -393,7 +395,11 @@ async function login(browser: Browser): Promise<LoginOutcome> {
     // failure latch tripped (observed 2026-08-28, ~25h outage). Wedged means
     // exactly one thing: credentials submitted but the 2FA prompt never
     // appeared — only then does a bezant restart help.
-    const outcome: LoginOutcome = reached2FA ? 'push_timeout' : 'wedged';
+    // Only now, with the window spent and no session, does the challenge
+    // matter: it says WHY this failed and what can still fix it. A run that saw
+    // a challenge cannot be recovered by another push — the operator has to
+    // answer it — so it is reported as `challenge`, not `push_timeout`.
+    const outcome: LoginOutcome = lastChallenge ? 'challenge' : reached2FA ? 'push_timeout' : 'wedged';
     log(`Timed out (final URL: ${page.url()}) — classified "${outcome}" (reached2FA=${reached2FA})`);
     await page.screenshot({ path: `${debugDir}/04-timeout.png` });
     return outcome;

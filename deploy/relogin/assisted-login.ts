@@ -1,19 +1,27 @@
 /**
- * Operator-assisted IBKR login, for the case the unattended relogin cannot win:
- * IBKR's **challenge/response** fallback.
+ * Operator-assisted IBKR login, for the half of the second factor that no
+ * unattended script can answer.
  *
- * Observed 2026-09-01. index.ts submits credentials, selects IB Key, and waits
- * two minutes for the push to be approved. If it is not approved inside that
- * window, IBKR does not simply fail — the page switches to:
+ * IBKR offers TWO routes through 2FA, at the same time:
+ *
+ *   - the IB Key push, tapped on the phone; and
+ *   - a challenge/response form, shown on the page within seconds of the
+ *     device selection:
  *
  *     Enter the challenge code below into the IBKR Mobile app to generate a
- *     response code.   Challenge: 416 346   [ Enter Response Code ]  [Login]
+ *     response code.   Challenge: 111 222   [ Enter Response Code ]  [Login]
  *
- * There is no push to tap any more; the login can only be completed by a human
- * reading a code out of IBKR Mobile and typing it back. index.ts had already
- * torn the browser down by then and classified the run `push_timeout`, so three
- * attempts in a row "sent a push" that had, by the time anyone looked, become a
- * form nobody was filling in.
+ * EITHER completes the login. Measured 2026-09-02: the form appeared at
+ * 23:34:19 and a tap authenticated the session at 23:34:27, no code entered.
+ * The form appearing is therefore NOT evidence that the push has died, and is
+ * not a reason to stop waiting — an earlier version of index.ts treated it as
+ * both, and would have abandoned that login three seconds before it succeeded.
+ *
+ * What an unattended run cannot do is ANSWER the form; that needs a person with
+ * IBKR Mobile. When nobody taps in time the run ends with the form on screen
+ * and no way to use it — four runs on 2026-09-01/02 ended exactly that way.
+ * This script is the other half: it holds the page open long enough for a human
+ * to take either route.
  *
  * This script keeps the browser alive and hands that step to the operator over
  * two files, so it works fine over SSH with no TTY:

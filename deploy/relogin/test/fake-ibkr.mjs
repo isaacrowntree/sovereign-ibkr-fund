@@ -19,9 +19,12 @@
  *    whatever the first one did. That is what turned a correct code into
  *    "Authentication failed" on 2026-09-02: the fallback pressed Enter *and*
  *    clicked Login.
- *  - **The challenge is optional.** Per the operator: approve the push and
- *    IBKR *sometimes* follows with a challenge, sometimes just logs you in.
- *    `--mode` picks which.
+ *  - **The challenge and the push run in PARALLEL.** The form appears within
+ *    seconds of the device selection and either route completes the login —
+ *    measured in production on 2026-09-02, where the form was up 8 seconds
+ *    before a tap authenticated the session with no code entered. `--mode
+ *    push-wins` reproduces that: the form is served, and the push lands
+ *    anyway. Anything that treats the form as "the push is dead" fails here.
  *  - **The form's geometry.** The response box and Login button sit where they
  *    sit on the real page in a 1280x720 viewport, so the pixel fallback is
  *    exercised for real rather than against a convenient layout.
@@ -43,9 +46,12 @@ const flag = (name) => args.includes(`--${name}`);
 
 const PORT = Number(opt('port', 8099));
 const FRAME_PORT = PORT + 1;
-const MODE = opt('mode', 'challenge'); // challenge | push-only | wrong-code
+const MODE = opt('mode', 'challenge'); // challenge | push-only | wrong-code | push-wins
 const CROSS_ORIGIN = flag('cross-origin');
 const APPROVE_AFTER_MS = Number(opt('approve-after-ms', 1500));
+// How long after the form appears the tap lands, in push-wins mode. Production
+// measured 8 seconds.
+const PUSH_WINS_DELAY_MS = Number(opt('push-wins-delay-ms', 8000));
 
 const EXPECTED_CODE = '99887766';
 const CHALLENGE = '111 222';
@@ -130,6 +136,14 @@ function route(req, res, isFramePort) {
   const frameOrigin = CROSS_ORIGIN ? `http://127.0.0.1:${FRAME_PORT}` : '';
 
   if (url.pathname === '/health') {
+    // push-wins: the tap authenticates the SESSION, not the page. The real
+    // gateway flips /health on its own clock whether or not the browser asks
+    // for anything, which is exactly how a login completes while a challenge
+    // form sits untouched on screen.
+    if (MODE === 'push-wins' && state.deviceSelected
+        && Date.now() >= (state.pushApprovedAt ?? Infinity) + PUSH_WINS_DELAY_MS) {
+      state.authenticated = true;
+    }
     return send(res, 200, JSON.stringify({
       authenticated: state.authenticated,
       connected: state.authenticated,
@@ -185,6 +199,14 @@ function route(req, res, isFramePort) {
       return send(res, 200, '<html><body>Welcome</body></html>');
     }
     state.challengeShown = true;
+    return send(res, 200, challengeShell(frameOrigin));
+  }
+  // push-wins: show the form straight away, then let the tap complete the login
+  // a few seconds later. Both routes live at once, which is what production
+  // actually does.
+  if (state.deviceSelected && MODE === 'push-wins') {
+    state.challengeShown = true;
+    if (Date.now() >= (state.pushApprovedAt ?? Infinity) + PUSH_WINS_DELAY_MS) state.authenticated = true;
     return send(res, 200, challengeShell(frameOrigin));
   }
   if (state.deviceSelected) return send(res, 200, pushPage);

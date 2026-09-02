@@ -252,5 +252,19 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
     'the page echoed an unescaped <script> tag');
 }
 
+// ── 8. the form is up, and the TAP wins ─────────────────────────────────────
+// The regression that matters most: index.ts used to abandon the login the
+// instant this form appeared. In production on 2026-09-02 that would have
+// thrown away a session that arrived 8 seconds later, parked the fund and
+// paged the operator. Nothing may treat the form as proof the push is dead.
+{
+  const r = await scenario({ name: 'challenge form shown, but the push completes it', mode: 'push-wins' });
+  want('waits through the challenge and lets the tap win', r.serverState.authenticated, true);
+  want('  ...without submitting any code', r.serverState.submissions.length, 0);
+  want('  ...exit code 0', r.exit, 0);
+  want('  ...and the sentinel is cleared', r.sentinel, 'gone');
+  wantIncludes('  ...having still told the operator the challenge exists', r.out, 'CHALLENGE CODE');
+}
+
 console.log(`\n${PASS} passed, ${FAIL} failed`);
 process.exit(FAIL === 0 ? 0 : 1);
