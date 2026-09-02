@@ -164,8 +164,11 @@ function route(req, res, isFramePort) {
         const code = new URLSearchParams(body).get('response') ?? '';
         state.submissions.push(code);
         // Single-use: only the FIRST submission can ever succeed.
-        const first = state.submissions.length === 1;
-        if (first && code === EXPECTED_CODE && MODE !== 'wrong-code') {
+        // Single-use: a code already seen can never succeed again. But a NEW
+        // code still can — which is what makes a typo recoverable, and what the
+        // old "one submission per run" latch made impossible.
+        const fresh = state.submissions.filter((c) => c === code).length === 1;
+        if (fresh && code === EXPECTED_CODE && MODE !== 'wrong-code') {
           state.authenticated = true;
           return send(res, 200, '<html><body>Welcome</body></html>');
         }

@@ -607,7 +607,13 @@ async function main(): Promise<void> {
   // operator no way to tell an expected re-login from someone else trying to
   // get into the account — and "was that me?" is not a question you want to be
   // guessing at while a 2-minute approval window runs down.
-  await alert(
+  // Suppressed when the caller has already said it. preflight sends a richer
+  // heads-up (hours parked, minutes to the US open) and then invokes this
+  // script, so without the guard the operator gets two near-identical messages
+  // seconds apart — the fastest way to train someone to ignore both.
+  if (process.env.RELOGIN_PUSH_ALERT === 'already-sent') {
+    log('push notice suppressed — the caller has already announced it');
+  } else await alert(
     `:key: *IBKR session expired — logging in now.* An IB Key push is on its way; ` +
       `*tap Approve*. (Automatic re-login, triggered by ${process.env.INVOCATION_ID ? 'the relogin timer' : 'a manual run'} ` +
       `at ${new Date().toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney' })}.) ` +

@@ -110,7 +110,18 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
       25_000,
       'the challenge announcement',
     );
-    if (viaWeb) {
+    if (Array.isArray(respondWith)) {
+      // A wrong code, then the right one — the correction path.
+      for (const code of respondWith) {
+        await fetch(`http://127.0.0.1:${webPort}/`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ code }).toString(),
+        }).catch(() => {});
+        await sleep(6_000);
+      }
+      out += `\n[test] page after retries: ${await fetch(`http://127.0.0.1:${webPort}/`).then((r) => r.text()).catch(() => '')}\n`;
+    } else if (viaWeb) {
       // Exactly what a phone does: GET the page, then POST the form.
       const shown = await fetch(`http://127.0.0.1:${webPort}/`).then((r) => r.text()).catch(() => '');
       out += `\n[test] page showed: ${shown.includes('111 222') ? 'the challenge' : 'NO challenge'}\n`;
@@ -207,6 +218,38 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
   want('  ...with the code the phone sent', r.serverState.submissions[0], '99887766');
   want('  ...and the session comes back', r.serverState.authenticated, true);
   want('  ...with the sentinel cleared', r.sentinel, 'gone');
+}
+
+// ── 6. a typo must be correctable ───────────────────────────────────────────
+// The original latch allowed exactly one submission per run, so a mistyped code
+// ended the login: another push, another challenge, another 20 minutes.
+{
+  const r = await scenario({
+    name: 'a mistyped code, then the right one',
+    crossOrigin: true,
+    respondWith: ['11112222', '99887766'],
+  });
+  want('sends both codes to IBKR', r.serverState.submissions.length, 2);
+  want('  ...the wrong one first', r.serverState.submissions[0], '11112222');
+  want('  ...then the correction', r.serverState.submissions[1], '99887766');
+  want('  ...and the session comes back', r.serverState.authenticated, true);
+  wantIncludes('  ...having told the operator it was rejected', r.out, 'rejected the submitted code');
+}
+
+// ── 7. junk from the LAN never reaches IBKR ─────────────────────────────────
+{
+  const r = await scenario({
+    name: 'malformed submissions are refused at the door',
+    crossOrigin: true,
+    respondWith: ['<script>alert(1)</script>', 'not-a-code', '99887766'],
+  });
+  want('only the real code is sent to IBKR', r.serverState.submissions.length, 1);
+  want('  ...and it is the valid one', r.serverState.submissions[0], '99887766');
+  wantIncludes('  ...the junk is logged as refused', r.out, 'not sent to IBKR');
+  wantIncludes('  ...and never echoed unescaped into the page', r.out, '[test] page after retries:');
+  const echoedRaw = r.out.includes('<script>alert(1)</script>');
+  (echoedRaw ? no : ok)('  ...no raw script tag survives into the HTML',
+    'the page echoed an unescaped <script> tag');
 }
 
 console.log(`\n${PASS} passed, ${FAIL} failed`);

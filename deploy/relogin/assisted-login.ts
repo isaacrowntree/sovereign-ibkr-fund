@@ -88,6 +88,13 @@ const WEB_URL = `http://${WEB_HOST}:${WEB_PORT}`;
 const log = (m: string) => console.log(`[${new Date().toISOString()}] [assisted] ${m}`);
 
 /**
+ * The caller may have already told the operator a push is coming — preflight
+ * does, with more context than this script has (hours parked, minutes to the
+ * open). Two near-identical messages seconds apart teach people to ignore both.
+ */
+const PUSH_ALREADY_ANNOUNCED = process.env.RELOGIN_PUSH_ALERT === 'already-sent';
+
+/**
  * Slack/ntfy-compatible `{"text": ...}` webhook, no-op when unset.
  *
  * This script exists because a challenge appears where a push was expected, and
@@ -95,6 +102,14 @@ const log = (m: string) => console.log(`[${new Date().toISOString()}] [assisted]
  * phone that has to answer it is the difference between a two-minute fix and an
  * outage that waits for someone to go looking.
  */
+async function announcePush(text: string): Promise<void> {
+  if (PUSH_ALREADY_ANNOUNCED) {
+    log('push notice suppressed — the caller has already announced it');
+    return;
+  }
+  await alert(text);
+}
+
 async function alert(text: string): Promise<void> {
   if (!ALERT_WEBHOOK) return;
   try {
@@ -255,10 +270,36 @@ async function submitResponse(page: Page, code: string): Promise<boolean> {
  */
 const ui = {
   challenge: null as string | null,
-  submitted: null as string | null,
-  authenticated: false,
-  finished: false,
+  status: 'waiting' as 'waiting' | 'challenge' | 'submitting' | 'rejected' | 'authenticated' | 'failed',
+  lastCode: null as string | null,
+  note: null as string | null,
+  attemptsLeft: 0,
 };
+
+/**
+ * A response code is digits. Rejecting anything else at the door means a stray
+ * or malicious POST from the LAN costs nothing: it never reaches IBKR, so it
+ * cannot spend one of the few wrong answers an account tolerates.
+ */
+const CODE_RE = /^[0-9]{4,12}$/;
+
+/**
+ * How many codes one run will send to IBKR. More than one because a typo must
+ * be correctable — see the retry loop in run() — and not many, because wrong
+ * answers are not free with a broker.
+ */
+const MAX_SUBMISSIONS = 3;
+
+/**
+ * Everything interpolated into the page is escaped. `lastCode` and `note` come
+ * from a POST body, so a LAN device could otherwise inject script into a page
+ * the operator opens on their phone while logging into a brokerage account.
+ */
+function esc(value: string): string {
+  return value.replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string
+  ));
+}
 
 const page_css = `
   body{font-family:-apple-system,system-ui,sans-serif;margin:0;padding:24px;background:#f6f7f9;color:#111}
@@ -267,55 +308,90 @@ const page_css = `
   .challenge{font-size:40px;font-weight:600;letter-spacing:3px;text-align:center;margin:18px 0;font-variant-numeric:tabular-nums}
   input{width:100%;box-sizing:border-box;font-size:26px;padding:14px;border:2px solid #cbd2d9;border-radius:10px;text-align:center;letter-spacing:2px}
   button{width:100%;margin-top:14px;padding:15px;font-size:17px;border:0;border-radius:10px;background:#0b5fff;color:#fff;font-weight:600}
-  .ok{color:#0a7a3d;font-weight:600} .wait{color:#8a6d00;font-weight:600}
+  .ok{color:#0a7a3d;font-weight:600} .wait{color:#8a6d00;font-weight:600} .bad{color:#b00020;font-weight:600}
 `;
 
-function renderPage(): string {
-  if (ui.authenticated) {
-    return html('Logged in', '<p class="ok">✅ Session restored — the fund is trading again. You can close this.</p>');
-  }
-  if (ui.submitted) {
-    return html('Submitting…', `<p class="wait">Sent <b>${ui.submitted}</b> — waiting for IBKR.</p>`
-      + '<p>This page refreshes itself.</p>');
-  }
-  if (!ui.challenge) {
-    return html('Waiting for IBKR', '<p class="wait">Login started. Approve the IB Key push if it arrives.</p>'
-      + '<p>If IBKR asks for a challenge code instead, it will appear here automatically.</p>');
-  }
-  return html('Enter response code', `
-    <p>In IBKR Mobile: <b>Avatar → Two-Factor Authentication</b>, enter this challenge:</p>
-    <div class="challenge">${ui.challenge}</div>
-    <form method="POST" action="/">
+function form(buttonLabel: string): string {
+  return `<form method="POST" action="/">
       <input name="code" inputmode="numeric" autocomplete="one-time-code" autofocus placeholder="response code">
-      <button type="submit">Submit</button>
-    </form>`);
+      <button type="submit">${buttonLabel}</button>
+    </form>
+    <p>${ui.attemptsLeft} attempt${ui.attemptsLeft === 1 ? '' : 's'} left this login.</p>`;
+}
+
+function renderPage(): string {
+  const note = ui.note ? `<p class="bad">${esc(ui.note)}</p>` : '';
+  const challenge = ui.challenge
+    ? `<p>In IBKR Mobile: <b>Avatar → Two-Factor Authentication</b>, enter this challenge:</p>
+       <div class="challenge">${esc(ui.challenge)}</div>`
+    : '';
+
+  switch (ui.status) {
+    case 'authenticated':
+      return html('Logged in', '<p class="ok">✅ Session restored — the fund is trading again. You can close this.</p>');
+    case 'failed':
+      // A terminal page, not a dead socket: the run is over and the phone must
+      // be told, or the last thing it ever said is "waiting for IBKR".
+      return html('Login did not complete', `<p class="bad">❌ This login has ended without a session.</p>${note}
+        <p>Start another from the Pi:<br><code>npx tsx assisted-login.ts</code></p>`);
+    case 'submitting':
+      return html('Submitting…', `<p class="wait">Sent <b>${esc(ui.lastCode ?? '')}</b> — waiting for IBKR.</p>
+        <p>This page refreshes itself.</p>`);
+    case 'rejected':
+      return html('IBKR rejected that code', `${note}
+        <p>Response codes are single-use — generate a <b>new</b> one for the challenge below.</p>
+        ${challenge}${ui.attemptsLeft > 0 ? form('Try again') : '<p class="bad">No attempts left this login.</p>'}`);
+    case 'challenge':
+      return html('Enter response code', `${note}${challenge}${form('Submit')}`);
+    default:
+      return html('Waiting for IBKR', `${note}<p class="wait">Login started. Approve the IB Key push if it arrives.</p>
+        <p>If IBKR asks for a challenge code instead, it will appear here automatically.</p>`);
+  }
 }
 
 // A refresh keeps the page honest without a websocket: the states it moves
 // between are seconds apart and it is one form on a phone, not an app.
 function html(title: string, body: string): string {
-  const refresh = ui.authenticated ? '' : '<meta http-equiv="refresh" content="3">';
+  const settled = ui.status === 'authenticated' || ui.status === 'failed';
+  const refresh = settled ? '' : '<meta http-equiv="refresh" content="3">';
   return `<!doctype html><html><head><meta charset="utf-8">
     <meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
     <title>IBKR login</title><style>${page_css}</style></head>
-    <body><div class="card"><h1>${title}</h1>${body}</div></body></html>`;
+    <body><div class="card"><h1>${esc(title)}</h1>${body}</div></body></html>`;
 }
 
 /**
  * Serves the form for the life of the run. Bound to every interface because the
- * point is to reach it from the phone; it exposes one challenge and accepts one
- * response code, never credentials, and only while a login this host started is
- * already in flight.
+ * point is to reach it from the phone; it exposes one challenge and accepts
+ * response codes, never credentials, and only while a login this host started
+ * is already in flight.
  */
 function startWebServer(onCode: (code: string) => void): http.Server {
   const server = http.createServer((req, res) => {
     if (req.method === 'POST') {
       let body = '';
-      req.on('data', (c) => { body += c; });
+      let aborted = false;
+      req.on('data', (c) => {
+        body += c;
+        // A form field is a few bytes. Anything larger is not an operator, and
+        // an unbounded string on a listening socket is a way to exhaust the
+        // memory of the process holding the login open.
+        if (body.length > 4096 && !aborted) {
+          aborted = true;
+          res.writeHead(413).end();
+          req.destroy();
+        }
+      });
       req.on('end', () => {
+        if (aborted) return;
         const code = (new URLSearchParams(body).get('code') ?? '').replace(/\s+/g, '');
-        if (code) {
-          ui.submitted = code;
+        if (!CODE_RE.test(code)) {
+          ui.note = code ? 'That does not look like a response code — it should be 6 to 8 digits.' : 'Enter the code from IBKR Mobile.';
+          log(`Rejected a malformed submission from the form (${code.length} chars) — not sent to IBKR`);
+        } else {
+          ui.note = null;
+          ui.lastCode = code;
+          ui.status = 'submitting';
           onCode(code);
           log(`Response code received from ${WEB_URL} (${code.length} chars)`);
         }
@@ -331,6 +407,19 @@ function startWebServer(onCode: (code: string) => void): http.Server {
   // Never let an idle socket hold the process open past the login it serves.
   server.unref();
   return server;
+}
+
+/**
+ * Let a phone mid-refresh see the terminal page before the socket goes away.
+ * Without this the last thing the operator sees is a connection error, which
+ * reads as "the Pi broke" rather than "the login ended".
+ */
+async function settle(server: http.Server, status: 'authenticated' | 'failed', note?: string): Promise<void> {
+  ui.status = status;
+  if (note) ui.note = note;
+  ui.attemptsLeft = 0;
+  await sleep(4_000);
+  server.close();
 }
 
 async function markSuccess(): Promise<void> {
@@ -370,7 +459,7 @@ async function run(browser: Browser): Promise<boolean> {
   const deviceSelect = page.locator('select').first();
   if (await deviceSelect.count() > 0 && await deviceSelect.isVisible()) {
     log('2FA device prompt — selecting IB Key (value=5.2a); a push is being sent');
-    await alert(
+    await announcePush(
       ':key: *IBKR assisted login started* — an IB Key push is on its way; *tap Approve*. ' +
         `If IBKR asks for a challenge code instead, it will appear at ${WEB_URL} and here. ` +
         'If you did NOT expect this, do not approve it.',
@@ -388,8 +477,13 @@ async function run(browser: Browser): Promise<boolean> {
   log('Waiting: approve the push. IBKR may then ask for a challenge/response code — watching for both.');
 
   const started = Date.now();
-  let announced = false;
-  let submitted = false;
+  ui.attemptsLeft = MAX_SUBMISSIONS;
+  // Codes already sent to IBKR. A SET, not a boolean: the old latch stopped the
+  // same single-use code being submitted twice (right) and also stopped a
+  // CORRECTED code being submitted after a rejection (wrong) — one typo ended
+  // the run, costing another push, another challenge and 20 more minutes.
+  const sentToIbkr = new Set<string>();
+  let announcedChallenge: string | null = null;
   let shot = 0;
 
   while (Date.now() - started < TOTAL_BUDGET_MS) {
@@ -397,20 +491,15 @@ async function run(browser: Browser): Promise<boolean> {
     await nudgeSsoBridge();
     const health = await probeHealth();
     if (health?.authenticated) {
-      ui.authenticated = true;
       log('Authenticated — /health.authenticated=true');
       await alert(':white_check_mark: *IBKR session is back* — assisted login succeeded, the fund is trading again.');
       await page.screenshot({ path: `${DEBUG_DIR}/success.png` }).catch(() => {});
-      // Held open briefly so a phone mid-refresh sees the success page rather
-      // than a dead socket.
-      await sleep(4_000);
-      ui.finished = true;
-      server.close();
+      await settle(server, 'authenticated');
       return true;
     }
 
     const text = await deepText(page);
-    if (!announced && text.length < 40) {
+    if (!announcedChallenge && text.length < 40) {
       // One line per poll would be noise; this fires only while the page is
       // opaque to us, which is exactly when we want to know about it.
       log(`(diag: deepText=${text.length} chars, frames=${page.frames().length}, url=${page.url()}` +
@@ -418,12 +507,23 @@ async function run(browser: Browser): Promise<boolean> {
     }
     const challenge = text.match(CHALLENGE_RE)?.[1].trim() ?? null;
 
-    // Announce the challenge once. Re-announcing on every poll would race the
-    // operator: they could be reading digits that a re-render has replaced.
-    if (challenge && !announced) {
+    // IBKR rejects a code on the page, not over the API, so the page text is
+    // the only place this is visible. Seeing it matters: it is what turns a
+    // silent 20-minute wait into "generate another one".
+    if (/authentication failed|invalid|incorrect/i.test(text) && ui.status === 'submitting') {
+      ui.status = 'rejected';
+      ui.note = 'IBKR rejected that code. Generate a new one — codes are single-use.';
+      log('IBKR rejected the submitted code — waiting for another');
+    }
+
+    // Announce each DISTINCT challenge once. Re-announcing the same digits every
+    // poll would race the operator; never re-announcing means a challenge that
+    // IBKR rotates after a rejection is one the operator can no longer answer.
+    if (challenge && challenge !== announcedChallenge) {
       await page.screenshot({ path: `${DEBUG_DIR}/challenge.png` }).catch(() => {});
       await fs.writeFile(CHALLENGE_FILE, `${challenge}\n`);
       ui.challenge = challenge;
+      if (ui.status === 'waiting' || ui.status === 'rejected') ui.status = 'challenge';
       log(`CHALLENGE CODE: ${challenge}`);
       await alert(
         `:1234: *IBKR wants a challenge/response code.* Challenge: *${challenge}*\n` +
@@ -434,15 +534,17 @@ async function run(browser: Browser): Promise<boolean> {
       );
       log('Enter it in IBKR Mobile (Avatar -> Two-Factor Authentication) and write the');
       log(`response code to: ${RESPONSE_FILE}`);
-      announced = true;
+      announcedChallenge = challenge;
     }
 
     // Submission does NOT wait for the challenge to be recognised. Detection has
     // failed twice on a page that was plainly showing the form; a response code
     // the operator has already generated must not be held hostage to it.
-    if (!submitted) {
+    if (sentToIbkr.size < MAX_SUBMISSIONS) {
       const code = await fs.readFile(RESPONSE_FILE, 'utf8').then((c) => c.trim()).catch(() => '');
-      if (code) {
+      // Skip codes already sent: re-submitting a single-use code is guaranteed
+      // to fail and spends one of the few wrong answers IBKR tolerates.
+      if (code && CODE_RE.test(code) && !sentToIbkr.has(code)) {
         log(`Response code received (${code.length} chars) — submitting`);
         let typed = await submitResponse(page, code);
         if (!typed) {
@@ -466,9 +568,10 @@ async function run(browser: Browser): Promise<boolean> {
           await page.mouse.click(LOGIN_BUTTON_XY.x, LOGIN_BUTTON_XY.y);
           typed = true;
         }
-        // One submission per run. A wrong code must surface as a visible
-        // failure the operator can see, not as a loop retyping it forever.
-        submitted = true;
+        sentToIbkr.add(code);
+        ui.attemptsLeft = MAX_SUBMISSIONS - sentToIbkr.size;
+        ui.lastCode = code;
+        ui.status = 'submitting';
         await page.waitForTimeout(3_000);
         await page.screenshot({ path: `${DEBUG_DIR}/post-response.png` }).catch(() => {});
         log(`Submitted (box found: ${typed}). Post-submit URL: ${page.url()}`);
@@ -485,10 +588,13 @@ async function run(browser: Browser): Promise<boolean> {
     }
   }
 
-  ui.finished = true;
-  server.close();
   log('Budget exhausted without an authenticated session');
   await page.screenshot({ path: `${DEBUG_DIR}/timeout.png` }).catch(() => {});
+  await alert(
+    ':x: *IBKR assisted login ended without a session* — the push was not approved and no working ' +
+      'response code arrived. The fund is still logged out.',
+  );
+  await settle(server, 'failed', 'The login timed out before a session was established.');
   return false;
 }
 
@@ -522,6 +628,14 @@ async function main(): Promise<void> {
     const ok = await run(browser);
     if (ok) await markSuccess();
     process.exit(ok ? 0 : 1);
+  } catch (e) {
+    // Anything thrown before or during the loop — a gateway that stops
+    // answering mid-navigation, a page that never renders — used to exit
+    // silently. The operator is by definition waiting on a phone at this point.
+    const why = String((e as Error).stack ?? e).split('\n')[0];
+    log(`FATAL: ${why}`);
+    await alert(`:x: *IBKR assisted login crashed* — \`${why}\`. The fund is still logged out.`);
+    process.exit(1);
   } finally {
     await browser.close().catch(() => {});
   }
