@@ -13,28 +13,56 @@
  *   SILENT   — no runs at all. A dead scheduler produces zero failures, so a
  *              failure-only check stays quiet through the worst outage.
  *
+ * WHERE THIS REPORTS. It used to post to Slack on every change to the set of
+ * unhealthy agents, which on a bad night meant five messages saying much the
+ * same thing — and not one of them was actionable at the hour it arrived. So
+ * it now writes two things and posts nothing:
+ *
+ *   agent-health.json   the CURRENT picture, which is what you actually want:
+ *                       who is failing right now, not who was failing at 01:07.
+ *                       Rendered as a table on pi.lan/ops.
+ *   ops-feed.jsonl      one line when the set CHANGES, so the history of a
+ *                       flapping agent is still readable.
+ *
+ * The dedupe below therefore no longer gates whether you are interrupted — it
+ * gates whether an event is worth a line in the log. Both files are written
+ * every run regardless.
+ *
  * Env:
  *   PAPERCLIP_DATABASE_URL     postgres URL for the paperclip schema
- *   IBKR_FUND_ALERT_WEBHOOK    Slack incoming webhook
- *   AGENT_HEALTH_STATE_DIR     where to keep dedupe state (default /fund-state/state)
+ *   AGENT_HEALTH_STATE_DIR     where the status file and feed live
+ *                              (default /fund-state/state)
  *   AGENT_HEALTH_SILENT_FACTOR multiple of an agent's own interval before it is
  *                              considered silent (default 2)
- *   AGENT_HEALTH_DRY_RUN=1     print, do not post
+ *   AGENT_HEALTH_DRY_RUN=1     print, write nothing
  */
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { globSync } from 'node:fs';
 
 const DB = process.env.PAPERCLIP_DATABASE_URL;
-const HOOK = process.env.IBKR_FUND_ALERT_WEBHOOK;
 const STATE_DIR = process.env.AGENT_HEALTH_STATE_DIR || '/fund-state/state';
 const FACTOR = Number(process.env.AGENT_HEALTH_SILENT_FACTOR || 2);
 const DRY = process.env.AGENT_HEALTH_DRY_RUN === '1';
 
 const die = (m) => { console.error(`[agent-health] FATAL: ${m}`); process.exit(1); };
 if (!DB) die('PAPERCLIP_DATABASE_URL unset');
-if (!HOOK && !DRY) die('IBKR_FUND_ALERT_WEBHOOK unset');
+
+/**
+ * The ops feed, in longhand — see deploy/lib/ops-feed.ts for the contract.
+ * Copied rather than imported on purpose: this file runs as bare `node` inside
+ * the paperclip container, with no tsx and no build step, so it cannot import
+ * the TypeScript one. Fifteen duplicated lines is a better trade than a build
+ * step on the one script whose job is to notice when other things stop running.
+ */
+function feed(ev) {
+  try {
+    mkdirSync(STATE_DIR, { recursive: true });
+    appendFileSync(join(STATE_DIR, 'ops-feed.jsonl'),
+      JSON.stringify({ at: new Date().toISOString(), source: 'agents', ...ev }) + '\n');
+  } catch { /* never worth failing the check over */ }
+}
 
 // paperclip's own `postgres` driver. Resolved by glob rather than a pinned path so
 // a pnpm version bump inside the container does not silently break the alerter —
@@ -93,22 +121,26 @@ try {
   const failing = rows.filter(r => !silent.includes(r) && r.lastStatus === 'failed');
 
   const hrs = (s) => s === null ? 'never' : `${(s / 3600).toFixed(1)}h ago`;
-  const lines = [];
-  if (failing.length) {
-    lines.push(`*${failing.length} agent(s) failing*`);
-    for (const r of failing) {
-      lines.push(`• \`${r.name}\` — last run failed${r.lastErr ? ` (${r.lastErr})` : ''}, ${hrs(r.ageSec)} · ${r.ok}✓/${r.failed}✗ recently`);
-    }
-  }
-  if (silent.length) {
-    lines.push(`*${silent.length} agent(s) silent* (no run in >${FACTOR}× their interval)`);
-    for (const r of silent) {
-      lines.push(`• \`${r.name}\` — last run ${hrs(r.ageSec)}, expected every ${(r.intervalSec / 3600).toFixed(0)}h`);
-    }
-  }
 
-  // Dedupe on the SET of unhealthy agents, not on time: re-alert when the set
-  // changes (something broke or recovered), stay quiet while it is unchanged.
+  // Shaped for the page that renders it, not for a chat message: the hub shows
+  // a table, so the reasons are pre-worded here rather than parsed back out of
+  // a bullet list on the other side.
+  const detail = (r, why) => ({
+    name: r.name,
+    reason: why,
+    lastErr: r.lastErr,
+    ago: hrs(r.ageSec),
+    ok: r.ok,
+    failed: r.failed,
+    intervalHours: Number((r.intervalSec / 3600).toFixed(1)),
+  });
+  const failingOut = failing.map(r => detail(r, 'last run failed'));
+  const silentOut = silent.map(r => detail(r, `no run in >${FACTOR}× its interval`));
+
+  // Dedupe on the SET of unhealthy agents, not on time: record an event when
+  // the set changes (something broke or recovered), stay quiet while it is
+  // unchanged. The status file below is rewritten either way — a page must
+  // show what is true now, not what was true when it last changed.
   const key = JSON.stringify({
     failing: failing.map(r => r.name).sort(),
     silent: silent.map(r => r.name).sort(),
@@ -119,33 +151,41 @@ try {
   try { prev = JSON.parse(readFileSync(statePath, 'utf8')).key; } catch { /* first run */ }
 
   const healthy = !failing.length && !silent.length;
-  if (healthy) {
-    if (prev && prev !== '{"failing":[],"silent":[]}') {
-      lines.push(`*Recovered* — all ${rows.length} invokable agents healthy again`);
-    } else {
-      console.log(`[agent-health] OK — ${rows.length} agents healthy, nothing to report`);
-      writeFileSync(statePath, JSON.stringify({ key, at: new Date().toISOString() }));
-      await sql.end(); process.exit(0);
-    }
-  } else if (key === prev) {
-    console.log(`[agent-health] unchanged (${failing.length} failing, ${silent.length} silent) — not re-alerting`);
+  const status = {
+    at: new Date().toISOString(),
+    key,
+    healthy,
+    total: rows.length,
+    failing: failingOut,
+    silent: silentOut,
+  };
+
+  if (DRY) {
+    console.log('[agent-health] DRY RUN, would write:\n' + JSON.stringify(status, null, 2));
     await sql.end(); process.exit(0);
   }
 
-  const text = `:rotating_light: *IBKR fund — agent health*\n${lines.join('\n')}`;
-  if (DRY) {
-    console.log('[agent-health] DRY RUN, would post:\n' + text);
-  } else {
-    const res = await fetch(HOOK, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ text }),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!res.ok) die(`webhook rejected: ${res.status} ${await res.text().catch(() => '')}`);
-    console.log(`[agent-health] alerted: ${failing.length} failing, ${silent.length} silent`);
+  writeFileSync(statePath, JSON.stringify(status));
+
+  if (key === prev) {
+    console.log(`[agent-health] unchanged (${failing.length} failing, ${silent.length} silent) — status refreshed, no event`);
+    await sql.end(); process.exit(0);
   }
-  writeFileSync(statePath, JSON.stringify({ key, at: new Date().toISOString() }));
+
+  if (healthy) {
+    // First run on a healthy fund is not a recovery, it is a baseline.
+    if (prev !== null) {
+      feed({ severity: 'recovery', title: `All ${rows.length} invokable agents healthy again` });
+    }
+  } else {
+    const bad = [...failingOut, ...silentOut];
+    feed({
+      severity: 'critical',
+      title: `${bad.length} of ${rows.length} agents unhealthy`,
+      detail: bad.map(r => `${r.name} — ${r.reason}${r.lastErr ? ` (${r.lastErr})` : ''}, ${r.ago}`).join('; '),
+    });
+  }
+  console.log(`[agent-health] ${failing.length} failing, ${silent.length} silent — status written, event recorded`);
   await sql.end();
 } catch (err) {
   console.error('[agent-health] ERROR:', err?.message || err);

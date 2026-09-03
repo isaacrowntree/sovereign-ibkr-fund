@@ -42,6 +42,20 @@ export interface NotifyEvent {
   agent?: string;
   /** Dedupe policy. Omit to always send. */
   dedupe?: { key: string; fingerprint?: string; ttlMs?: number };
+  /**
+   * Where this event is allowed to interrupt.
+   *
+   * Every event is recorded on the ops feed and shows up at pi.lan/ops. This
+   * says whether it ALSO buzzes a phone. Default 'slack' — the events that
+   * predate this field are fills, hard stops and reconcile breaks, and those
+   * are exactly what a notification is for. Set 'ops' for the ones that are
+   * only ever read after the fact: the daily digest is state, not news, and it
+   * is already on the page in a form a chat message cannot match.
+   *
+   * Rendering ignores this entirely; it is a routing decision, and blocks.ts
+   * stays pure.
+   */
+  channel?: 'slack' | 'ops';
 }
 
 export interface RenderMeta {

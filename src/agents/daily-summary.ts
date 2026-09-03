@@ -206,13 +206,21 @@ export async function run(): Promise<void> {
       fields: digest.fields,
       agent: AGENT,
       // Once per trading day, ever. The date IS the identity, so there is
-      // nothing to re-nag about — hence no ttl.
+      // nothing to re-nag about — hence no ttl. The dedupe row is also the
+      // nightly backup's proof that this agent ran, so it keeps being written
+      // even though nothing is posted to Slack any more.
       dedupe: { key: `digest:${date}`, ttlMs: Infinity },
+      // The page, not the phone. Every number in this digest — NAV, drift,
+      // movers, VaR, alpha — is already on pi.lan/fund, live and sorted and
+      // clickable, which a 30-line chat message can never be. As a daily
+      // notification it was the largest single thing in the channel and the
+      // least likely to be acted on.
+      channel: 'ops',
     },
     storeHooks,
   );
 
-  log(`Daily summary sent for ${date}`, AGENT);
+  log(`Daily summary recorded for ${date}`, AGENT);
 }
 
 if (process.argv.includes('--once')) {

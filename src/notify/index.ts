@@ -19,6 +19,7 @@
  */
 import { log, logError } from '../log.js';
 import { renderText, renderSlackPayload, type NotifyEvent, type RenderMeta } from './blocks.js';
+import { feed } from './feed.js';
 
 export type { NotifyEvent, NotifyField, RenderMeta, Severity } from './blocks.js';
 
@@ -222,6 +223,16 @@ export async function notify(event: NotifyEvent, hooks?: DedupeHooks): Promise<v
       if (!ok) return;
       claimed = event.dedupe.key;
     }
+
+    // The ops feed is the record; Slack is an interruption layer on top of it,
+    // and `channel: 'ops'` means record-only. Both sit BELOW the dedupe claim
+    // rather than above it, which matters more than it looks: the daily
+    // digest's claim row (`digest:<date>`) is what the nightly backup reads to
+    // prove the digest agent ran at all. Short-circuiting before the claim
+    // would have left that row unwritten and the backup crying wolf every
+    // night — the exact false alarm it was fixed for in the first place.
+    feed(event);
+    if (event.channel === 'ops') return;
 
     const delivered = await getNotifier().notify(event);
     if (!delivered && claimed && hooks) {

@@ -1,0 +1,5 @@
+{
+  "name": "ibkr-fund-deploy-lib",
+  "private": true,
+  "type": "module"
+}

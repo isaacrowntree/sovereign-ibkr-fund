@@ -47,6 +47,7 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { chromium, type Browser } from 'playwright';
 import { planRecovery } from './recovery-plan.js';
+import { feed } from '../lib/ops-feed.js';
 import {
   trySilentRecovery,
   SSODH_INIT_PATH,
@@ -501,25 +502,34 @@ async function finalizeFailure(outcome: LoginOutcome | 'terminated', reason: str
       `Hit ${MAX_CONSECUTIVE_FAILURES} consecutive failure(s) (last outcome: ${outcome}) — ` +
         `disabling further automatic attempts. Manual reset required (see top-of-file comment).`,
     );
-    // A challenge needs a different message AND a different command: clearing
-    // the sentinel and re-running relogin cannot fix it, because relogin has no
-    // way to type a response code. Sending the generic "tap a push" text here
-    // is what makes this failure a surprise twice.
+    // Both of these are the feed's, not Slack's. They read as emergencies, but
+    // they are not ones you can act on from a notification: the fix is a login
+    // you have to be present for, and pi.lan/ibkr shows this state whenever you
+    // open it. Waking someone at 03:00 for a fund that will stay logged out
+    // until they are awake anyway bought nothing but the habit of ignoring the
+    // channel.
+    //
+    // A challenge still gets its own wording: clearing the sentinel and
+    // re-running relogin cannot fix it, because relogin has no way to type a
+    // response code. Saying "tap a push" here is what made this failure a
+    // surprise twice.
     if (outcome === 'challenge') {
-      await alert(
-        `IBKR asked for a CHALLENGE/RESPONSE code, not a push — automatic re-login cannot finish ` +
-          `this and the fund is logged out.${lastChallenge ? ` Challenge shown: ${lastChallenge} (now expired).` : ''}\n` +
-          `Generate the response in IBKR Mobile (Avatar -> Two-Factor Authentication) against the ` +
-          `challenge THIS run prints:\n` +
-          `ssh your-pi 'cd ~/sovereign-ibkr-fund/deploy/relogin && npx tsx assisted-login.ts'\n` +
-          `It waits for you; write the response code to /tmp/bezant-assisted/response.txt.`,
-      );
+      feed({
+        source: 'relogin',
+        severity: 'critical',
+        title: 'IBKR asked for a challenge code, not a push — the fund is logged out',
+        detail:
+          `Automatic re-login cannot answer a challenge.${lastChallenge ? ` Challenge shown: ${lastChallenge} (now expired).` : ''} ` +
+          `Start a login from pi.lan/ibkr and answer it there — the page shows the challenge ` +
+          `and takes the response code from the phone that generated it.`,
+      });
     } else {
-      await alert(
-        `IBKR re-login failed (${outcome}: ${reason}) — auto-relogin is now DISABLED and the fund ` +
-          `is logged out. Reset when you can tap an IB Key push:\n` +
-          `ssh your-pi 'rm -f ~/.local/state/bezant-relogin/disabled && systemctl --user start ibkr-fund-relogin.service'`,
-      );
+      feed({
+        source: 'relogin',
+        severity: 'critical',
+        title: `Re-login failed (${outcome}) — auto-relogin is parked and the fund is logged out`,
+        detail: `${reason}. Start a login from pi.lan/ibkr when you can tap an IB Key push; the nightly pre-market re-key will also unpark and try once.`,
+      });
     }
   }
 
@@ -529,8 +539,15 @@ async function finalizeFailure(outcome: LoginOutcome | 'terminated', reason: str
 async function finalizeSuccess(): Promise<void> {
   if (finalized) return;
   // The other half of the announcement above: a push that is never mentioned
-  // again leaves the operator unsure whether their tap actually landed.
-  await alert(':white_check_mark: *IBKR session is back* — login succeeded, the fund is trading again.');
+  // again leaves the operator unsure whether their tap actually landed. That
+  // still matters — but only while you are looking, and by then you are on
+  // pi.lan/ibkr, which says it live. As a notification it was the single
+  // noisiest thing on the channel: four of them one night, none actionable.
+  feed({
+    source: 'relogin',
+    severity: 'recovery',
+    title: 'IBKR session is back — the fund is trading again',
+  });
   finalized = true;
 
   const state = activeState ?? (await loadState());

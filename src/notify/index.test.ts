@@ -273,6 +273,31 @@ describe('notify() claim lifecycle', () => {
     return { hooks, released, claimed };
   }
 
+  it("channel:'ops' records the event but sends nothing", async () => {
+    const { hooks } = spyHooks();
+    await notify({ severity: 'info', title: 'digest', channel: 'ops', dedupe: { key: 'k' } }, hooks);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("channel:'ops' STILL claims its dedupe key", async () => {
+    // Not a detail. The daily digest is the only 'ops' event with a dedupe
+    // policy, and its claim row (`digest:<date>`) is what the nightly backup
+    // reads to prove the digest agent ran. An early return above the claim
+    // would leave that row unwritten and the backup would report a dead digest
+    // every night — which is the exact false alarm it was fixed for once
+    // already.
+    const { hooks, claimed } = spyHooks();
+    await notify({ severity: 'info', title: 'digest', channel: 'ops',
+                   dedupe: { key: 'digest:2026-09-02' } }, hooks);
+    expect(claimed.map((c) => c[0])).toEqual(['digest:2026-09-02']);
+  });
+
+  it("channel:'ops' respects a suppressed claim", async () => {
+    const { hooks } = spyHooks(false);
+    await notify({ severity: 'info', title: 'digest', channel: 'ops', dedupe: { key: 'k' } }, hooks);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it('suppressed claim → no POST at all', async () => {
     const { hooks } = spyHooks(false);
     await notify({ severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);

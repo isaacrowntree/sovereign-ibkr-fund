@@ -9,9 +9,9 @@ your own host.
 | `ibkr-fund-watchdog` | probes the bezant gateway **and the event feed**, restarts it if either is wedged | ~1 min |
 | `ibkr-fund-relogin` | re-authenticates the IBKR session (Playwright) | ~5 min |
 | `ibkr-fund-observer` | polls the bezant event stream; the only writer of `state.observedEvents` | ~5 min |
-| `ibkr-fund-digest` | daily summary to Slack | Mon–Fri |
+| `ibkr-fund-digest` | daily summary to the ops feed | Mon–Fri |
 | `ibkr-fund-backup` | uploads the SQLite ledger to Slack | daily |
-| `ibkr-fund-agent-health` | alerts on failing **or silent** agents | hourly |
+| `ibkr-fund-agent-health` | reports failing **or silent** agents to the ops feed | hourly |
 | `ibkr-fund-db-retention` | redacts old run blobs in paperclip's DB | weekly |
 
 ## Substitute the placeholders
@@ -75,14 +75,36 @@ without a redeploy fails loudly instead of trading.
 > `SAMPLE_PORTFOLIO` **silently** — i.e. rebalancing a live account toward a
 > sample allocation.
 
+## Where these units report — the ops feed
+
+Almost nothing here posts to Slack any more. It used to, because a webhook was
+the only surface these units could reach, and the result was about nine
+messages a day of which roughly none could be acted on at the hour they
+arrived. A channel you have learned to scroll past is not monitoring.
+
+So Slack keeps exactly what a page cannot do — carry the backup archive off the
+Pi, and buzz a phone when a login needs a thumb inside two minutes — and
+everything else appends to `ops-feed.jsonl`, which the hub renders at
+`pi.lan/ops`. `lib/ops-feed.ts` is the writer and documents the line format;
+`src/notify/feed.ts` is the same contract for the agents, wired into `notify()`
+so **every** structured event is recorded whether or not it also reaches Slack.
+`NotifyEvent.channel: 'ops'` is what says "record it, don't interrupt".
+
+The feed and its status files live in `/fund-state/state` inside the container,
+which is `/var/lib/sovereign-fund/state` on the host — the one directory both
+sides can already see, which is why a check running inside paperclip can
+publish to a page outside it with no new mount.
+
 ## Monitoring
 
 Agent failures are recorded in paperclip's Postgres (`heartbeat_runs`), **not**
 in `docker logs`. A clean container log does not mean the fund is working; in
 this project it hid months of every-run failures. `ibkr-fund-agent-health`
-queries that table and alerts on two independent conditions — agents *failing*,
+queries that table and reports two independent conditions — agents *failing*,
 and agents *silent* (a dead scheduler produces zero failures, so a failure-only
-check stays quiet through the worst outage).
+check stays quiet through the worst outage). It writes `agent-health.json` every
+run (what is true now) and a feed line only when the set of unhealthy agents
+changes (what happened).
 
 Note that on some hosts `journalctl --user -u <unit>` returns nothing even
 though the unit ran; user units may log to the system journal. Use

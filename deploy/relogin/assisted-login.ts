@@ -49,6 +49,7 @@ import { chromium, type Browser, type Frame, type Page } from 'playwright';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { feed } from '../lib/ops-feed.js';
 
 const HEALTH_URL = process.env.BEZANT_HEALTH_URL ?? 'http://localhost:8080/health';
 const LOGIN_URL = process.env.BEZANT_LOGIN_URL ?? 'https://localhost:5000';
@@ -389,7 +390,15 @@ async function run(browser: Browser): Promise<boolean> {
     const health = await probeHealth();
     if (health?.authenticated) {
       log('Authenticated — /health.authenticated=true');
-      await alert(':white_check_mark: *IBKR session is back* — assisted login succeeded, the fund is trading again.');
+      // Feed, not Slack: this run only ever happens because a human started it
+      // and is watching the page, which says "Session restored" the moment
+      // this does. A push telling you what the screen in your hand already
+      // says is the definition of the noise this channel was drowning in.
+      feed({
+        source: 'relogin',
+        severity: 'recovery',
+        title: 'IBKR session is back — assisted login succeeded',
+      });
       await page.screenshot({ path: `${DEBUG_DIR}/success.png` }).catch(() => {});
       await publishStatus({ status: 'authenticated', attemptsLeft: 0, note: null });
       return true;
@@ -493,10 +502,20 @@ async function run(browser: Browser): Promise<boolean> {
 
   log('Budget exhausted without an authenticated session');
   await page.screenshot({ path: `${DEBUG_DIR}/timeout.png` }).catch(() => {});
+  // This one stays a notification. It can only follow a login you started
+  // yourself, so it is bounded by your own actions rather than by the Pi's
+  // clock — and it is the message that tells you to walk back to the page,
+  // which you have by then almost certainly closed.
   await alert(
     ':x: *IBKR assisted login ended without a session* — the push was not approved and no working ' +
       'response code arrived. The fund is still logged out.',
   );
+  feed({
+    source: 'relogin',
+    severity: 'critical',
+    title: 'Assisted login ended without a session',
+    detail: 'The push was not approved and no working response code arrived. The fund is still logged out.',
+  });
   await publishStatus({
     status: 'failed',
     attemptsLeft: 0,
@@ -542,6 +561,12 @@ async function main(): Promise<void> {
     const why = String((e as Error).stack ?? e).split('\n')[0];
     log(`FATAL: ${why}`);
     await alert(`:x: *IBKR assisted login crashed* — \`${why}\`. The fund is still logged out.`);
+    feed({
+      source: 'relogin',
+      severity: 'critical',
+      title: 'Assisted login crashed',
+      detail: `${why}. The fund is still logged out.`,
+    });
     process.exit(1);
   } finally {
     await browser.close().catch(() => {});

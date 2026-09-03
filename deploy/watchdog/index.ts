@@ -37,6 +37,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
+import { feed } from '../lib/ops-feed.js';
 
 const execAsync = promisify(exec);
 
@@ -328,11 +329,27 @@ async function main(): Promise<void> {
     if (ok) {
       await clearReloginDisabled();
       // bezant was hard-down (not just logged out) and we bounced it — surface
-      // it so a recurring crash loop is visible, not silent.
-      await alert(`IBKR fund: bezant was down (${restartReason}) — auto-restarted the container (restart #${state.totalRestarts}).`);
+      // it so a recurring crash loop is visible, not silent. On the feed rather
+      // than Slack: a restart that WORKED is a thing to notice, not a thing to
+      // wake up for, and /ops shows the running total so a crash loop reads as
+      // a climbing number instead of a stack of identical messages.
+      feed({
+        source: 'watchdog',
+        severity: 'warn',
+        title: `bezant was down (${restartReason}) — auto-restarted`,
+        detail: `Restart #${state.totalRestarts}. The gateway usually comes back logged out; the 5-minute re-login picks it up.`,
+      });
     } else {
-      // Restart itself failed — bezant is down AND self-heal didn't work.
+      // Restart itself failed — bezant is down AND self-heal didn't work. This
+      // one is genuinely stuck until a human touches the Pi, so it stays a
+      // notification. It is also rare enough to have never fired.
       await alert(`🚨 IBKR fund: bezant down (${restartReason}) and the auto-restart FAILED — manual intervention needed on the Pi.`);
+      feed({
+        source: 'watchdog',
+        severity: 'critical',
+        title: `bezant is down (${restartReason}) and the auto-restart FAILED`,
+        detail: 'Self-heal did not work — the container needs a look on the Pi.',
+      });
     }
     state.lastHealthState = await probeHealth();
     state.consecutiveNotAuthenticated = 0;
@@ -352,13 +369,18 @@ async function main(): Promise<void> {
       ? now.getTime() - new Date(state.lastDownAlertAt).getTime()
       : Infinity;
     if (sinceAlert >= DOWN_ALERT_INTERVAL_MS) {
-      await alert(
-        `IBKR fund has been logged out for ~${state.consecutiveNotAuthenticated}+ min and ` +
-          `auto-relogin is DISABLED. Reset: ssh your-pi 'rm -f ` +
-          `~/.local/state/bezant-relogin/disabled && systemctl --user start ibkr-fund-relogin.service'`,
-      );
+      // Was a Slack message on a 6h re-nag whose timing drifted with the
+      // outage, so it landed at 03:30 as often as it landed somewhere useful —
+      // and its instruction was an ssh command that pi.lan/ibkr now performs
+      // with a button. The condition still matters; the interruption did not.
+      feed({
+        source: 'watchdog',
+        severity: 'critical',
+        title: `Logged out ~${state.consecutiveNotAuthenticated}+ min and auto-relogin is parked`,
+        detail: 'Start a login from pi.lan/ibkr when you can tap an IB Key push. The nightly pre-market re-key will also unpark and try once.',
+      });
       state.lastDownAlertAt = now.toISOString();
-      log(`down-alert sent (not_authenticated ×${state.consecutiveNotAuthenticated}, relogin disabled)`);
+      log(`down-event recorded (not_authenticated ×${state.consecutiveNotAuthenticated}, relogin disabled)`);
     }
   }
 
