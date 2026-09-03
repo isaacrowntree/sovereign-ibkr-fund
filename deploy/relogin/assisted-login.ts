@@ -170,6 +170,24 @@ async function nudgeSsoBridge(): Promise<void> {
 const CHALLENGE_RE = /Challenge:?\s*([0-9][0-9 ]{4,})/i;
 
 /**
+ * IBKR's "now tap the push" screen.
+ *
+ * This is the step that made the whole flow look broken. A correct response
+ * code does NOT finish the login — IBKR answers it by sending an IB Key push
+ * and showing "Tap the notification to complete two-factor authentication".
+ * The operator, watching a page that only ever spoke about challenges, saw the
+ * next challenge appear instead and assumed their code had been rejected. They
+ * then generated another response, and another, each one rotating the
+ * challenge and burning an attempt, while the notification they actually
+ * needed to tap sat unread on their phone.
+ *
+ * Matching it does two things: it stops the rejection heuristic below from
+ * mislabelling this screen, and it lets the page say the one thing that
+ * actually moves the login forward.
+ */
+const PUSH_WAIT_RE = /tap the notification|open the ibkr notification|sent you a notification/i;
+
+/**
  * Every text node on the page: main frame, child frames, shadow roots.
  *
  * The frame half is what production needed. The live page reports `frames=2`
@@ -283,16 +301,32 @@ async function submitResponse(page: Page, code: string): Promise<boolean> {
  * knows nothing about the hub, and the hub knows nothing about Playwright.
  */
 interface AssistedStatus {
-  status: 'waiting' | 'challenge' | 'submitting' | 'rejected' | 'authenticated' | 'failed';
+  status: 'waiting' | 'challenge' | 'submitting' | 'pushwait' | 'rejected' | 'authenticated' | 'failed';
   challenge: string | null;
   attemptsLeft: number;
   note: string | null;
   updatedAt: string;
+  /**
+   * The three timestamps the operator's page needs to say something useful
+   * rather than just display digits.
+   *
+   * A challenge is not valid forever — IBKR rotates it, and a response
+   * generated against a rotated one is rejected. A run is not open-ended
+   * either: it ends at `expiresAt`, after which typing a code achieves
+   * nothing. Without these the page can only show a number and hope, which is
+   * how someone ends up carefully entering a code that expired minutes ago.
+   */
+  startedAt: string | null;
+  expiresAt: string | null;
+  challengeAt: string | null;
 }
 
 const ui: AssistedStatus = {
   status: 'waiting',
   challenge: null,
+  startedAt: null,
+  expiresAt: null,
+  challengeAt: null,
   attemptsLeft: 0,
   note: null,
   updatedAt: new Date().toISOString(),
@@ -312,9 +346,16 @@ const CODE_RE = /^[0-9]{4,12}$/;
 const MAX_SUBMISSIONS = 3;
 
 /**
- * Written on every state change, and polled by the hub. Written whole and
- * frequently: a reader that sees a stale file must be able to tell, so
- * `updatedAt` is what marks a login as no longer in progress.
+ * Written on every state change AND once per poll as a heartbeat, then read by
+ * the hub. `updatedAt` is what marks a login as still in progress, so the
+ * heartbeat is not decoration — it is the whole contract.
+ *
+ * It was missing, and the failure was ugly: this loop's quietest moment is
+ * exactly when a human is squinting at a phone typing a response code, so a
+ * login published nothing for minutes precisely when it was most alive. The
+ * hub's staleness check then concluded it was dead and took away the form the
+ * operator was mid-way through using. Called with no patch, this merges
+ * nothing and only refreshes the timestamp.
  */
 async function publishStatus(patch: Partial<AssistedStatus> = {}): Promise<void> {
   Object.assign(ui, patch, { updatedAt: new Date().toISOString() });
@@ -375,7 +416,11 @@ async function run(browser: Browser): Promise<boolean> {
   log('Waiting: approve the push. IBKR may then ask for a challenge/response code — watching for both.');
 
   const started = Date.now();
-  await publishStatus({ attemptsLeft: MAX_SUBMISSIONS });
+  await publishStatus({
+    attemptsLeft: MAX_SUBMISSIONS,
+    startedAt: new Date(started).toISOString(),
+    expiresAt: new Date(started + TOTAL_BUDGET_MS).toISOString(),
+  });
   // Codes already sent to IBKR. A SET, not a boolean: the old latch stopped the
   // same single-use code being submitted twice (right) and also stopped a
   // CORRECTED code being submitted after a rejection (wrong) — one typo ended
@@ -386,6 +431,10 @@ async function run(browser: Browser): Promise<boolean> {
 
   while (Date.now() - started < TOTAL_BUDGET_MS) {
     await sleep(POLL_MS);
+    // Heartbeat first, before any of the work below can throw or hang. A login
+    // that is waiting on a human is still a live login, and the hub has no
+    // other way to know that.
+    await publishStatus();
     await nudgeSsoBridge();
     const health = await probeHealth();
     if (health?.authenticated) {
@@ -413,10 +462,24 @@ async function run(browser: Browser): Promise<boolean> {
     }
     const challenge = text.match(CHALLENGE_RE)?.[1].trim() ?? null;
 
+    // The push screen is checked FIRST and short-circuits the rejection test
+    // below. Both can look similar in page text, and calling a push wait a
+    // rejection is the error that sent the operator round the loop.
+    const awaitingPush = PUSH_WAIT_RE.test(text);
+    if (awaitingPush && (ui.status === 'submitting' || ui.status === 'pushwait')) {
+      if (ui.status !== 'pushwait') {
+        await publishStatus({
+          status: 'pushwait',
+          note: 'Your response code was accepted. IBKR has sent an IB Key push — tap it on your phone to finish.',
+        });
+        log('Response accepted — IBKR is now waiting for an IB Key push to be tapped');
+      }
+    }
+
     // IBKR rejects a code on the page, not over the API, so the page text is
     // the only place this is visible. Seeing it matters: it is what turns a
     // silent 20-minute wait into "generate another one".
-    if (/authentication failed|invalid|incorrect/i.test(text) && ui.status === 'submitting') {
+    else if (/authentication failed|invalid|incorrect/i.test(text) && ui.status === 'submitting') {
       await publishStatus({
         status: 'rejected',
         note: 'IBKR rejected that code. Generate a new one — codes are single-use.',
@@ -427,11 +490,12 @@ async function run(browser: Browser): Promise<boolean> {
     // Announce each DISTINCT challenge once. Re-announcing the same digits every
     // poll would race the operator; never re-announcing means a challenge that
     // IBKR rotates after a rejection is one the operator can no longer answer.
-    if (challenge && challenge !== announcedChallenge) {
+    if (challenge && challenge !== announcedChallenge && !awaitingPush) {
       await page.screenshot({ path: `${DEBUG_DIR}/challenge.png` }).catch(() => {});
       await fs.writeFile(CHALLENGE_FILE, `${challenge}\n`);
       await publishStatus({
         challenge,
+        challengeAt: new Date().toISOString(),
         status: ui.status === 'submitting' ? ui.status : 'challenge',
       });
       log(`CHALLENGE CODE: ${challenge}`);
