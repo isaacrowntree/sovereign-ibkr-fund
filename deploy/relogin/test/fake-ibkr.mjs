@@ -46,8 +46,21 @@ const flag = (name) => args.includes(`--${name}`);
 
 const PORT = Number(opt('port', 8099));
 const FRAME_PORT = PORT + 1;
-const MODE = opt('mode', 'challenge'); // challenge | push-only | wrong-code | push-wins
+// challenge | push-only | wrong-code | push-wins | push-after-code
+const MODE = opt('mode', 'challenge');
 const CROSS_ORIGIN = flag('cross-origin');
+/**
+ * Keep the "tap the notification" copy in the TOP-LEVEL document while the
+ * challenge form sits in the iframe below it.
+ *
+ * This is the shape that broke production on 2026-09-03. The two screens are
+ * not sequential the way this fake originally modelled them: the shell can
+ * still be talking about the push while the operator is plainly looking at a
+ * challenge. Anything that decides "a push is pending" from a whole-page text
+ * scan therefore sees BOTH at once, and a run sat for nine minutes with a
+ * challenge on screen and nothing published to the operator's page.
+ */
+const PUSH_IN_SHELL = flag('push-in-shell');
 const APPROVE_AFTER_MS = Number(opt('approve-after-ms', 1500));
 // How long after the form appears the tap lands, in push-wins mode. Production
 // measured 8 seconds.
@@ -55,6 +68,16 @@ const PUSH_WINS_DELAY_MS = Number(opt('push-wins-delay-ms', 8000));
 
 const EXPECTED_CODE = '99887766';
 const CHALLENGE = '111 222';
+/**
+ * The digits IBKR rotates to after a push wait. Production does this: a correct
+ * code is answered with a push, and if that push is not tapped the gateway
+ * comes back asking a DIFFERENT challenge. Anything that published the
+ * challenge once and stopped shows the operator digits the gateway has already
+ * forgotten — which is unanswerable, and looks exactly like the page working.
+ */
+const CHALLENGE_2 = '641 654';
+// How long the push screen holds before rotating, in push-then-rotate mode.
+const ROTATE_AFTER_MS = Number(opt('rotate-after-ms', 6000));
 
 const state = {
   credentialsSeen: false,
@@ -62,6 +85,8 @@ const state = {
   pushApprovedAt: null,
   challengeShown: false,
   submissions: [],      // every response code the page received, in order
+  codeAcceptedAt: null, // push-after-code: when a correct code was accepted
+  rotateAt: null,       // push-then-rotate: when the challenge rotates
   authenticated: false,
 };
 
@@ -113,14 +138,15 @@ const pushPage = `<!doctype html><html><body style="font-family:sans-serif;text-
  * frame's DOM, exactly as observed in production.
  */
 const challengeShell = (frameOrigin) => `<!doctype html><html><body style="margin:0">
+  ${PUSH_IN_SHELL ? '<p style="position:absolute;left:-9999px">IBKR sent you a notification to your phone. Tap the notification to complete two-factor authentication.</p>' : ''}
   <iframe src="${frameOrigin}/challenge-frame" style="border:0;width:1280px;height:720px"></iframe>
 </body></html>`;
 
 /** Geometry matches the real form in a 1280x720 viewport. */
-const challengeFrame = (error) => `<!doctype html><html><body style="margin:0;font-family:sans-serif;text-align:center">
+const challengeFrame = (error, challenge = CHALLENGE) => `<!doctype html><html><body style="margin:0;font-family:sans-serif;text-align:center">
   <div style="padding-top:140px">
     <p>Enter the challenge code below into the IBKR Mobile app to generate a response code.</p>
-    <p>Challenge: ${CHALLENGE}</p>
+    <p>Challenge: ${challenge}</p>
     <form method="POST" action="/challenge-frame" style="margin:0">
       <input name="response" placeholder="Enter Response Code"
              style="display:block;margin:0 auto;width:414px;height:46px;position:absolute;top:307px;left:433px;font-size:18px">
@@ -136,6 +162,11 @@ function route(req, res, isFramePort) {
   const frameOrigin = CROSS_ORIGIN ? `http://127.0.0.1:${FRAME_PORT}` : '';
 
   if (url.pathname === '/health') {
+    // push-after-code: the tap that follows an accepted code is what finally
+    // authenticates the session.
+    if (MODE === 'push-after-code' && state.codeAcceptedAt !== null && approved()) {
+      state.authenticated = true;
+    }
     // push-wins: the tap authenticates the SESSION, not the page. The real
     // gateway flips /health on its own clock whether or not the browser asks
     // for anything, which is exactly how a login completes while a challenge
@@ -172,6 +203,10 @@ function route(req, res, isFramePort) {
     state.pushApprovedAt = Date.now() + APPROVE_AFTER_MS;
     return send(res, 200, pushPage);
   }
+  // push-then-rotate: after the untapped push, the frame shows NEW digits.
+  const rotated = MODE === 'push-then-rotate' && state.rotateAt !== null
+    && Date.now() >= state.rotateAt;
+
   if (url.pathname === '/challenge-frame') {
     if (req.method === 'POST') {
       return readBody(req, (body) => {
@@ -183,16 +218,38 @@ function route(req, res, isFramePort) {
         // old "one submission per run" latch made impossible.
         const fresh = state.submissions.filter((c) => c === code).length === 1;
         if (fresh && code === EXPECTED_CODE && MODE !== 'wrong-code') {
+          // The real gateway's answer to a CORRECT code, observed 2026-09-03:
+          // not "Welcome" but another IB Key push, and a screen asking for a
+          // tap. The session only authenticates once that tap lands. Modelling
+          // this as instant success is what let a page ship that told the
+          // operator their correct code had been rejected.
+          if (MODE === 'push-then-rotate') {
+            state.codeAcceptedAt = Date.now();
+            state.rotateAt = Date.now() + ROTATE_AFTER_MS;
+            return send(res, 200, pushPage);
+          }
+          if (MODE === 'push-after-code') {
+            state.codeAcceptedAt = Date.now();
+            state.pushApprovedAt = Date.now() + APPROVE_AFTER_MS;
+            return send(res, 200, pushPage);
+          }
           state.authenticated = true;
           return send(res, 200, '<html><body>Welcome</body></html>');
         }
         return send(res, 200, challengeFrame(true));
       });
     }
-    return send(res, 200, challengeFrame(false));
+    return send(res, 200, challengeFrame(false, rotated ? CHALLENGE_2 : CHALLENGE));
   }
 
   // Root: whichever screen the flow is currently on.
+  if (rotated) {
+    state.challengeShown = true;
+    return send(res, 200, challengeShell(frameOrigin));
+  }
+  if (MODE === 'push-then-rotate' && state.codeAcceptedAt !== null) {
+    return send(res, 200, pushPage);
+  }
   if (state.deviceSelected && approved()) {
     if (MODE === 'push-only') {
       state.authenticated = true;

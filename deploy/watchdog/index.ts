@@ -77,6 +77,22 @@ const STREAM_URL = process.env.BEZANT_STREAM_URL ?? 'http://localhost:8080/event
 const STREAM_STALE_MS = 15 * 60 * 1000; // observed cadence is ~60s, so 15min of silence is anomalous
 const STREAM_WEDGED_THRESHOLD = 10; // ≈10 consecutive probes (≈10 min) before bouncing
 const NOT_AUTH_ALERT_THRESHOLD = 30; // ≈30 consecutive not_authenticated probes (≈30 min)
+/**
+ * Consecutive 5xx from the SSO bridge before the gateway counts as wedged.
+ *
+ * This is the blind spot that cost an operator an evening on 2026-09-03.
+ * `/health` answered perfectly the whole time — `not_authenticated`, exactly
+ * what a logged-out fund looks like — so nothing here fired. Underneath,
+ * `iserver/auth/ssodh/init` had been returning 500 for hours, which means NO
+ * login could ever complete: three correct response codes and several IB Key
+ * taps were spent against a gateway that could not finish a handshake. A
+ * container restart cleared it instantly, and afterwards the same endpoint
+ * answered 401 like it should.
+ *
+ * 5 probes ≈ 5 minutes, which is comfortably longer than any restart or
+ * transient blip, and far shorter than an evening.
+ */
+const SSO_WEDGED_THRESHOLD = 5;
 const DOWN_ALERT_INTERVAL_MS = 6 * 60 * 60 * 1000; // re-alert at most every 6h while down
 // Optional Slack/Discord/ntfy {"text"} webhook.
 //
@@ -98,6 +114,7 @@ interface WatchdogState {
   consecutiveServerErrors: number;
   consecutiveNotAuthenticated: number;
   consecutiveStreamWedged: number;
+  consecutiveSsoFaults: number;
   lastRestartAt: string | null;
   lastRestartReason: string | null;
   totalRestarts: number;
@@ -109,6 +126,7 @@ const DEFAULT_STATE: WatchdogState = {
   consecutiveServerErrors: 0,
   consecutiveNotAuthenticated: 0,
   consecutiveStreamWedged: 0,
+  consecutiveSsoFaults: 0,
   lastRestartAt: null,
   lastRestartReason: null,
   totalRestarts: 0,
@@ -134,6 +152,31 @@ async function saveState(state: WatchdogState): Promise<void> {
 }
 
 // ---------- probes ----------
+
+/** The SSO bridge path. Same endpoint assisted-login pokes during a login. */
+const SSODH_INIT_PATH = '/v1/api/iserver/auth/ssodh/init';
+
+/**
+ * Ask the SSO bridge whether it can work at all. Returns the HTTP status, or
+ * null when the request itself failed (which `/health` already covers).
+ *
+ * 401 = healthy and waiting for a login. 5xx = the Client Portal Gateway
+ * inside the container is wedged; bezant relays upstream status verbatim, so
+ * the 500 is the GATEWAY's, and it does not clear on its own.
+ */
+async function probeSsoBridge(): Promise<number | null> {
+  try {
+    const res = await fetch(`${HEALTH_URL.replace(/\/health$/, '')}${SSODH_INIT_PATH}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ publish: true, compete: true }),
+      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
+    });
+    return res.status;
+  } catch {
+    return null;
+  }
+}
 
 async function probeHealth(): Promise<HealthState> {
   try {
@@ -291,6 +334,17 @@ async function main(): Promise<void> {
     state.consecutiveStreamWedged = 0;
   }
 
+  // Probe the SSO bridge ONLY while logged out. Authenticated, the bridge is
+  // already established and poking it is pointless; logged out, its answer is
+  // the difference between "waiting for a human" (401, healthy) and "cannot
+  // complete any login" (5xx, wedged) — two states /health renders identically.
+  const sso = currentHealth === 'not_authenticated' ? await probeSsoBridge() : null;
+  if (sso !== null && sso >= 500) {
+    state.consecutiveSsoFaults += 1;
+  } else if (sso !== null || currentHealth === 'authenticated') {
+    state.consecutiveSsoFaults = 0;
+  }
+
   const sinceLastRestart = state.lastRestartAt
     ? now.getTime() - new Date(state.lastRestartAt).getTime()
     : Infinity;
@@ -312,10 +366,18 @@ async function main(): Promise<void> {
     restartReason =
       `event stream wedged for ${state.consecutiveStreamWedged} consecutive probes ` +
       `(${stream?.detail ?? 'no detail'}) while /health reported authenticated`;
+  } else if (state.consecutiveSsoFaults >= SSO_WEDGED_THRESHOLD) {
+    // Safe to bounce precisely because we are already logged out: there is no
+    // working session to destroy, and without a restart no login can succeed.
+    restartReason =
+      `SSO bridge wedged — ${SSODH_INIT_PATH} returned 5xx on ` +
+      `${state.consecutiveSsoFaults} consecutive probes while logged out, ` +
+      `so no login could complete`;
   } else {
     log(
       `status: health=${currentHealth} stream=${stream ? stream.detail : 'n/a'} ` +
-        `stream_wedged=${state.consecutiveStreamWedged} relogin_failures=${reloginFailures} ` +
+        `stream_wedged=${state.consecutiveStreamWedged} sso=${sso ?? 'n/a'} ` +
+        `sso_faults=${state.consecutiveSsoFaults} relogin_failures=${reloginFailures} ` +
         `relogin_disabled=${reloginDisabled} (healthy)`,
     );
   }

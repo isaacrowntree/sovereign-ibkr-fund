@@ -26,12 +26,26 @@ const RELOGIN_DIR = path.dirname(HERE);
 let PASS = 0;
 let FAIL = 0;
 
-const ok = (name) => { PASS += 1; console.log(`  ok   ${name}`); };
-const no = (name, detail) => { FAIL += 1; console.log(`  FAIL ${name}\n     ${detail}`); };
+/**
+ * ONLY=<substring> runs just the scenarios whose name contains it. Each
+ * scenario drives a real browser against a real fake gateway and can take a
+ * minute, so proving one regression against three code variants is otherwise
+ * half an hour of waiting — long enough that you stop doing it.
+ */
+const ONLY = process.env.ONLY || '';
+let SKIPPING = false;
+
+const ok = (name) => { if (SKIPPING) return; PASS += 1; console.log(`  ok   ${name}`); };
+const no = (name, detail) => {
+  if (SKIPPING) return;
+  FAIL += 1; console.log(`  FAIL ${name}\n     ${detail}`);
+};
 const want = (name, actual, expected) =>
   (String(actual) === String(expected) ? ok(name) : no(name, `expected ${expected}, got ${actual}`));
 const wantIncludes = (name, haystack, needle) =>
   (String(haystack).includes(needle) ? ok(name) : no(name, `expected to contain: ${needle}`));
+const wantNotIncludes = (name, haystack, needle) =>
+  (String(haystack).includes(needle) ? no(name, `expected NOT to contain: ${needle}`) : ok(name));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -70,7 +84,15 @@ async function freePort() {
   });
 }
 
-async function scenario({ mode = 'challenge', crossOrigin = false, respondWith = null, name }) {
+async function scenario({ mode = 'challenge', crossOrigin = false, respondWith = null,
+                          pushInShell = false, approveAfterMs = null, name }) {
+  SKIPPING = Boolean(ONLY) && !name.includes(ONLY);
+  if (SKIPPING) {
+    console.log(`\n${name}\n  skip (ONLY=${ONLY})`);
+    // Shaped like a real result so the assertions below can run harmlessly
+    // rather than each block needing its own guard.
+    return { out: '', exit: 0, serverState: { submissions: [] }, stateJson: {}, sentinel: '', status: null };
+  }
   const port = await freePort();
   const work = await fs.mkdtemp(path.join(os.tmpdir(), 'assisted-test-'));
   const stateDir = path.join(work, 'state');
@@ -89,6 +111,8 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
     '--port', String(port),
     '--mode', mode,
     ...(crossOrigin ? ['--cross-origin'] : []),
+    ...(pushInShell ? ['--push-in-shell'] : []),
+    ...(approveAfterMs !== null ? ['--approve-after-ms', String(approveAfterMs)] : []),
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
   await until(async () => {
     try {
@@ -270,6 +294,79 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
   want('  ...and the sentinel is cleared', r.sentinel, 'gone');
   wantIncludes('  ...having still told the operator the challenge exists', r.out, 'CHALLENGE CODE');
   want('  ...and published it for the page', r.status?.challenge, '111 222');
+}
+
+// ── 8. the shell still talks about the push while the challenge is up ───────
+// Regression, 2026-09-03. The two screens are not sequential: the top-level
+// document can still carry "tap the notification" while the challenge form
+// sits in the iframe. A push check that scans the whole page therefore sees
+// both at once — and a version that let that suppress the challenge left a run
+// sitting for nine minutes with a challenge plainly on screen and nothing
+// published to the operator's page.
+{
+  const r = await scenario({
+    name: 'push copy in the shell must not hide the challenge in the frame',
+    crossOrigin: true,
+    pushInShell: true,
+    respondWith: '99887766',
+  });
+  wantIncludes('still finds the challenge', r.out, 'CHALLENGE CODE: 111 222');
+  want('  ...and publishes it for the page', r.status?.challenge, '111 222');
+  want('  ...so the operator can actually answer it', r.serverState.submissions.length, 1);
+  want('  ...and the login completes', r.serverState.authenticated, true);
+}
+
+// ── 9. a correct code is answered with a push, not a welcome ────────────────
+// The bug that cost three response codes in ninety seconds on 2026-09-03. IBKR
+// answers a CORRECT code by sending another IB Key push and asking for a tap,
+// then rotates the challenge. Read as a rejection, that sends the operator
+// round the loop generating codes while the notification goes untapped.
+{
+  const r = await scenario({
+    name: 'a correct code leads to a push wait, not a rejection',
+    crossOrigin: true,
+    mode: 'push-after-code',
+    respondWith: '99887766',
+    // The tap has to land SLOWLY enough that the push screen is actually on
+    // display for a poll or two. At the 1.5s default the session authenticates
+    // before the loop ever looks, and the test passes without exercising the
+    // state it exists to pin down — which is how a green run can still tell
+    // you nothing.
+    approveAfterMs: 12_000,
+  });
+  want('submits the code once', r.serverState.submissions.length, 1);
+  wantIncludes('recognises the code was ACCEPTED', r.out, 'Response accepted');
+  want('  ...telling the page to ask for a tap, not another code',
+       ['pushwait', 'authenticated'].includes(r.status?.status), true);
+  wantNotIncludes('  ...and never calls it a rejection', r.out, 'IBKR rejected the submitted code');
+  want('  ...and the tap completes the login', r.serverState.authenticated, true);
+  want('  ...exit code 0', r.exit, 0);
+}
+
+// ── 10. the published challenge must track the one on screen ────────────────
+// The failure this pins down, observed live on 2026-09-03: a correct code is
+// answered with a push, the push goes untapped, and IBKR comes back asking a
+// DIFFERENT challenge. A run that published the challenge once and then went
+// quiet left the operator staring at digits the gateway had already forgotten
+// — unanswerable, and indistinguishable from the page working. The operator
+// only got moving again by being read the real digits out of a screenshot.
+{
+  const r = await scenario({
+    name: 'the published challenge follows IBKR when it rotates',
+    crossOrigin: true,
+    mode: 'push-then-rotate',
+    respondWith: '99887766',
+  });
+  want('submits the first code', r.serverState.submissions.length, 1);
+  wantIncludes('  ...and recognises the push wait', r.out, 'Response accepted');
+  // The whole point: what the page is told must be what the gateway is asking.
+  want('publishes the ROTATED challenge, not the stale one', r.status?.challenge, '641 654');
+  // Asserted on the LOG, not the final status file: the run legitimately times
+  // out after this (no second code is supplied), so the end state is 'failed'.
+  // Checking the end state would have been checking the wrong moment — the
+  // transition is what matters and it happens mid-run.
+  wantIncludes('  ...and stops asking for a tap once IBKR has moved on',
+               r.out, 'push wait is over, asking for a new code');
 }
 
 console.log(`\n${PASS} passed, ${FAIL} failed`);

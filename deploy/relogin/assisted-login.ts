@@ -147,16 +147,33 @@ async function probeHealth(): Promise<{ authenticated: boolean; connected: boole
  * typed-API session on its own; index.ts nudges this on every poll for the same
  * reason. Failures are swallowed — the /health probe is the verdict, not this.
  */
-async function nudgeSsoBridge(): Promise<void> {
+/**
+ * Poke the SSO bridge, and REPORT WHAT IT SAID.
+ *
+ * This used to swallow the answer entirely, and that silence cost an operator
+ * a whole evening on 2026-09-03: every one of these returned HTTP 500, so a
+ * completed 2FA could never become an authenticated session, and the failure
+ * surfaced only as "your login timed out". Three correct response codes and
+ * several taps were spent on what was never a 2FA problem.
+ *
+ * 401 is the healthy answer before a login lands — the bridge is there and
+ * saying "not yet". 5xx is the wedged Client Portal Gateway inside the
+ * container: bezant relays upstream status verbatim, so a 500 here is the
+ * GATEWAY's, and it persists until the container is restarted.
+ *
+ * Returns the HTTP status, or 0 when the request itself failed.
+ */
+async function nudgeSsoBridge(): Promise<number> {
   try {
-    await fetch(`${HEALTH_URL.replace(/\/health$/, '')}${SSODH_INIT_PATH}`, {
+    const res = await fetch(`${HEALTH_URL.replace(/\/health$/, '')}${SSODH_INIT_PATH}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ publish: true, compete: true }),
       signal: AbortSignal.timeout(10_000),
     });
+    return res.status;
   } catch {
-    /* see above */
+    return 0;
   }
 }
 
@@ -186,6 +203,11 @@ const CHALLENGE_RE = /Challenge:?\s*([0-9][0-9 ]{4,})/i;
  * actually moves the login forward.
  */
 const PUSH_WAIT_RE = /tap the notification|open the ibkr notification|sent you a notification/i;
+
+/** Consecutive 5xx from the SSO bridge before we call it wedged (~3 polls). */
+const SSO_FAULT_THRESHOLD = 3;
+
+
 
 /**
  * Every text node on the page: main frame, child frames, shadow roots.
@@ -243,7 +265,18 @@ const DEEP_TEXT_JS = `(() => {
   return out.join(' ');
 })()`;
 
-const submitJs = (code: string) => `(() => {
+/**
+ * `strict` picks ONLY a box that identifies itself as the response field.
+ * The loose pass — any visible text input — is a last resort and is dangerous
+ * on this page: the SSO login form has a username box, and typing a response
+ * code into that submits gibberish as a username, which fails in a way that
+ * looks exactly like a rejected code. So the two passes are separated and
+ * every frame gets the strict one before any frame gets the loose one.
+ *
+ * Returns a description of the field it used, or '' — so the log can say WHERE
+ * the code went. It reports the field's identity, never the code itself.
+ */
+const submitJs = (code: string, strict: boolean) => `(() => {
   var inputs = [];
   var buttons = [];
   var walk = function (root) {
@@ -251,22 +284,34 @@ const submitJs = (code: string) => `(() => {
     root.querySelectorAll('button, input[type="submit"]').forEach(function (el) { buttons.push(el); });
     root.querySelectorAll('*').forEach(function (el) { if (el.shadowRoot) walk(el.shadowRoot); });
   };
-  if (!document.body) return false;
+  if (!document.body) return '';
   walk(document.body);
-  var box = inputs.filter(function (i) {
-    return /response|challenge/i.test((i.placeholder || '') + ' ' + (i.name || '') + ' ' + (i.id || ''));
-  })[0] || inputs.filter(function (i) { return i.type === 'text' && i.offsetParent !== null; })[0];
-  if (!box) return false;
+  var ident = function (i) {
+    return (i.placeholder || '') + ' ' + (i.name || '') + ' ' + (i.id || '');
+  };
+  var box = inputs.filter(function (i) { return /response|challenge/i.test(ident(i)); })[0];
+  ${'' /* the loose pass is opt-in */}
+  if (!box && ${strict ? 'false' : 'true'}) {
+    box = inputs.filter(function (i) {
+      // never the credential fields, whatever else happens
+      return i.type === 'text' && i.offsetParent !== null && !/user|login|email/i.test(ident(i));
+    })[0];
+  }
+  if (!box) return '';
   box.focus();
   box.value = ${JSON.stringify(code)};
   box.dispatchEvent(new Event('input', { bubbles: true }));
   box.dispatchEvent(new Event('change', { bubbles: true }));
+  // Read it back. If the field did not take the value — a framework that
+  // controls it, a readonly box — clicking Login submits nothing or worse,
+  // something stale, and the operator is told their correct code failed.
+  if (box.value !== ${JSON.stringify(code)}) return '';
   var login = buttons.filter(function (b) {
     return /login|submit|continue/i.test(b.textContent || b.value || '');
   })[0];
   if (login) login.click();
   else if (box.form && box.form.requestSubmit) box.form.requestSubmit();
-  return true;
+  return (ident(box).trim() || 'unnamed input') + ' @ ' + location.host;
 })()`;
 
 async function frameText(frame: Frame): Promise<string> {
@@ -278,15 +323,18 @@ async function frameText(frame: Frame): Promise<string> {
  * it. Sets `.value` and dispatches input/change by hand, because a framework
  * rendering the form is usually not listening for anything else.
  */
-async function submitResponse(page: Page, code: string): Promise<boolean> {
-  for (const frame of page.frames()) {
-    const done = await frame.evaluate(submitJs(code)).catch((e) => {
-      lastReadError = `${frame.url()}: ${String((e as Error).message ?? e).split('\n')[0]}`;
-      return false;
-    });
-    if (done) return true;
+async function submitResponse(page: Page, code: string): Promise<string> {
+  // Strict across every frame first, loose across every frame only after.
+  for (const strict of [true, false]) {
+    for (const frame of page.frames()) {
+      const where = await frame.evaluate(submitJs(code, strict)).catch((e) => {
+        lastReadError = `${frame.url()}: ${String((e as Error).message ?? e).split('\n')[0]}`;
+        return '';
+      });
+      if (where) return `${where}${strict ? '' : ' (loose match)'}`;
+    }
   }
-  return false;
+  return '';
 }
 
 /**
@@ -426,6 +474,13 @@ async function run(browser: Browser): Promise<boolean> {
   // CORRECTED code being submitted after a rejection (wrong) — one typo ended
   // the run, costing another push, another challenge and 20 more minutes.
   const sentToIbkr = new Set<string>();
+  // Consecutive 5xx from the SSO bridge. A single one is noise; a run of them
+  // is the gateway telling you it cannot finish any login at all.
+  let ssoFaults = 0;
+  // The challenge that was on screen when we last submitted. A push wait
+  // belongs to THAT challenge; the moment IBKR shows a different one it has
+  // moved on and the operator needs to answer the new one.
+  let challengeAtSubmit: string | null = null;
   let announcedChallenge: string | null = null;
   let shot = 0;
 
@@ -435,7 +490,26 @@ async function run(browser: Browser): Promise<boolean> {
     // that is waiting on a human is still a live login, and the hub has no
     // other way to know that.
     await publishStatus();
-    await nudgeSsoBridge();
+
+    const ssoStatus = await nudgeSsoBridge();
+    if (ssoStatus >= 500) ssoFaults += 1;
+    else if (ssoStatus > 0) ssoFaults = 0;
+    // Announced ONCE, and loudly. There is no point asking for another code
+    // against a gateway that cannot complete the handshake — say so plainly
+    // rather than letting it look like the operator's codes are wrong.
+    if (ssoFaults === SSO_FAULT_THRESHOLD) {
+      const note = `The gateway's SSO bridge is failing (HTTP ${ssoStatus}). This is a GATEWAY fault, `
+        + 'not a 2FA problem — a code entered now cannot complete the login. '
+        + 'Restart the bezant container, then start a new login.';
+      log(`SSO BRIDGE WEDGED — ${SSODH_INIT_PATH} returned ${ssoStatus} ${ssoFaults}x in a row. ${note}`);
+      await publishStatus({ note });
+      feed({
+        source: 'relogin',
+        severity: 'critical',
+        title: `IBKR gateway SSO bridge is wedged (HTTP ${ssoStatus})`,
+        detail: note,
+      });
+    }
     const health = await probeHealth();
     if (health?.authenticated) {
       log('Authenticated — /health.authenticated=true');
@@ -465,8 +539,31 @@ async function run(browser: Browser): Promise<boolean> {
     // The push screen is checked FIRST and short-circuits the rejection test
     // below. Both can look similar in page text, and calling a push wait a
     // rejection is the error that sent the operator round the loop.
+    // TWO different push waits, and conflating them broke the login.
+    //
+    // IBKR shows push wording at the START of every run — it sends a push the
+    // moment IB Key is selected, before any code exists — and again AFTER a
+    // response code is accepted. Only the second one means "your code worked,
+    // go tap". Suppressing the challenge on the first one hid the challenge
+    // form completely: observed 2026-09-03, a run sat for nine minutes with a
+    // challenge plainly on screen and nothing published for the operator.
+    // A push wait ends when IBKR asks something new. Bounding it by a clock
+    // instead was a guess about how long a tap "should" take; the gateway
+    // moving to different digits is the gateway telling us directly.
+    const rotated = challenge !== null && challengeAtSubmit !== null
+      && challenge !== challengeAtSubmit;
+    // Say it out loud. This transition is the difference between an operator
+    // tapping a notification and an operator typing a code, and leaving it
+    // implicit is what made the stuck-in-pushwait bug so hard to see from the
+    // outside — the page simply stopped changing.
+    if (rotated && ui.status === 'pushwait') {
+      log('IBKR rotated the challenge — push wait is over, asking for a new code');
+    }
     const awaitingPush = PUSH_WAIT_RE.test(text);
-    if (awaitingPush && (ui.status === 'submitting' || ui.status === 'pushwait')) {
+    const postSubmitPush = awaitingPush
+      && (ui.status === 'submitting' || ui.status === 'pushwait')
+      && !rotated;
+    if (postSubmitPush) {
       if (ui.status !== 'pushwait') {
         await publishStatus({
           status: 'pushwait',
@@ -490,7 +587,7 @@ async function run(browser: Browser): Promise<boolean> {
     // Announce each DISTINCT challenge once. Re-announcing the same digits every
     // poll would race the operator; never re-announcing means a challenge that
     // IBKR rotates after a rejection is one the operator can no longer answer.
-    if (challenge && challenge !== announcedChallenge && !awaitingPush) {
+    if (challenge && challenge !== announcedChallenge && !postSubmitPush) {
       await page.screenshot({ path: `${DEBUG_DIR}/challenge.png` }).catch(() => {});
       await fs.writeFile(CHALLENGE_FILE, `${challenge}\n`);
       await publishStatus({
@@ -540,9 +637,10 @@ async function run(browser: Browser): Promise<boolean> {
           // page ends on "Authentication failed" over a code that may well have
           // been right. Observed 2026-09-02 with challenge 111 222.
           await page.mouse.click(LOGIN_BUTTON_XY.x, LOGIN_BUTTON_XY.y);
-          typed = true;
+          typed = `pixel fallback @ ${RESPONSE_BOX_XY.x},${RESPONSE_BOX_XY.y}`;
         }
         sentToIbkr.add(code);
+        challengeAtSubmit = ui.challenge;
         await publishStatus({
           status: 'submitting',
           attemptsLeft: MAX_SUBMISSIONS - sentToIbkr.size,
@@ -550,7 +648,10 @@ async function run(browser: Browser): Promise<boolean> {
         });
         await page.waitForTimeout(3_000);
         await page.screenshot({ path: `${DEBUG_DIR}/post-response.png` }).catch(() => {});
-        log(`Submitted (box found: ${typed}). Post-submit URL: ${page.url()}`);
+        // WHICH field took the code, by name — so "are you sure it went in the
+        // right box?" is answerable from the log instead of by inference. The
+        // code itself is never logged; only its length, above.
+        log(`Submitted into [${typed}]. Post-submit URL: ${page.url()}`);
       }
     }
 
