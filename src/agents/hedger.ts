@@ -3,7 +3,7 @@
  * Manages options overlay: covered calls, protective puts, collars, tail risk.
  */
 import { connect, disconnect, getAccountSummary, getMarketPrices , requestDelayedData } from '../connection/gateway.js';
-import { TARGET_PORTFOLIO } from '../config.js';
+import { TARGET_PORTFOLIO, validateTargets } from '../config.js';
 import { generateCoveredCall, generateProtectivePut, tailRiskPutBudget, CoveredCallParams } from '../hedging/options.js';
 import { loadState, mergeState } from '../state/store.js';
 import { log, logError } from '../log.js';
@@ -13,6 +13,7 @@ const IMPLIED_VOL = 0.20; // default, would come from options chain data
 
 async function run(): Promise<void> {
   log('Hedge analysis starting', AGENT);
+  validateTargets();
   await connect();
   requestDelayedData();
 

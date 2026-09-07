@@ -3,7 +3,7 @@
  * VaR/CVaR, drawdown control, volatility targeting, correlation monitoring.
  */
 import { connect, disconnect, getAccountSummary, getMarketPrices , requestDelayedData } from '../connection/gateway.js';
-import { TARGET_PORTFOLIO, config } from '../config.js';
+import { TARGET_PORTFOLIO, config, validateTargets } from '../config.js';
 import { historicalVaR, conditionalVaR } from '../risk/var.js';
 import { assessDrawdown, maxDrawdown, type DrawdownLimits, type DrawdownState } from '../risk/drawdown.js';
 import { ewmaVolatility, annualizeVol, volTargetLeverage } from '../risk/volatility.js';
@@ -41,6 +41,9 @@ const DD_LIMITS: DrawdownLimits = {
 
 export async function run(): Promise<void> {
   log('Risk assessment starting', AGENT);
+  // The drawdown ladder this writes scales the strategist's weights, so a
+  // report computed against the wrong book corrupts real decisions.
+  validateTargets();
   await connect();
   requestDelayedData();
 
