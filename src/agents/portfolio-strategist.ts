@@ -5,6 +5,9 @@
  */
 import { connect, disconnect, getAccountSummary, getUsdBalances, getMarketPrices, requestDelayedData } from '../connection/gateway.js';
 import { TARGET_PORTFOLIO, validateTargets, config } from '../config.js';
+import { decideDeposit } from '../portfolio/deposit-policy.js';
+import { loadDepositPolicy } from '../portfolio/deposit-policy-file.js';
+import { planDepositBuy } from '../portfolio/deposit-plan.js';
 import { allocateCashFlow, recentlySoldSymbols } from '../portfolio/cashflow-rebalance.js';
 import {
   computeTargetWeights,
@@ -58,6 +61,7 @@ async function run(): Promise<void> {
     const usd = await getUsdBalances();
     const navUsd = usd.usdNav;
     const cashUsd = usd.usdCash;
+    const settledCashUsd = usd.usdSettledCash;
 
     log(`NAV(USD): $${navUsd.toFixed(2)}, Cash(USD): $${cashUsd.toFixed(2)} [base AUD NAV $${account.netLiquidation.toFixed(2)}]`, AGENT);
 
@@ -403,16 +407,57 @@ async function run(): Promise<void> {
           log(`Rebuy guard (${guardDays}d): excluding ${[...excluded].sort().join(', ')} from cash-flow deployment`, AGENT);
         }
 
-        const cashOrders = allocateCashFlow(
-          holdings, cashUsd - CASH_THRESHOLD, 100, prices, excluded,
-          config.rebalance.cashFlowFillMode,
-        );
-        for (const o of cashOrders) {
-          log(`  Cash flow: BUY ${o.shares} ${o.symbol} ($${o.amountUsd.toFixed(2)})`, AGENT);
-          pendingOrders.push({
-            symbol: o.symbol, action: 'BUY', qty: o.shares,
-            estimatedValue: o.amountUsd, reason: 'cash_flow_rebalance',
+        // Standing instruction. When one is in force this deploys the deposit
+        // against the PUBLISHED model rather than pro-rata against deficits:
+        // directed names first and exempt from the rebuy guard (a name written
+        // down in advance is an instruction, not churn), then a greedy fill.
+        // Gated on SETTLED cash — an unsettled deposit shows in the balance but
+        // funds nothing, and the executor defers such buys silently.
+        const deposit = decideDeposit({
+          policy: loadDepositPolicy(),
+          settledCashUsd,
+          cashThresholdUsd: CASH_THRESHOLD,
+          now: new Date(),
+        });
+        log(`Cash deployment: ${deposit.reason}`, AGENT);
+
+        if (deposit.directed) {
+          const policy = loadDepositPolicy()!;
+          const targets: Record<string, number> = {};
+          TARGET_PORTFOLIO.forEach((t, i) => { targets[t.symbol] = adjustedWeights[i] * 100; });
+          const plan = planDepositBuy({
+            targets,
+            holdings: new Map(holdings.map(h => [h.symbol, h.currentValue])),
+            prices,
+            nav: navUsd - deposit.deployableUsd,
+            cash: deposit.deployableUsd,
+            depositUsd: 0,
+            directed: policy.directed.filter(sym => sym in targets),
+            reserveUsd: policy.reserveUsd,
+            excluded,
           });
+          for (const o of plan.orders) {
+            log(`  Deposit: BUY ${o.qty} ${o.symbol} ($${o.estimatedValue.toFixed(2)})`, AGENT);
+            pendingOrders.push({
+              symbol: o.symbol, action: 'BUY', qty: o.qty,
+              estimatedValue: o.estimatedValue, reason: 'directed_deposit',
+            });
+          }
+          log(`  Deposit plan: $${plan.deployedUsd.toFixed(0)} deployed, `
+            + `$${plan.residualCashUsd.toFixed(0)} residual, `
+            + `max drift ${plan.maxDriftPct.toFixed(2)}pp`, AGENT);
+        } else {
+          const cashOrders = allocateCashFlow(
+            holdings, cashUsd - CASH_THRESHOLD, 100, prices, excluded,
+            config.rebalance.cashFlowFillMode,
+          );
+          for (const o of cashOrders) {
+            log(`  Cash flow: BUY ${o.shares} ${o.symbol} ($${o.amountUsd.toFixed(2)})`, AGENT);
+            pendingOrders.push({
+              symbol: o.symbol, action: 'BUY', qty: o.shares,
+              estimatedValue: o.amountUsd, reason: 'cash_flow_rebalance',
+            });
+          }
         }
       }
     } else {

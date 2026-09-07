@@ -327,6 +327,15 @@ export interface UsdBalances {
    * the USD sells that run first.
    */
   usdCash: number;
+  /**
+   * USD cash that has SETTLED. Deliberately separate from `usdCash` above:
+   * a rebalance's buys are legitimately funded by the unsettled proceeds of
+   * its own sells, so the order gate must keep using `usdCash`. But a DEPOSIT
+   * should not be deployed before it settles, and that is a different
+   * question. Absent from the ledger means nothing is known to have settled,
+   * never that everything has.
+   */
+  usdSettledCash: number;
   /** Total portfolio net liquidation value expressed in USD. */
   usdNav: number;
 }
@@ -350,8 +359,12 @@ export function deriveUsdBalances(ledger: Record<string, LedgerRow>): UsdBalance
   );
   const usdNav = usdRate && usdRate > 0 ? baseNav / usdRate : (usd?.netliquidationvalue ?? 0);
 
+  const usdCash = usd?.cashbalance ?? 0;
   return {
-    usdCash: usd?.cashbalance ?? 0,
+    usdCash,
+    // Clamped: a settled figure above the total is nonsense, and trusting it
+    // would deploy more than exists.
+    usdSettledCash: Math.min(usd?.settledcash ?? 0, usdCash),
     usdNav,
   };
 }

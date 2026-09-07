@@ -144,3 +144,45 @@ describe('planDepositBuy', () => {
     expect(holdings.get('AAA')).toBe(5000);
   });
 });
+
+describe('planDepositBuy respects the rebuy guard except where directed', () => {
+  // The guard exists to stop buy-only cash flow round-tripping a name the
+  // strategy just sold. That is right for incidental cash and wrong for a
+  // deposit: a name the operator NAMED in advance is an instruction, not
+  // churn. So directed names are exempt and everything else is not.
+  const prices = new Map([['AAA', 100], ['BBB', 100], ['CCC', 100]]);
+  const base = {
+    targets: { AAA: 40, BBB: 30, CCC: 30 },
+    holdings: new Map<string, number>([['AAA', 0], ['BBB', 0], ['CCC', 0]]),
+    prices,
+    nav: 0,
+    cash: 0,
+    depositUsd: 3000,
+    reserveUsd: 0,
+  };
+
+  it('buys an excluded name when it is directed', () => {
+    const p = planDepositBuy({ ...base, directed: ['BBB'], excluded: new Set(['BBB']) });
+    expect(p.orders.find(o => o.symbol === 'BBB')?.qty).toBeGreaterThan(0);
+  });
+
+  it('skips an excluded name that was not directed', () => {
+    const p = planDepositBuy({ ...base, directed: [], excluded: new Set(['BBB']) });
+    expect(p.orders.find(o => o.symbol === 'BBB')).toBeUndefined();
+  });
+
+  it('parks the excluded share rather than overshooting the others', () => {
+    const p = planDepositBuy({ ...base, directed: [], excluded: new Set(['BBB']) });
+    // BBB's 30% ($900) stays in cash. Pushing it into AAA and CCC would buy
+    // past their targets to dodge a guard that lapses in weeks, creating real
+    // drift — and a taxable sell to unwind it. The money waits instead.
+    expect(p.residualCashUsd).toBeCloseTo(900, 0);
+    expect(p.orders.every(o => o.symbol !== 'BBB')).toBe(true);
+  });
+
+  it('is unchanged when nothing is excluded', () => {
+    const withNone = planDepositBuy({ ...base, directed: [] });
+    const withEmpty = planDepositBuy({ ...base, directed: [], excluded: new Set() });
+    expect(withEmpty.orders).toEqual(withNone.orders);
+  });
+});

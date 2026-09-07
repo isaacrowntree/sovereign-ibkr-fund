@@ -25,6 +25,32 @@ describe('deriveUsdBalances', () => {
     expect(deriveUsdBalances(withProceeds as any).usdCash).toBe(16000);
   });
 
+  // A deposit must not be deployed before it settles, but a rebalance's BUYs
+  // are legitimately funded by the unsettled proceeds of its own SELLs. Those
+  // are different questions, so they get different numbers rather than one
+  // being redefined into the other.
+  it('reports settled cash separately from spendable cash', () => {
+    const deposited = {
+      ...LEDGER,
+      USD: { ...LEDGER.USD, cashbalance: 5402.97, settledcash: 1790.34 },
+    };
+    const b = deriveUsdBalances(deposited as any);
+    expect(b.usdCash).toBe(5402.97);
+    expect(b.usdSettledCash).toBe(1790.34);
+  });
+
+  it('treats a missing settledcash as nothing settled, not as everything', () => {
+    // Assuming the full balance is settled would deploy an unsettled deposit,
+    // which is the failure this field exists to prevent.
+    const noSettled = { USD: { currency: 'USD', cashbalance: 5000, netliquidationvalue: 5000 } };
+    expect(deriveUsdBalances(noSettled as any).usdSettledCash).toBe(0);
+  });
+
+  it('never reports more settled than total', () => {
+    const odd = { USD: { currency: 'USD', cashbalance: 100, settledcash: 999, netliquidationvalue: 100 } };
+    expect(deriveUsdBalances(odd as any).usdSettledCash).toBeLessThanOrEqual(100);
+  });
+
   it('falls back to the USD bucket NAV if no exchange rate is present', () => {
     const noRate = { USD: { currency: 'USD', cashbalance: 5, netliquidationvalue: 1234 } };
     expect(deriveUsdBalances(noRate as any).usdNav).toBe(1234);

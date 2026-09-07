@@ -38,6 +38,15 @@ export interface DepositPlanInput {
   directed?: string[];
   /** Held back for commission and slippage. Never spent. */
   reserveUsd?: number;
+  /**
+   * Names the rebuy guard is holding back, from `recentlySoldSymbols`.
+   *
+   * Applied to the water-fill only. A name in `directed` is exempt: the guard
+   * exists to stop buy-only cash flow round-tripping something the strategy
+   * just sold, which is right for incidental cash and wrong for a deposit —
+   * a name the operator wrote down in advance is an instruction, not churn.
+   */
+  excluded?: ReadonlySet<string>;
 }
 
 export interface DepositPlanOrder {
@@ -111,10 +120,14 @@ export function planDepositBuy(input: DepositPlanInput): DepositPlan {
   //    price of a single share of the name that most needs it, so the money
   //    sits idle instead. One-share steps also self-terminate, because every
   //    step strictly reduces the budget by at least the cheapest price.
+  const guarded = (s: string): boolean =>
+    (input.excluded?.has(s) ?? false) && !directed.includes(s);
+
   for (;;) {
     let best: string | null = null;
     let bestDeficit = 0;
     for (const s of Object.keys(targets)) {
+      if (guarded(s)) continue;
       const deficit = deficitOf(s);
       if (deficit > 0 && prices.get(s)! <= budget && deficit > bestDeficit) {
         bestDeficit = deficit;
