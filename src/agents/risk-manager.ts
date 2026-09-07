@@ -163,7 +163,14 @@ export async function run(): Promise<void> {
       const stressObs = historicalReturns?.[0]?.length ?? 0;
       const STRESS_MIN_OBS = Math.max(30, symbols.length * 2);
 
-      if (historicalReturns && historicalReturns.length >= 2 && stressObs >= STRESS_MIN_OBS && weights) {
+      // A reweight changes the model's asset count immediately; historicalReturns
+      // only catches up as the observer accumulates the new names. Skipping for a
+      // few cycles is right — dying is not, and silently stressing mismatched
+      // vectors would be worse than either.
+      if (weights && historicalReturns && weights.length !== historicalReturns.length) {
+        log(`Stress test skipped: ${weights.length} model weights vs `
+          + `${historicalReturns.length} assets of return history (model recently changed)`, AGENT);
+      } else if (historicalReturns && historicalReturns.length >= 2 && stressObs >= STRESS_MIN_OBS && weights) {
         const cov = sampleCovMatrix(historicalReturns);
         const stress = correlationStressTest(weights, cov, account.netLiquidation);
         log(`Stress test: baseline VaR $${stress.baselineVaR.toFixed(2)} → stressed VaR $${stress.stressedVaR.toFixed(2)} (corr=0.9)`, AGENT);

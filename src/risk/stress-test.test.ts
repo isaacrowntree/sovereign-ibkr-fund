@@ -71,3 +71,26 @@ describe('correlationStressTest', () => {
     expect(result.portfolioValue).toBe(500000);
   });
 });
+
+describe('correlationStressTest dimension guard', () => {
+  // A model reweight changes the number of holdings, but historicalReturns is
+  // accumulated per-asset and lags behind. On 2026-09-07 the strategist wrote
+  // 19 weights while historicalReturns still held 17 assets, and quadraticForm
+  // walked off the end of the covariance: "Cannot read properties of undefined
+  // (reading '0')". The risk-manager died on it every cycle, which is a bad
+  // way to find out — this agent is the one that reports the fund is unwell.
+  const cov = [[0.04, 0.01], [0.01, 0.09]];
+
+  it('refuses weights longer than the covariance', () => {
+    expect(() => correlationStressTest([0.3, 0.3, 0.4], cov, 10000))
+      .toThrow(/3 weights.*2x2|dimension/i);
+  });
+
+  it('refuses weights shorter than the covariance', () => {
+    expect(() => correlationStressTest([1.0], cov, 10000)).toThrow(/dimension|1 weights/i);
+  });
+
+  it('still runs when they agree', () => {
+    expect(() => correlationStressTest([0.5, 0.5], cov, 10000)).not.toThrow();
+  });
+});

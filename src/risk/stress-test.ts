@@ -45,6 +45,18 @@ export function correlationStressTest(
   targetCorrelation: number = 0.9,
   confidence: number = 0.95,
 ): StressResult {
+  // The weight vector comes from the MODEL and the covariance from accumulated
+  // price history, so a reweight changes one before the other. Walking off the
+  // end of the matrix produced "Cannot read properties of undefined" and killed
+  // the agent that exists to report the fund is unwell.
+  if (weights.length !== covMatrix.length) {
+    throw new Error(
+      `stress test dimension mismatch: ${weights.length} weights against a `
+      + `${covMatrix.length}x${covMatrix.length} covariance — the model changed `
+      + 'and the return history has not caught up',
+    );
+  }
+
   const baselineVar = quadraticForm(weights, covMatrix);
   const baselineVol = Math.sqrt(baselineVar);
 
