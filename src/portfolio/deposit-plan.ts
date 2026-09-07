@@ -77,9 +77,20 @@ export function planDepositBuy(input: DepositPlanInput): DepositPlan {
   if (!Number.isFinite(depositUsd) || depositUsd < 0) {
     throw new Error(`deposit must be a non-negative number, got ${depositUsd}`);
   }
+  // Targets may sum to LESS than 100 and that is not an error: the strategist
+  // passes `targetWeights * exposureMultiplier * ddMultiplier`, so in a
+  // drawdown or with vol targeting on the shortfall is de-risking held as cash
+  // on purpose. Demanding exactly 100 would throw inside the agent precisely
+  // when the fund is already drawn down — the worst moment to lose it.
+  //
+  // Above 100 is a different thing entirely: not de-risking but a broken
+  // model, sizing buys against money that does not exist.
   const sum = Object.values(targets).reduce((a, b) => a + b, 0);
-  if (Math.abs(sum - 100) > TARGET_SUM_TOLERANCE) {
-    throw new Error(`targets sum to ${sum}, not 100`);
+  if (!(sum > 0)) {
+    throw new Error(`targets sum to ${sum} — nothing to deploy against`);
+  }
+  if (sum > 100 + TARGET_SUM_TOLERANCE) {
+    throw new Error(`targets sum to ${sum}, over 100`);
   }
   const missing = Object.keys(targets).filter((s) => !(prices.get(s)! > 0));
   if (missing.length > 0) {

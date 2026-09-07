@@ -429,7 +429,8 @@ async function run(): Promise<void> {
             targets,
             holdings: new Map(holdings.map(h => [h.symbol, h.currentValue])),
             prices,
-            nav: navUsd - deposit.deployableUsd,
+            // NAV already includes the cash; the deposit is not additional to it.
+            nav: navUsd,
             cash: deposit.deployableUsd,
             depositUsd: 0,
             directed: policy.directed.filter(sym => sym in targets),

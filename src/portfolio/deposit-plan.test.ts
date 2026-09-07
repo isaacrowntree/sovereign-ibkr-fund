@@ -16,9 +16,11 @@ function base(over: Partial<DepositPlanInput> = {}): DepositPlanInput {
 }
 
 describe('planDepositBuy', () => {
-  it('rejects targets that do not sum to 100', () => {
-    expect(() => planDepositBuy(base({ targets: { AAA: 50, BBB: 30 } })))
-      .toThrow(/targets sum to 80, not 100/i);
+  it('rejects targets that over-allocate', () => {
+    // Under 100 is legitimate de-risking (see the de-scaling block below);
+    // over 100 sizes buys against money that does not exist.
+    expect(() => planDepositBuy(base({ targets: { AAA: 60, BBB: 50 } })))
+      .toThrow(/targets sum to 110/i);
   });
 
   it('rejects a negative deposit', () => {
@@ -184,5 +186,47 @@ describe('planDepositBuy respects the rebuy guard except where directed', () => 
     const withNone = planDepositBuy({ ...base, directed: [] });
     const withEmpty = planDepositBuy({ ...base, directed: [], excluded: new Set() });
     expect(withEmpty.orders).toEqual(withNone.orders);
+  });
+});
+
+describe('planDepositBuy under risk de-scaling', () => {
+  // The strategist passes `targetWeights * exposureMultiplier * ddMultiplier`.
+  // In a drawdown, or with vol targeting on, those sum to LESS than 100 — the
+  // shortfall IS the de-risking, held as cash on purpose. Demanding exactly
+  // 100 here would throw inside the agent precisely when the fund is already
+  // in a drawdown, which is the worst possible moment to lose the strategist.
+  const prices = new Map([['AAA', 100], ['BBB', 100]]);
+  const base = {
+    holdings: new Map<string, number>([['AAA', 0], ['BBB', 0]]),
+    prices,
+    // NAV INCLUDES cash — it is net liquidation, not invested value. Passing
+    // nav without it makes every deficit zero and the plan silently empty.
+    nav: 10000,
+    cash: 10000,
+    depositUsd: 0,
+    reserveUsd: 0,
+    directed: [] as string[],
+  };
+
+  it('accepts de-scaled targets and leaves the shortfall in cash', () => {
+    const p = planDepositBuy({ ...base, targets: { AAA: 45, BBB: 45 } });
+    expect(p.deployedUsd).toBeCloseTo(9000, 0);
+    expect(p.residualCashUsd).toBeCloseTo(1000, 0);
+  });
+
+  it('still deploys everything when targets sum to 100', () => {
+    const p = planDepositBuy({ ...base, targets: { AAA: 50, BBB: 50 } });
+    expect(p.deployedUsd).toBeCloseTo(10000, 0);
+  });
+
+  it('rejects targets that over-allocate', () => {
+    // Above 100 is not de-risking, it is a broken model, and it would size
+    // buys against money that does not exist.
+    expect(() => planDepositBuy({ ...base, targets: { AAA: 60, BBB: 50 } }))
+      .toThrow(/110/);
+  });
+
+  it('rejects targets that sum to nothing', () => {
+    expect(() => planDepositBuy({ ...base, targets: { AAA: 0, BBB: 0 } })).toThrow();
   });
 });
