@@ -403,7 +403,10 @@ async function run(): Promise<void> {
           log(`Rebuy guard (${guardDays}d): excluding ${[...excluded].sort().join(', ')} from cash-flow deployment`, AGENT);
         }
 
-        const cashOrders = allocateCashFlow(holdings, cashUsd - CASH_THRESHOLD, 100, prices, excluded);
+        const cashOrders = allocateCashFlow(
+          holdings, cashUsd - CASH_THRESHOLD, 100, prices, excluded,
+          config.rebalance.cashFlowFillMode,
+        );
         for (const o of cashOrders) {
           log(`  Cash flow: BUY ${o.shares} ${o.symbol} ($${o.amountUsd.toFixed(2)})`, AGENT);
           pendingOrders.push({

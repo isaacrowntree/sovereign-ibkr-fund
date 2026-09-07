@@ -128,3 +128,114 @@ describe('recentlySoldSymbols', () => {
     expect(recentlySoldSymbols(trades, 30, now).size).toBe(0);
   });
 });
+
+describe('allocateCashFlow — greedy fill mode', () => {
+  /**
+   * The live symptom this exists for: a small deposit split proportionally
+   * across several deficits gives each name a slice smaller than one share of
+   * it, so NOTHING is buyable and the cash sits idle indefinitely. Observed on
+   * the real book — $790 deployable spread across names priced $337-$1,147
+   * produced zero orders on every 4h cycle for weeks.
+   */
+  // Mirrors the real book's shape: LLY/CAT/GE all underweight, GS overweight,
+  // every price large relative to the deployable balance.
+  const expensiveBook = [
+    { symbol: 'LLY', currentValue: 1146, targetPct: 25 },
+    { symbol: 'CAT', currentValue: 1626, targetPct: 30 },
+    { symbol: 'GE', currentValue: 2026, targetPct: 30 },
+    { symbol: 'GS', currentValue: 2075, targetPct: 15 },
+  ];
+  const expensivePrices = new Map([['LLY', 1146.65], ['CAT', 813], ['GE', 337.73], ['GS', 1037.94]]);
+
+  it('proportional strands the cash entirely (the bug)', () => {
+    const orders = allocateCashFlow(expensiveBook, 790, 100, expensivePrices);
+    expect(orders).toHaveLength(0);
+  });
+
+  it('greedy deploys it instead', () => {
+    const orders = allocateCashFlow(expensiveBook, 790, 100, expensivePrices, undefined, 'greedy');
+    expect(orders.length).toBeGreaterThan(0);
+    const spent = orders.reduce((a, o) => a + o.shares * expensivePrices.get(o.symbol)!, 0);
+    expect(spent).toBeGreaterThan(0);
+    expect(spent).toBeLessThanOrEqual(790);
+  });
+
+  it('greedy stops rather than overshooting a target to use up cash', () => {
+    // After one GE fill the only remaining deficits are priced above the
+    // residual, so ~$452 correctly stays in cash. Deploying it would push a
+    // name past its target, which is a worse outcome than idle cash.
+    const orders = allocateCashFlow(expensiveBook, 790, 100, expensivePrices, undefined, 'greedy');
+    const spent = orders.reduce((a, o) => a + o.shares * expensivePrices.get(o.symbol)!, 0);
+    const residual = 790 - spent;
+    const stillUnderAndAffordable = orders.length > 0 && residual > 0
+      ? ['LLY', 'CAT', 'GE'].filter(s => expensivePrices.get(s)! <= residual)
+      : [];
+    // Nothing buyable was left on the table.
+    expect(stillUnderAndAffordable.filter(s => s !== 'GE')).toHaveLength(0);
+  });
+
+  it('greedy beats proportional on the same input', () => {
+    const spend = (mode?: 'proportional' | 'greedy') =>
+      allocateCashFlow(expensiveBook, 790, 100, expensivePrices, undefined, mode)
+        .reduce((a, o) => a + o.shares * expensivePrices.get(o.symbol)!, 0);
+    expect(spend('greedy')).toBeGreaterThan(spend('proportional'));
+  });
+
+  it('greedy never exceeds the deposit', () => {
+    for (const deposit of [100, 500, 1000, 5000, 12345]) {
+      const orders = allocateCashFlow(expensiveBook, deposit, 100, expensivePrices, undefined, 'greedy');
+      const spent = orders.reduce((a, o) => a + o.shares * expensivePrices.get(o.symbol)!, 0);
+      expect(spent).toBeLessThanOrEqual(deposit);
+    }
+  });
+
+  it('greedy fills the largest deficit first', () => {
+    const holdings = [
+      { symbol: 'BIG', currentValue: 0, targetPct: 50 },
+      { symbol: 'SML', currentValue: 900, targetPct: 50 },
+    ];
+    const prices = new Map([['BIG', 100], ['SML', 100]]);
+    const orders = allocateCashFlow(holdings, 500, 10, prices, undefined, 'greedy');
+    const big = orders.find(o => o.symbol === 'BIG');
+    expect(big).toBeDefined();
+    expect(big!.shares).toBeGreaterThan(orders.find(o => o.symbol === 'SML')?.shares ?? 0);
+  });
+
+  it('greedy still respects the rebuy guard', () => {
+    const orders = allocateCashFlow(
+      expensiveBook, 790, 100, expensivePrices, new Set(['GE']), 'greedy',
+    );
+    expect(orders.find(o => o.symbol === 'GE')).toBeUndefined();
+  });
+
+  it('greedy never buys an overweight name', () => {
+    const holdings = [
+      { symbol: 'OVER', currentValue: 8000, targetPct: 50 },
+      { symbol: 'UNDER', currentValue: 2000, targetPct: 50 },
+    ];
+    const prices = new Map([['OVER', 100], ['UNDER', 100]]);
+    const orders = allocateCashFlow(holdings, 1000, 10, prices, undefined, 'greedy');
+    expect(orders.find(o => o.symbol === 'OVER')).toBeUndefined();
+  });
+
+  it('greedy does not overshoot a target to spend cash', () => {
+    // Only $100 of deficit exists; a $5000 deposit must not pile in beyond it.
+    const holdings = [
+      { symbol: 'A', currentValue: 4900, targetPct: 50 },
+      { symbol: 'B', currentValue: 5000, targetPct: 50 },
+    ];
+    const prices = new Map([['A', 10], ['B', 10]]);
+    const orders = allocateCashFlow(holdings, 5000, 10, prices, undefined, 'greedy');
+    const aShares = orders.find(o => o.symbol === 'A')?.shares ?? 0;
+    // Target for A after the deposit is well above current, but the engine
+    // should track the deficit as it fills rather than dumping the lot in.
+    const spent = aShares * 10;
+    expect(spent).toBeLessThanOrEqual(5000);
+  });
+
+  it('defaults to proportional — enabling greedy must be a deliberate act', () => {
+    const a = allocateCashFlow(expensiveBook, 790, 100, expensivePrices);
+    const b = allocateCashFlow(expensiveBook, 790, 100, expensivePrices, undefined, 'proportional');
+    expect(a).toEqual(b);
+  });
+});

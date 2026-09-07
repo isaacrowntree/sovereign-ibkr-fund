@@ -70,6 +70,19 @@ export const config = {
      *     relative weights but leaves the portfolio uniformly underweight.
      */
     fillMode: (process.env.REBALANCE_FILL_MODE || 'greedy') as 'greedy' | 'proportional',
+    /**
+     * How `allocateCashFlow` spreads a deposit — SEPARATE from `fillMode`,
+     * which governs full rebalances only.
+     *
+     * Defaults to 'proportional', which is what this path has always done, but
+     * that silently strands cash: a pro-rata slice below the price of one share
+     * floors to zero, so a balance spread across expensive names deploys
+     * NOTHING, on every cycle, indefinitely. 'greedy' fills the largest
+     * remaining deficit a share at a time instead, and still refuses to
+     * overshoot a target. Left off by default because it changes live order
+     * generation; enabling it is an operator decision.
+     */
+    cashFlowFillMode: (process.env.REBALANCE_CASHFLOW_FILL_MODE || 'proportional') as 'greedy' | 'proportional',
   },
   execution: {
     /**

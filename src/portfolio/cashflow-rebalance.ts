@@ -50,6 +50,25 @@ export function allocateCashFlow(
    * would overweight them against target.
    */
   excludeSymbols?: ReadonlySet<string>,
+  /**
+   * How to spread the deposit across deficits.
+   *
+   * `'proportional'` (default, and what production has always run) gives each
+   * deficit its pro-rata slice. That silently strands cash whenever a slice
+   * lands below the price of a single share: with $790 spread across names
+   * priced $337-$1,147, EVERY allocation floors to zero shares and the
+   * function returns no orders at all. It is not a rounding loss — the cash
+   * never deploys, on any cycle, until the deficits or the balance change.
+   *
+   * `'greedy'` fills the largest remaining deficit one share at a time,
+   * recomputing after each. It is the same principle as
+   * `generateRebalanceOrders`'s greedy fillMode (which production already
+   * runs) and it deploys everything down to the cheapest buyable share.
+   *
+   * Default is `'proportional'` so that merging this changes no live
+   * behaviour; enabling greedy is a deliberate operator decision.
+   */
+  fillMode: 'proportional' | 'greedy' = 'proportional',
 ): CashFlowOrder[] {
   if (depositUsd < 0) {
     throw new Error('Deposit must be non-negative');
@@ -80,6 +99,8 @@ export function allocateCashFlow(
     ? Math.min(depositUsd, totalDeficit)
     : depositUsd;
 
+  if (fillMode === 'greedy') return greedyFill(deficits, deployable, prices);
+
   // Allocate deposit proportionally to deficits
   const orders: CashFlowOrder[] = [];
   for (const { symbol, deficit } of deficits) {
@@ -101,4 +122,52 @@ export function allocateCashFlow(
   }
 
   return orders;
+}
+
+/**
+ * Fill the largest remaining deficit one share at a time.
+ *
+ * One-share steps rather than a computed batch because the ranking changes as
+ * we buy: filling the biggest gap can make another name the biggest. It
+ * terminates because every step spends at least the cheapest price and only
+ * names whose price still fits the remaining budget are eligible.
+ *
+ * `minTradeUsd` is deliberately NOT applied here. It exists to stop the
+ * proportional path emitting dust orders; greedy only ever buys whole shares of
+ * the name that most needs them, so the floor would just re-strand the cash
+ * this mode exists to deploy.
+ */
+function greedyFill(
+  deficits: { symbol: string; deficit: number }[],
+  budgetUsd: number,
+  prices: Map<string, number>,
+): CashFlowOrder[] {
+  const remaining = new Map(deficits.map((d) => [d.symbol, d.deficit]));
+  const shares = new Map<string, number>();
+  let budget = budgetUsd;
+
+  for (;;) {
+    let best: string | null = null;
+    let bestDeficit = 0;
+    for (const [symbol, deficit] of remaining) {
+      const price = prices.get(symbol);
+      if (!price || price <= 0) continue;
+      if (deficit > 0 && price <= budget && deficit > bestDeficit) {
+        bestDeficit = deficit;
+        best = symbol;
+      }
+    }
+    if (best === null) break;
+    const price = prices.get(best)!;
+    shares.set(best, (shares.get(best) ?? 0) + 1);
+    remaining.set(best, remaining.get(best)! - price);
+    budget -= price;
+  }
+
+  return [...shares.entries()].map(([symbol, qty]) => ({
+    symbol,
+    action: 'BUY' as const,
+    amountUsd: Math.round(qty * prices.get(symbol)! * 100) / 100,
+    shares: qty,
+  }));
 }
