@@ -25,6 +25,7 @@ import {
 } from '../connection/gateway.js';
 import { executeQueue, type ExecutorDeps } from '../execution/executor.js';
 import { reconcileExecutions } from '../execution/reconcile.js';
+import { recoverOrphanedFills } from '../execution/orphan-recovery.js';
 import type { StagedOrder } from '../execution/staging.js';
 import type { AlgoPriority, ExecutionPlan as AlgoPlan } from '../execution/algo-orders.js';
 import { isExecutionWindow, describeWindow, EXECUTION_WINDOW } from '../strategy/market-hours.js';
@@ -289,6 +290,126 @@ async function run(): Promise<void> {
       logError('Execution reconciliation failed (continuing)', err, AGENT);
     }
 
+    // Self-heal an orphaned queue. reconcileExecutions above works at the FILL
+    // level and is session-scoped — on 2026-09-08 it returned [] for a VST buy
+    // that had genuinely filled, because the session had been re-established
+    // since. Positions survive that, so cross-check the queue against them:
+    // any staged order whose shares are already at the broker beyond the
+    // accepted baseline has run, and must be retired rather than placed again.
+    //
+    // FAIL CLOSED, like the getLiveOrders guard inside the executor: a queue we
+    // cannot verify against positions is a queue that might double-spend. Skip
+    // the session instead.
+    let queue = pendingOrders;
+    try {
+      const summary = await getAccountSummary();
+      const recovery = recoverOrphanedFills({
+        pending: queue,
+        history: loadTradeHistory(),
+        positions: summary.positions.map(p => ({
+          symbol: p.symbol, qty: p.qty ?? 0, avgCost: p.avgCost,
+        })),
+        baselineSignature: state.ledgerDriftBaseline as string | undefined,
+        now: new Date(),
+      });
+
+      if (recovery.recovered.length > 0) {
+        for (const r of recovery.recovered) appendTrade(r.trade);
+        queue = recovery.remaining;
+        // Persist immediately: if this run dies too, the queue must already be
+        // clean. Leaving it to the end is how the original orphan survived.
+        mergeState({ pendingOrders: queue });
+
+        const detail = recovery.recovered
+          .map(r => `${r.order.action} ${r.order.qty} ${r.order.symbol}`).join(', ');
+        log(`Recovered ${recovery.recovered.length} orphaned fill(s) from positions: ${detail}`, AGENT);
+        await notify(
+          {
+            severity: 'warn',
+            title: `Recovered ${recovery.recovered.length} orphaned fill${recovery.recovered.length === 1 ? '' : 's'} — queue would have double-traded`,
+            body:
+              'These staged orders had already filled at IBKR but were never recorded, and were ' +
+              'still queued. They have been written to the ledger and removed from the queue. ' +
+              'Cost basis is INFERRED from the broker average cost, not an observed fill price — ' +
+              'check it before it matters for tax.',
+            fields: [{ label: 'Recovered', value: detail }],
+            agent: AGENT,
+            dedupe: { key: 'exec:orphan-recovered', fingerprint: detail },
+          },
+          storeHooks,
+        );
+      }
+
+      if (recovery.unexplained.length > 0) {
+        const detail = recovery.unexplained
+          .map(u => `${u.symbol}:${u.delta > 0 ? '+' : ''}${u.delta}`).join(', ');
+
+        // Without a baseline this list is mostly the pre-ledger account, which
+        // is history, not an anomaly — calling that critical would cry wolf on
+        // the one run where the operator most needs to read it carefully. Once
+        // a baseline exists, anything exceeding it really is an unrecorded fill.
+        const adopting = recovery.adoptedBaseline;
+        log(
+          adopting
+            ? `Ledger drift baseline adopted: ${detail}`
+            : `Share drift no pending order explains: ${detail}`,
+          AGENT,
+        );
+        await notify(
+          {
+            severity: adopting ? 'warn' : 'critical',
+            title: adopting
+              ? 'Ledger drift baseline adopted'
+              : 'Broker holds shares the ledger cannot account for',
+            body: adopting
+              ? 'No accepted drift baseline existed, so the difference between the ledger and ' +
+                'IBKR has been adopted as the starting point. Most of this is the account as it ' +
+                'stood before the ledger began. Anything here that is NOT pre-ledger history is ' +
+                'an unrecorded fill worth checking against the IBKR statement — after this run ' +
+                'it will not be reported again, because it is now the baseline.'
+              : 'These differences are not explained by the ledger, the accepted baseline, or any ' +
+                'queued order — so a fill happened that we have no record of and cannot price. The ' +
+                'ledger is the tax record; this needs a human to reconcile against the IBKR ' +
+                'statement. It is accepted into the baseline now so it reports once, not every run.',
+            fields: [{ label: adopting ? 'Baseline' : 'Unaccounted', value: detail }],
+            agent: AGENT,
+            dedupe: {
+              key: adopting ? 'exec:baseline-adopted' : 'exec:unexplained-drift',
+              fingerprint: detail,
+            },
+          },
+          storeHooks,
+        );
+      }
+
+      // Store the baseline the ledger now sits at, so the reconciler and the
+      // next run agree on what drift is already accepted.
+      mergeState({ ledgerDriftBaseline: recovery.baseline });
+
+      if (queue.length === 0) {
+        log('Queue was entirely orphaned fills — nothing left to execute', AGENT);
+        mergeState({ lastExecutionAt: new Date().toISOString() });
+        return;
+      }
+    } catch (err) {
+      logError('Orphan recovery failed — halting run (cannot verify the queue has not already run)', err, AGENT);
+      await notify(
+        {
+          severity: 'warn',
+          title: 'Execution skipped — could not verify the queue against broker positions',
+          body:
+            'Positions are how we detect a staged order that already filled. Without them a ' +
+            'crashed prior run could be replayed as a duplicate, so this session was skipped. ' +
+            'The queue is untouched and will be retried next window.',
+          fields: [{ label: 'Error', value: err instanceof Error ? err.message : String(err) }],
+          agent: AGENT,
+          dedupe: { key: 'exec:orphan-guard-unavailable', fingerprint: 'unavailable' },
+        },
+        storeHooks,
+      );
+      return;
+    }
+
     // Enforce the risk-manager's drawdown level — FAIL SAFE. If risk data is
     // missing or stale (risk-manager hasn't run / errored), do NOT trade
     // ungated; block and alert. On a hard stop, block AND clear the pending
@@ -382,7 +503,7 @@ async function run(): Promise<void> {
     };
 
     const outcome = await executeQueue(
-      pendingOrders,
+      queue,
       {
         validated,
         nav: startBalances.usdNav || 100000,

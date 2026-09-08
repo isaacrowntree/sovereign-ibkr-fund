@@ -28,21 +28,12 @@ import { connect, disconnect, getAccountSummary, requestDelayedData } from '../c
 import { TARGET_PORTFOLIO, config } from '../config.js';
 import { assessModelConformance } from '../risk/model-conformance.js';
 import { loadState, mergeState, loadTradeHistory } from '../state/store.js';
+import { ledgerImpliedShares, formatDriftSignature } from '../execution/orphan-recovery.js';
 import { notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
 
 const AGENT = 'Reconciler';
-
-/** symbol -> net shares implied by everything we have recorded. */
-function ledgerImpliedShares(): Map<string, number> {
-  const implied = new Map<string, number>();
-  for (const t of loadTradeHistory()) {
-    const delta = t.qty * (t.action === 'BUY' ? 1 : -1);
-    implied.set(t.symbol, (implied.get(t.symbol) ?? 0) + delta);
-  }
-  return implied;
-}
 
 /**
  * A stable description of how the ledger differs from the broker.
@@ -53,11 +44,14 @@ function ledgerImpliedShares(): Map<string, number> {
  * not record, or recorded wrongly.
  */
 function driftSignature(implied: Map<string, number>, actual: Map<string, number>): string {
-  const symbols = [...new Set([...implied.keys(), ...actual.keys()])].sort();
-  return symbols
-    .map(s => `${s}:${(actual.get(s) ?? 0) - (implied.get(s) ?? 0)}`)
-    .filter(entry => !entry.endsWith(':0'))
-    .join(',');
+  const drift = new Map<string, number>();
+  for (const s of new Set([...implied.keys(), ...actual.keys()])) {
+    drift.set(s, (actual.get(s) ?? 0) - (implied.get(s) ?? 0));
+  }
+  // Shared with execution-bot's orphan recovery, which subtracts the accepted
+  // baseline from this same difference. Two spellings of one signature would
+  // make it silently disagree about what has already been accounted for.
+  return formatDriftSignature(drift);
 }
 
 async function run(): Promise<void> {
@@ -116,7 +110,7 @@ async function run(): Promise<void> {
     }
 
     // ---- 2. Ledger vs broker positions ----
-    const implied = ledgerImpliedShares();
+    const implied = ledgerImpliedShares(loadTradeHistory());
     const actual = new Map(positions.map(p => [p.symbol, p.qty ?? 0]));
     const signature = driftSignature(implied, actual);
     const state = loadState();
@@ -151,7 +145,29 @@ async function run(): Promise<void> {
       log(`Ledger drift unchanged from baseline (${signature})`, AGENT);
     }
 
-    mergeState({ ledgerDriftSignature: signature, lastReconcileAt: new Date().toISOString() });
+    // Two different things, deliberately stored separately:
+    //
+    //   ledgerDriftSignature — the rolling last-seen difference. Overwritten
+    //     every run, which is what makes "it changed" detectable ONCE.
+    //   ledgerDriftBaseline — the difference ACCEPTED as pre-ledger history.
+    //     execution-bot's orphan recovery subtracts it before concluding that
+    //     shares at the broker are an unrecorded fill, so it must never absorb
+    //     a real fill: if it did, the orphan that fill left in the queue would
+    //     look explained and get placed a second time.
+    //
+    // Only a genuine first run seeds the baseline here. Once a signature
+    // exists, the difference may already contain an unrecorded fill (it did on
+    // 2026-09-08), and adopting that would hide exactly what recovery hunts
+    // for. From then on the baseline is execution-bot's to advance, because
+    // only it knows which part of the drift the queue accounts for.
+    const updates: Record<string, unknown> = {
+      ledgerDriftSignature: signature,
+      lastReconcileAt: new Date().toISOString(),
+    };
+    if (known === undefined && state.ledgerDriftBaseline === undefined) {
+      updates.ledgerDriftBaseline = signature;
+    }
+    mergeState(updates);
   } finally {
     disconnect();
   }
