@@ -30,7 +30,8 @@
  * (AMZN:4, ARM:5, BRK-B:10, NET:50, …). Treating that as unrecorded fills would
  * retire every staged order on the first run and silently cancel real trades.
  * So the caller passes the accepted baseline and only drift BEYOND it is treated
- * as a fill we missed.
+ * as a fill we missed. With no baseline at all there is no safe reading, and
+ * this refuses to run rather than pick one — see `blocked`.
  *
  * ## The direction the uncertainty falls
  *
@@ -92,16 +93,15 @@ export interface OrphanRecoveryResult {
   /** Drift signature to persist as the accepted baseline once `recovered` is applied. */
   baseline: string;
   /**
-   * True when no baseline had been accepted yet and this call established one.
+   * Non-null when the inputs could not support a safe conclusion. The caller
+   * MUST NOT execute the queue on such a run: `remaining` is returned
+   * untouched, nothing is recovered, and `baseline` is left as it was.
    *
-   * On that run every pre-ledger share lands in `unexplained`, because without
-   * a baseline nothing distinguishes "history from before the ledger existed"
-   * from "a fill we missed". It is the former far more often than the latter,
-   * so the caller should report the adoption rather than raise an anomaly —
-   * and treat `unexplained` as critical only on later runs, when a baseline
-   * really was in place for the drift to exceed.
+   * Recovery decides whether real money gets spent twice, so it either knows
+   * or it stops. Both blocking conditions are cases where the two possible
+   * readings of the same observation have opposite, expensive consequences.
    */
-  adoptedBaseline: boolean;
+  blocked: string | null;
 }
 
 /** Net shares per symbol implied by everything recorded in the ledger. */
@@ -137,11 +137,19 @@ export function parseDriftSignature(sig: string | undefined | null): Map<string,
   return out;
 }
 
-/** Render a drift map back to its canonical signature: sorted, zeroes omitted. */
+/**
+ * Render a drift map back to its canonical signature: sorted, zeroes omitted.
+ *
+ * Ordered by code unit (plain `<`), NOT localeCompare. The signature is
+ * compared as a STRING against one already persisted, so its spelling has to
+ * be stable: localeCompare collates punctuation differently (`BRK-B`, `BF.B`)
+ * and is ICU/locale dependent, so adopting it would re-spell an unchanged
+ * drift and raise a critical "ledger drift changed" alert about nothing.
+ */
 export function formatDriftSignature(drift: Map<string, number>): string {
   return [...drift.entries()]
     .filter(([, n]) => n !== 0)
-    .sort(([a], [b]) => a.localeCompare(b))
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([s, n]) => `${s}:${n}`)
     .join(',');
 }
@@ -149,14 +157,43 @@ export function formatDriftSignature(drift: Map<string, number>): string {
 export function recoverOrphanedFills(input: OrphanRecoveryInput): OrphanRecoveryResult {
   const { pending, history, positions, baselineSignature, now } = input;
 
+  const blocked = (why: string): OrphanRecoveryResult => ({
+    recovered: [], remaining: pending, unexplained: [],
+    baseline: baselineSignature ?? '', blocked: why,
+  });
+
+  // No accepted baseline means pre-ledger history and an orphaned fill are the
+  // SAME observation. Guessing "history" re-places an order that already
+  // filled; guessing "fill" cancels real orders and fabricates trades in the
+  // tax ledger. Adopting the drift silently is the worst of the three, because
+  // it buries any real orphan inside the baseline where nothing can find it
+  // again. An operator establishes the baseline once; until then, stop.
+  if (baselineSignature == null) {
+    return blocked('no accepted drift baseline — cannot tell pre-ledger history from an unrecorded fill');
+  }
+
   const implied = ledgerImpliedShares(history);
   const actual = new Map<string, number>();
   for (const p of positions) {
     if (!p.qty) continue; // a zeroed row is a closed position, not a sale to explain
     actual.set(p.symbol, (actual.get(p.symbol) ?? 0) + p.qty);
   }
+  // IBKR commonly answers [] on the first call after a session bounce, and
+  // getAccountSummary() turns a null/absent body into an empty array rather
+  // than an error — so "no positions" arrives looking like a successful
+  // answer. Read literally it means everything was sold, which would retire
+  // every staged SELL as already-filled and write sales that never happened.
+  // Consistent only if we believe we hold nothing either.
+  if (actual.size === 0 && [...implied.values()].some(v => v !== 0)) {
+    return blocked('broker reported no positions while the ledger implies holdings — cannot verify the queue');
+  }
+
+  // A missing average cost reaches us as 0, not undefined: gateway.ts maps
+  // `avgCost: p.avgCost ?? 0` into a required number. Recording that would put
+  // a $0 cost basis in the tax ledger and make the eventual sale read as 100%
+  // capital gain, so a non-positive cost is treated as no cost at all.
   const avgCost = new Map(
-    positions.filter(p => p.avgCost != null).map(p => [p.symbol, p.avgCost as number]),
+    positions.filter(p => p.avgCost != null && p.avgCost > 0).map(p => [p.symbol, p.avgCost as number]),
   );
   const baseline = parseDriftSignature(baselineSignature);
 
@@ -239,6 +276,6 @@ export function recoverOrphanedFills(input: OrphanRecoveryInput): OrphanRecovery
     remaining,
     unexplained,
     baseline: formatDriftSignature(nextBaseline),
-    adoptedBaseline: baselineSignature == null,
+    blocked: null,
   };
 }

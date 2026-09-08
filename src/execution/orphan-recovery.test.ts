@@ -276,38 +276,26 @@ describe('recoverOrphanedFills — drift no staged order explains', () => {
     expect(out.baseline).toBe('LLY:1');
   });
 
-  it('flags that it ADOPTED a baseline when none had been accepted yet', () => {
-    // With no accepted baseline every pre-ledger share looks unaccounted for.
-    // That is history nobody was ever going to have recorded, not an anomaly,
-    // and the caller must be able to tell the two apart before it alerts.
-    const out = recoverOrphanedFills({
-      pending: [],
-      history: [],
-      positions: [pos('AMZN', 4), pos('NET', 50)],
-      baselineSignature: undefined,
-      now: NOW,
-    });
-    expect(out.adoptedBaseline).toBe(true);
-    expect(out.baseline).toBe('AMZN:4,NET:50');
-  });
-
-  it('does not claim adoption once a baseline exists, even an empty one', () => {
+  it('does not treat an empty baseline as an absent one', () => {
     // '' is a real answer — "the ledger explains every share" — not an absence.
     const out = recoverOrphanedFills({
       pending: [], history: [], positions: [pos('LLY', 1)], baselineSignature: '', now: NOW,
     });
-    expect(out.adoptedBaseline).toBe(false);
+    expect(out.blocked).toBeNull();
     expect(out.unexplained).toEqual([{ symbol: 'LLY', delta: 1 }]);
   });
 
   it('reports a symbol the broker no longer holds at all', () => {
+    // The book still has other names — a wholly empty positions response is
+    // untrustworthy and blocks instead (see 'refuses to guess').
     const out = recoverOrphanedFills({
       pending: [],
-      history: [rec({ symbol: 'ARM', action: 'BUY', qty: 5 })],
-      positions: [],
+      history: [rec({ symbol: 'ARM', action: 'BUY', qty: 5 }), rec({ symbol: 'NET', action: 'BUY', qty: 7 })],
+      positions: [pos('NET', 7, 188.82)],
       baselineSignature: '',
       now: NOW,
     });
+    expect(out.blocked).toBeNull();
     expect(out.unexplained).toEqual([{ symbol: 'ARM', delta: -5 }]);
   });
 });
@@ -351,5 +339,107 @@ describe('recoverOrphanedFills — degenerate inputs', () => {
       pending: [], history: [], positions: [pos('VST', 0, 153.545)], baselineSignature: '', now: NOW,
     });
     expect(out.unexplained).toEqual([]);
+  });
+});
+
+describe('recoverOrphanedFills — refuses to guess', () => {
+  // Without an accepted baseline, pre-ledger history and an orphaned fill are
+  // literally the same observation, and BOTH readings are unsafe: treat the
+  // drift as history and a staged order that already filled gets placed twice;
+  // treat it as fills and real staged orders are cancelled and fabricated into
+  // the tax ledger. There is no safe guess, so it must not guess.
+  it('blocks instead of adopting when no baseline has been accepted', () => {
+    const out = recoverOrphanedFills({
+      pending: [order('NET', 'BUY', 10, 2853)],
+      history: [],
+      positions: [pos('NET', 50, 188.82)],
+      baselineSignature: undefined,
+      now: NOW,
+    });
+    expect(out.blocked).toMatch(/baseline/i);
+    expect(out.recovered).toEqual([]);
+    expect(out.remaining).toHaveLength(1);
+    expect(out.remaining[0].qty).toBe(10);
+  });
+
+  it('does not silently bank a baseline it was not confident about', () => {
+    // Storing the adopted drift would bury any real orphan inside it, and the
+    // staged order it belongs to would then look unexplained and be re-placed.
+    const out = recoverOrphanedFills({
+      pending: [order('VST', 'BUY', 4, 615.48)],
+      history: [],
+      positions: [pos('VST', 4, 153.545)],
+      baselineSignature: undefined,
+      now: NOW,
+    });
+    expect(out.blocked).not.toBeNull();
+    expect(out.baseline).toBe('');
+    expect(out.unexplained).toEqual([]);
+  });
+
+  it('blocks when the broker reports no positions but the ledger implies some', () => {
+    // IBKR commonly answers [] on the first call after a session bounce. Read
+    // literally that is "everything was sold", which would retire every staged
+    // SELL as already-filled and write sales that never happened.
+    const out = recoverOrphanedFills({
+      pending: [order('TLT', 'SELL', 3, 249.88)],
+      history: [rec({ symbol: 'TLT', action: 'BUY', qty: 10 })],
+      positions: [],
+      baselineSignature: '',
+      now: NOW,
+    });
+    expect(out.blocked).toMatch(/position/i);
+    expect(out.recovered).toEqual([]);
+    expect(out.remaining).toHaveLength(1);
+  });
+
+  it('still works on a genuinely empty account', () => {
+    // No positions AND nothing in the ledger is consistent, not suspicious.
+    const out = recoverOrphanedFills({
+      pending: [order('VST', 'BUY', 4, 615.48)],
+      history: [], positions: [], baselineSignature: '', now: NOW,
+    });
+    expect(out.blocked).toBeNull();
+    expect(out.remaining).toHaveLength(1);
+  });
+});
+
+describe('recoverOrphanedFills — cost basis must never be fabricated', () => {
+  it('treats a zero average cost as absent, not as a free share', () => {
+    // gateway.getAccountSummary() coerces a missing avgCost to 0, so `0` is
+    // what production actually passes. Recording it would put a $0 cost basis
+    // in the tax ledger and turn the eventual sale into 100% capital gain.
+    const out = recoverOrphanedFills({
+      pending: [order('VST', 'BUY', 4, 615.48)],
+      history: [],
+      positions: [pos('VST', 4, 0)],
+      baselineSignature: '',
+      now: NOW,
+    });
+    expect(out.recovered).toHaveLength(1);
+    const t = out.recovered[0].trade;
+    expect(t.fillPrice).toBeUndefined();
+    expect(t.estimatedValue).toBeCloseTo(615.48, 2);
+    expect(t.reason).toContain('no fill price');
+  });
+
+  it('treats a negative average cost as absent too', () => {
+    const out = recoverOrphanedFills({
+      pending: [order('VST', 'BUY', 4, 615.48)],
+      history: [], positions: [pos('VST', 4, -1)], baselineSignature: '', now: NOW,
+    });
+    expect(out.recovered[0].trade.fillPrice).toBeUndefined();
+  });
+});
+
+describe('formatDriftSignature — ordering must not depend on the locale', () => {
+  it('orders by code unit, matching the signature already stored on disk', () => {
+    // The reconciler used to sort with a plain Array.sort(). localeCompare
+    // collates punctuation differently, so switching would re-spell an
+    // unchanged drift and fire a spurious "ledger drift changed" critical.
+    const symbols = ['BRKB', 'BRK-B', 'BF.B', 'AMZN', 'ARM'];
+    const m = new Map(symbols.map((s, i) => [s, i + 1]));
+    const got = formatDriftSignature(m).split(',').map(e => e.slice(0, e.lastIndexOf(':')));
+    expect(got).toEqual([...symbols].sort());
   });
 });
