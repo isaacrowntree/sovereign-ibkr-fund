@@ -94,6 +94,12 @@ export interface ExecutorDeps {
    */
   getAvgCosts?(): Promise<Map<string, number>>;
   /**
+   * Report the current step so the caller can persist it. A killed run leaves
+   * no trace in-process — no finally, no exit hook — so where it got to has to
+   * already be on disk when it dies. Optional: the pure tests do not care.
+   */
+  onPhase?(phase: string): void;
+  /**
    * Orders already working at IBKR (fetched once at run start). Used to skip
    * placing a duplicate for a symbol+side that already has a live order — the
    * central guard against cross-run duplicates. Optional: absent → no guard.
@@ -509,6 +515,7 @@ export async function executeQueue(
 
       let result: TradeResult;
       try {
+        deps.onPhase?.(`placing:${order.symbol}`);
         result = await deps.placeOrder(order, strategy, urgency);
       } catch (err) {
         deps.logError(`Order submission failed: ${order.action} ${order.qty} ${order.symbol}`, err);
@@ -550,6 +557,7 @@ export async function executeQueue(
         const timeoutMs = urgency === 'Patient' ? 180_000 : 60_000;
         let conf: FillConfirmation;
         try {
+          deps.onPhase?.(`confirming:${order.symbol}`);
           conf = await deps.confirmFill(result.orderId, {
             targetQty: order.qty,
             timeoutMs,

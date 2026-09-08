@@ -744,3 +744,40 @@ describe('executeQueue — avg-cost fallback for cost basis (no FIFO lot)', () =
     expect(t?.realisedPnlUsd).toBeCloseTo(7 * (403.88 - 240.34), 2);
   });
 });
+
+describe('phase reporting — the breadcrumb a killed run leaves behind', () => {
+  // On 2026-09-08 two runs were killed between placing an order and its fill
+  // confirming, and left no record of where they got to. The executor has to
+  // announce that boundary so the agent can put it on disk before the axe.
+  it('announces placing and confirming for each order, in order', async () => {
+    const { deps } = makeDeps();
+    const phases: string[] = [];
+    await executeQueue(
+      [order('NET', 'SELL', 500), order('VST', 'BUY', 600)],
+      ctx({ validated: true }),
+      { ...deps, onPhase: (p) => phases.push(p) },
+    );
+    expect(phases).toEqual([
+      'placing:NET', 'confirming:NET',
+      'placing:VST', 'confirming:VST',
+    ]);
+  });
+
+  it('reports placing before the order goes out, not after it comes back', async () => {
+    // A phase recorded after placement is useless: the kill happens in between.
+    const { deps } = makeDeps();
+    const seen: string[] = [];
+    await executeQueue([order('VST', 'BUY', 600)], ctx({ validated: true }), {
+      ...deps,
+      onPhase: (p) => seen.push(`phase:${p}`),
+      placeOrder: async (o, s, u) => { seen.push('placed'); return deps.placeOrder(o, s, u); },
+    });
+    expect(seen.indexOf('phase:placing:VST')).toBeLessThan(seen.indexOf('placed'));
+  });
+
+  it('runs fine without the hook — it is optional', async () => {
+    const { deps } = makeDeps();
+    const out = await executeQueue([order('VST', 'BUY', 600)], ctx({ validated: true }), deps);
+    expect(out.executed).toHaveLength(1);
+  });
+});

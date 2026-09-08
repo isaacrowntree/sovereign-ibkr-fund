@@ -26,6 +26,10 @@ import {
 import { executeQueue, type ExecutorDeps } from '../execution/executor.js';
 import { reconcileExecutions } from '../execution/reconcile.js';
 import { recoverOrphanedFills } from '../execution/orphan-recovery.js';
+import {
+  startRun, enterPhase, recordSignal, describeAbandonedRun, RUN_STALE_MS,
+  type RunPhase,
+} from '../observability/run-recorder.js';
 import type { StagedOrder } from '../execution/staging.js';
 import type { AlgoPriority, ExecutionPlan as AlgoPlan } from '../execution/algo-orders.js';
 import { isExecutionWindow, describeWindow, EXECUTION_WINDOW } from '../strategy/market-hours.js';
@@ -169,12 +173,57 @@ const RISK_STALE_MS = (() => {
  * runs per agent; this state-file lock is defence-in-depth against a manual
  * invocation overlapping a scheduled run. Considered stale after this long
  * (longer than the worst-case run of 10 Patient confirmations).
+ *
+ * The lock doubles as the flight recorder: it carries the phase the run is in,
+ * so a run that is killed leaves behind WHERE it died. See run-recorder.ts.
  */
-const RUN_LOCK_STALE_MS = 35 * 60 * 1000;
+const RUN_LOCK_STALE_MS = RUN_STALE_MS;
 
-interface RunLock {
-  at: string;
-  pid: number;
+/**
+ * The live run's breadcrumb. Module-scoped because the signal handlers need to
+ * amend it from outside the run, and a kill gives no chance to pass it along.
+ */
+let runPhase: RunPhase | null = null;
+
+/** Persist where we are, so a SIGKILL still leaves the phase on disk. */
+function phase(name: string): void {
+  if (!runPhase) return;
+  runPhase = enterPhase(runPhase, name, new Date(), process.memoryUsage().rss);
+  try {
+    mergeState({ executionRunLock: runPhase });
+  } catch (e) {
+    logError('Could not persist run phase', e, AGENT);
+  }
+}
+
+/**
+ * Catch the shutdowns that CAN be caught. SIGKILL runs nothing, so recording
+ * SIGTERM/SIGINT is what later distinguishes "a supervisor timed us out" from
+ * "the process was destroyed without warning" — the difference between a
+ * config problem and a crash.
+ */
+function watchForShutdown(): void {
+  for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
+    process.on(sig, () => {
+      log(`Received ${sig} during "${runPhase?.phase ?? 'unknown'}" — recording before exit`, AGENT);
+      if (runPhase) {
+        runPhase = recordSignal(runPhase, sig, new Date());
+        try { mergeState({ executionRunLock: runPhase }); } catch { /* best effort */ }
+      }
+      process.exit(143);
+    });
+  }
+  process.on('uncaughtException', (e) => {
+    logError(`Uncaught exception during "${runPhase?.phase ?? 'unknown'}"`, e, AGENT);
+    if (runPhase) {
+      runPhase = recordSignal(runPhase, `uncaughtException: ${e instanceof Error ? e.message : String(e)}`, new Date());
+      try { mergeState({ executionRunLock: runPhase }); } catch { /* best effort */ }
+    }
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (r) => {
+    logError(`Unhandled rejection during "${runPhase?.phase ?? 'unknown'}"`, r, AGENT);
+  });
 }
 
 async function placeOrder(
@@ -229,7 +278,7 @@ async function run(): Promise<void> {
 
   // Defence-in-depth run lock: refuse to start if another run is holding the
   // lock and it isn't stale.
-  const existingLock = state.executionRunLock as RunLock | undefined;
+  const existingLock = state.executionRunLock as RunPhase | undefined;
   if (existingLock && Date.now() - new Date(existingLock.at).getTime() < RUN_LOCK_STALE_MS) {
     log(
       `Another execution run holds the lock (pid ${existingLock.pid}, since ${existingLock.at}) — skipping to avoid double-execution`,
@@ -237,7 +286,38 @@ async function run(): Promise<void> {
     );
     return;
   }
-  mergeState({ executionRunLock: { at: new Date().toISOString(), pid: process.pid } satisfies RunLock });
+
+  // The previous run left a lock behind, which means it was killed rather than
+  // finishing — the `finally` that releases it never ran. It cannot report its
+  // own death, so we report it: this is the only place the cause ever surfaces.
+  const postMortem = describeAbandonedRun(
+    existingLock ?? null,
+    new Date(),
+    (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } },
+  );
+  if (postMortem) {
+    log(postMortem.detail, AGENT);
+    await notify(
+      {
+        severity: 'critical',
+        title: postMortem.title,
+        body: postMortem.detail,
+        fields: [
+          { label: 'Phase', value: postMortem.phase },
+          { label: 'Stuck for', value: `${Math.round(postMortem.phaseMs / 1000)}s` },
+        ],
+        agent: AGENT,
+        // Keyed on the phase: the same phase dying repeatedly is one story, a
+        // different phase is a new one worth hearing.
+        dedupe: { key: 'exec:run-died', fingerprint: `${postMortem.phase}:${existingLock?.at ?? ''}` },
+      },
+      storeHooks,
+    );
+  }
+
+  watchForShutdown();
+  runPhase = startRun(new Date(), process.pid, process.memoryUsage().rss);
+  mergeState({ executionRunLock: runPhase });
 
   // Floor for fill-confirmation event matching: only consider order events
   // at/after the cursor the observer has already reached, so a recycled
@@ -252,6 +332,7 @@ async function run(): Promise<void> {
   // leak the lock and wedge all execution for RUN_LOCK_STALE_MS.
   let connected = false;
   try {
+    phase('connect');
     await connect();
     connected = true;
 
@@ -261,6 +342,7 @@ async function run(): Promise<void> {
     // positions reflect it. Best-effort: a reconcile failure must not block
     // trading.
     try {
+      phase('reconcile-executions');
       const execs = await getExecutions();
       const backfill = reconcileExecutions(loadTradeHistory(), execs);
       for (const t of backfill) appendTrade(t);
@@ -303,6 +385,7 @@ async function run(): Promise<void> {
     let queue = pendingOrders;
     let recovery;
     try {
+      phase('orphan-recovery');
       const summary = await getAccountSummary();
       recovery = recoverOrphanedFills({
         pending: queue,
@@ -485,6 +568,7 @@ async function run(): Promise<void> {
 
     // USD balances: the account is AUD-base, but US-stock orders are USD, so
     // gate and size against USD figures (see getUsdBalances / risk register).
+    phase('usd-balances');
     const startBalances = await getUsdBalances();
 
     const deps: ExecutorDeps = {
@@ -509,8 +593,12 @@ async function run(): Promise<void> {
       isWindowOpen: isExecutionWindow,
       log: (msg) => log(msg, AGENT),
       logError: (msg, err) => logError(msg, err, AGENT),
+      // Both 2026-09-08 deaths happened between placing an order and its fill
+      // confirming, so that boundary is exactly what has to reach disk.
+      onPhase: (name) => phase(name),
     };
 
+    phase('execute-queue');
     const outcome = await executeQueue(
       queue,
       {
