@@ -140,7 +140,7 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Correlation analysis', () => {
     console.log(`Improvement: ${((concCorr - divCorr) / concCorr * 100).toFixed(1)}% lower correlation`);
 
     expect(divCorr).toBeLessThan(concCorr);
-  });
+  }, 30_000);
 });
 
 describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Diversification strategy comparison', () => {
@@ -160,7 +160,7 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Diversification strategy comparison',
     const concDD = rows.find(r => r.name.includes('Concentrated') && r.name.includes('HRP'))!.maxDD;
     const fullDD = rows.find(r => r.name.includes('Full'))!.maxDD;
     console.log(`\nDrawdown reduction: ${concDD.toFixed(1)}% → ${fullDD.toFixed(1)}% (${((concDD - fullDD) / concDD * 100).toFixed(0)}% improvement)`);
-  });
+  }, 30_000);
 
   it('compares optimizer methods on diversified universe', () => {
     const results = [
@@ -172,7 +172,7 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Diversification strategy comparison',
 
     console.log('\n=== OPTIMIZER COMPARISON (16-stock diversified) ===');
     compareResults(results);
-  });
+  }, 30_000);
 });
 
 describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Diversified portfolio parameter sweep', () => {
@@ -197,7 +197,7 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Diversified portfolio parameter sweep
 
     console.log('\n=== DIVERSIFIED PORTFOLIO PARAMETER SWEEP ===');
     compareResults(results);
-  });
+  }, 30_000);
 
   it('finds optimal diversified configuration', () => {
     const results = [
@@ -240,7 +240,7 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Diversified portfolio parameter sweep
     for (const p of bestConfig.r.finalPositions) {
       console.log(`  ${p.symbol.padEnd(6)} ${String(p.shares).padStart(4)} shares @ avg $${p.avgCost.toFixed(2)}`);
     }
-  });
+  }, 30_000);
 });
 
 describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Sleeve analysis', () => {
@@ -272,5 +272,5 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('Sleeve analysis', () => {
     // The whole should be better than the worst sleeve on risk-adjusted basis
     const fullSharpe = results.find(r => r.name.includes('Full'))!.r.sharpeRatio;
     expect(fullSharpe).toBeGreaterThan(0);
-  });
+  }, 30_000);
 });

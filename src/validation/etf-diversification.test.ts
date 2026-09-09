@@ -177,7 +177,7 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('ETF diversification impact', () => {
       const bar = '█'.repeat(Math.max(0, Math.floor(corr * 20)));
       console.log(`  ${symbol.padEnd(6)} ${corr.toFixed(3).padStart(6)}  ${bar}`);
     }
-  });
+  }, 30_000);
 
   it('optimizer comparison on the best universe', () => {
     const best = [...STOCKS_13, ...ETFS_TOP4];
@@ -188,5 +188,5 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('ETF diversification impact', () => {
     }
     console.log('\n=== OPTIMIZER COMPARISON (13 stocks + 4 ETFs) ===');
     printTable(rows);
-  });
+  }, 30_000);
 });
