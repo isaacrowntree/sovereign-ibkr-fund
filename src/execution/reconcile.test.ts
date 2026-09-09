@@ -148,43 +148,43 @@ describe('a fill recorded with no broker identifiers', () => {
     rec({ orderId: 0, execId: undefined, ...over });
 
   it('credits an execution against a same-day record that has no ids', () => {
-    const history = [noIds({ symbol: 'VST', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
+    const history = [noIds({ symbol: 'HHH', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
     const out = reconcileExecutions(history, [
-      exec('REAL-1', 'VST', 'BUY', 4, 153.295, 999, '2026-09-08T18:56:18Z'),
+      exec('REAL-1', 'HHH', 'BUY', 4, 100, 999, '2026-09-08T18:56:18Z'),
     ]);
     expect(out).toEqual([]);
   });
 
   it('covers partial executions from one pooled record, like the order-level credit', () => {
-    const history = [noIds({ symbol: 'VST', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
+    const history = [noIds({ symbol: 'HHH', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
     const out = reconcileExecutions(history, [
-      exec('R1', 'VST', 'BUY', 2, 153.29, 999, '2026-09-08T18:56:18Z'),
-      exec('R2', 'VST', 'BUY', 2, 153.30, 999, '2026-09-08T18:56:19Z'),
+      exec('R1', 'HHH', 'BUY', 2, 100, 999, '2026-09-08T18:56:18Z'),
+      exec('R2', 'HHH', 'BUY', 2, 100, 999, '2026-09-08T18:56:19Z'),
     ]);
     expect(out).toEqual([]);
   });
 
   it('still backfills a genuinely extra fill beyond what the record covers', () => {
-    const history = [noIds({ symbol: 'VST', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
+    const history = [noIds({ symbol: 'HHH', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
     const out = reconcileExecutions(history, [
-      exec('R1', 'VST', 'BUY', 4, 153.295, 999, '2026-09-08T18:56:18Z'),
-      exec('R2', 'VST', 'BUY', 1, 153.400, 998, '2026-09-08T19:10:00Z'),
+      exec('R1', 'HHH', 'BUY', 4, 100, 999, '2026-09-08T18:56:18Z'),
+      exec('R2', 'HHH', 'BUY', 1, 101, 998, '2026-09-08T19:10:00Z'),
     ]);
     expect(out.map(t => t.execId)).toEqual(['R2']);
     expect(out[0].qty).toBe(1);
   });
 
   it('does not let one day cover a different day', () => {
-    const history = [noIds({ symbol: 'VST', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
+    const history = [noIds({ symbol: 'HHH', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
     const out = reconcileExecutions(history, [
-      exec('R1', 'VST', 'BUY', 4, 153.295, 999, '2026-09-09T18:56:18Z'),
+      exec('R1', 'HHH', 'BUY', 4, 100, 999, '2026-09-09T18:56:18Z'),
     ]);
     expect(out).toHaveLength(1);
   });
 
   it('does not let a BUY record cover a SELL execution, or another symbol', () => {
-    const history = [noIds({ symbol: 'VST', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
-    expect(reconcileExecutions(history, [exec('R1', 'VST', 'SELL', 4, 153, 9, '2026-09-08T18:56:18Z')])).toHaveLength(1);
+    const history = [noIds({ symbol: 'HHH', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
+    expect(reconcileExecutions(history, [exec('R1', 'HHH', 'SELL', 4, 153, 9, '2026-09-08T18:56:18Z')])).toHaveLength(1);
     expect(reconcileExecutions(history, [exec('R2', 'LLY', 'BUY', 4, 153, 9, '2026-09-08T18:56:18Z')])).toHaveLength(1);
   });
 
@@ -192,11 +192,11 @@ describe('a fill recorded with no broker identifiers', () => {
     // A record with a real orderId must keep matching by order, not by day —
     // otherwise two orders for one symbol on one day would cover each other.
     const history = [
-      rec({ orderId: 111, action: 'BUY', symbol: 'NET', qty: 4, execId: undefined, timestamp: '2026-09-08T18:53:18Z' }),
+      rec({ orderId: 111, action: 'BUY', symbol: 'DDD', qty: 4, execId: undefined, timestamp: '2026-09-08T18:53:18Z' }),
     ];
     const out = reconcileExecutions(history, [
-      exec('E1', 'NET', 'BUY', 4, 285.32, 111, '2026-09-08T18:53:18Z'),
-      exec('E2', 'NET', 'BUY', 3, 285.40, 222, '2026-09-08T19:00:00Z'),
+      exec('E1', 'DDD', 'BUY', 4, 100, 111, '2026-09-08T18:53:18Z'),
+      exec('E2', 'DDD', 'BUY', 3, 101, 222, '2026-09-08T19:00:00Z'),
     ]);
     expect(out.map(t => t.execId)).toEqual(['E2']);
   });

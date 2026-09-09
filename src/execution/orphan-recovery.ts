@@ -108,7 +108,7 @@ export function ledgerImpliedShares(history: TradeRecord[]): Map<string, number>
 }
 
 /**
- * Parse a drift signature (`"AMZN:4,NET:50"`) into a map.
+ * Parse a drift signature (`"AAA:4,DDD:50"`) into a map.
  *
  * Tolerant by design: a corrupt or hand-edited signature must not throw and
  * take the whole execution run down with it. An unreadable entry is dropped,

@@ -18,7 +18,7 @@ const order = (
 ): StagedOrder => ({ symbol, action, qty, estimatedValue, reason });
 
 const rec = (over: Partial<TradeRecord>): TradeRecord => ({
-  timestamp: '2026-07-06T14:59:42.346Z', symbol: 'NET', action: 'BUY', qty: 1,
+  timestamp: '2026-07-06T14:59:42.346Z', symbol: 'DDD', action: 'BUY', qty: 1,
   estimatedValue: 100, orderId: 1, status: 'filled', reason: 'x', ...over,
 });
 
@@ -29,7 +29,7 @@ const NOW = new Date('2026-09-09T00:00:00.000Z');
 
 describe('parseDriftSignature / formatDriftSignature', () => {
   it('round-trips a multi-symbol signature unchanged', () => {
-    const sig = 'AMZN:4,ARM:5,BRK-B:10,NET:50,PLTR:10,TSLA:10,TWLO:20';
+    const sig = 'AAA:4,BBB:5,CC-C:10,DDD:50,EEE:10,FFF:10,GGG:20';
     expect(formatDriftSignature(parseDriftSignature(sig))).toBe(sig);
   });
 
@@ -39,7 +39,7 @@ describe('parseDriftSignature / formatDriftSignature', () => {
   });
 
   it('parses negative drift (broker holds fewer than the ledger implies)', () => {
-    expect(parseDriftSignature('TLT:-3').get('TLT')).toBe(-3);
+    expect(parseDriftSignature('LLL:-3').get('LLL')).toBe(-3);
   });
 
   it('omits zero entries and sorts, so one drift has exactly one spelling', () => {
@@ -48,20 +48,20 @@ describe('parseDriftSignature / formatDriftSignature', () => {
   });
 
   it('ignores malformed entries rather than throwing on a corrupt signature', () => {
-    const m = parseDriftSignature('AMZN:4,garbage,NET:x,TLT:3');
-    expect([...m]).toEqual([['AMZN', 4], ['TLT', 3]]);
+    const m = parseDriftSignature('AAA:4,garbage,DDD:x,LLL:3');
+    expect([...m]).toEqual([['AAA', 4], ['LLL', 3]]);
   });
 });
 
 describe('ledgerImpliedShares', () => {
   it('nets buys against sells per symbol', () => {
     const implied = ledgerImpliedShares([
-      rec({ symbol: 'NET', action: 'BUY', qty: 10 }),
-      rec({ symbol: 'NET', action: 'SELL', qty: 2 }),
-      rec({ symbol: 'XLE', action: 'BUY', qty: 21 }),
+      rec({ symbol: 'DDD', action: 'BUY', qty: 10 }),
+      rec({ symbol: 'DDD', action: 'SELL', qty: 2 }),
+      rec({ symbol: 'III', action: 'BUY', qty: 21 }),
     ]);
-    expect(implied.get('NET')).toBe(8);
-    expect(implied.get('XLE')).toBe(21);
+    expect(implied.get('DDD')).toBe(8);
+    expect(implied.get('III')).toBe(21);
   });
 });
 
@@ -70,45 +70,45 @@ describe('a staged order that already filled is retired, not placed again', () =
   // queue with the shares already at the broker. Neither session-scoped source
   // can see it — a filled order is not "working", and getExecutions() forgets
   // across a session bounce — so the position is the only proof it happened.
-  const baseline = 'AMZN:4,ARM:5,BRK-B:10,NET:50,PLTR:10,TSLA:10,TWLO:20';
+  const baseline = 'AAA:4,BBB:5,CC-C:10,DDD:50,EEE:10,FFF:10,GGG:20';
   // The book that baseline describes. With an empty ledger these positions ARE
   // the baseline, so recovery must find one orphan inside a book full of
   // accepted drift rather than in isolation.
   const BASELINE_POSITIONS: BrokerPosition[] = [
-    pos('AMZN', 4, 184.4), pos('ARM', 5, 88.6), pos('BRK-B', 10, 497.18),
-    pos('NET', 50, 188.82), pos('PLTR', 10, 85.58), pos('TSLA', 10, 240.34),
-    pos('TWLO', 20, 58.95),
+    pos('AAA', 4, 10), pos('BBB', 5, 20), pos('CC-C', 10, 30),
+    pos('DDD', 50, 40), pos('EEE', 10, 55), pos('FFF', 10, 60),
+    pos('GGG', 20, 70),
   ];
 
   it('retires a staged buy whose shares are already at the broker', () => {
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48)],
+      pending: [order('HHH', 'BUY', 4, 402)],
       history: [],
-      positions: [...BASELINE_POSITIONS, pos('VST', 4, 153.545)],
+      positions: [...BASELINE_POSITIONS, pos('HHH', 4, 100)],
       baselineSignature: baseline,
       now: NOW,
     });
 
     expect(out.remaining).toEqual([]);
     expect(out.recovered).toHaveLength(1);
-    expect(out.recovered[0].order.symbol).toBe('VST');
+    expect(out.recovered[0].order.symbol).toBe('HHH');
   });
 
   it('backfills the ledger with the fill it proved, priced at the broker cost', () => {
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48)],
+      pending: [order('HHH', 'BUY', 4, 402)],
       history: [],
-      positions: [...BASELINE_POSITIONS, pos('VST', 4, 153.545)],
+      positions: [...BASELINE_POSITIONS, pos('HHH', 4, 100)],
       baselineSignature: baseline,
       now: NOW,
     });
 
     const t = out.recovered[0].trade;
-    expect(t.symbol).toBe('VST');
+    expect(t.symbol).toBe('HHH');
     expect(t.action).toBe('BUY');
     expect(t.qty).toBe(4);
-    expect(t.fillPrice).toBe(153.545);
-    expect(t.estimatedValue).toBeCloseTo(614.18, 2);
+    expect(t.fillPrice).toBe(100);
+    expect(t.estimatedValue).toBeCloseTo(400, 2);
     expect(t.status).toBe('filled');
     expect(t.timestamp).toBe(NOW.toISOString());
     // The price is INFERRED from the broker's average cost, not observed. The
@@ -118,9 +118,9 @@ describe('a staged order that already filled is retired, not placed again', () =
 
   it('leaves the drift at exactly the baseline once the backfill is applied', () => {
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48)],
+      pending: [order('HHH', 'BUY', 4, 402)],
       history: [],
-      positions: [...BASELINE_POSITIONS, pos('VST', 4, 153.545)],
+      positions: [...BASELINE_POSITIONS, pos('HHH', 4, 100)],
       baselineSignature: baseline,
       now: NOW,
     });
@@ -132,22 +132,22 @@ describe('a staged order that already filled is retired, not placed again', () =
 describe('recoverOrphanedFills — what it must NOT do', () => {
   it('leaves a staged order alone when the broker has no matching shares', () => {
     // The overwhelmingly common case: a queue that simply has not run yet.
-    const pending = [order('VST', 'BUY', 4, 615.48), order('GLD', 'BUY', 2, 800)];
+    const pending = [order('HHH', 'BUY', 4, 402), order('KKK', 'BUY', 2, 160)];
     const out = recoverOrphanedFills({
-      pending, history: [], positions: [pos('AMZN', 8)], baselineSignature: 'AMZN:8', now: NOW,
+      pending, history: [], positions: [pos('AAA', 8)], baselineSignature: 'AAA:8', now: NOW,
     });
     expect(out.remaining).toEqual(pending);
     expect(out.recovered).toEqual([]);
   });
 
   it('does not mistake pre-ledger drift for a fill', () => {
-    // NET:50 is baseline — shares that pre-date the ledger. A staged NET buy
+    // DDD:50 is baseline — shares that pre-date the ledger. A staged DDD buy
     // must still execute. Getting this wrong silently cancels real orders.
     const out = recoverOrphanedFills({
-      pending: [order('NET', 'BUY', 4, 1141)],
+      pending: [order('DDD', 'BUY', 4, 160)],
       history: [],
-      positions: [pos('NET', 50, 188.82)],
-      baselineSignature: 'NET:50',
+      positions: [pos('DDD', 50, 40)],
+      baselineSignature: 'DDD:50',
       now: NOW,
     });
     expect(out.recovered).toEqual([]);
@@ -155,11 +155,11 @@ describe('recoverOrphanedFills — what it must NOT do', () => {
   });
 
   it('does not re-recover a fill already in the ledger', () => {
-    // XLE filled AND was recorded. Idempotency: running twice changes nothing.
+    // III filled AND was recorded. Idempotency: running twice changes nothing.
     const out = recoverOrphanedFills({
-      pending: [order('XLE', 'BUY', 21, 1368.57)],
-      history: [rec({ symbol: 'XLE', action: 'BUY', qty: 21, fillPrice: 65.145 })],
-      positions: [pos('XLE', 21, 65.19)],
+      pending: [order('III', 'BUY', 21, 1050)],
+      history: [rec({ symbol: 'III', action: 'BUY', qty: 21, fillPrice: 50 })],
+      positions: [pos('III', 21, 50.02)],
       baselineSignature: '',
       now: NOW,
     });
@@ -169,9 +169,9 @@ describe('recoverOrphanedFills — what it must NOT do', () => {
 
   it('is idempotent: feeding its own backfill back in recovers nothing more', () => {
     const input = {
-      pending: [order('VST', 'BUY', 4, 615.48)],
+      pending: [order('HHH', 'BUY', 4, 402)],
       history: [] as TradeRecord[],
-      positions: [pos('VST', 4, 153.545)],
+      positions: [pos('HHH', 4, 100)],
       baselineSignature: '',
       now: NOW,
     };
@@ -192,9 +192,9 @@ describe('recoverOrphanedFills — partial and multi-order cases', () => {
     // 2 of 4 filled. Retiring the whole order loses 2 shares of intent;
     // leaving it whole buys 4 more for 6 total. Only the remainder is right.
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48)],
+      pending: [order('HHH', 'BUY', 4, 402)],
       history: [],
-      positions: [pos('VST', 2, 153.545)],
+      positions: [pos('HHH', 2, 100)],
       baselineSignature: '',
       now: NOW,
     });
@@ -202,14 +202,14 @@ describe('recoverOrphanedFills — partial and multi-order cases', () => {
     expect(out.remaining).toHaveLength(1);
     expect(out.remaining[0].qty).toBe(2);
     // The estimate must shrink with the quantity or the cash gate misprices it.
-    expect(out.remaining[0].estimatedValue).toBeCloseTo(307.74, 2);
+    expect(out.remaining[0].estimatedValue).toBeCloseTo(201, 2);
   });
 
   it('charges a surplus to one staged order, not to every order on the symbol', () => {
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48), order('VST', 'BUY', 4, 615.48)],
+      pending: [order('HHH', 'BUY', 4, 402), order('HHH', 'BUY', 4, 402)],
       history: [],
-      positions: [pos('VST', 4, 153.545)],
+      positions: [pos('HHH', 4, 100)],
       baselineSignature: '',
       now: NOW,
     });
@@ -219,11 +219,11 @@ describe('recoverOrphanedFills — partial and multi-order cases', () => {
   });
 
   it('recovers a staged sell from a shortfall at the broker', () => {
-    // Ledger implies 10 TLT, broker shows 7 — the staged sell of 3 went through.
+    // Ledger implies 10 LLL, broker shows 7 — the staged sell of 3 went through.
     const out = recoverOrphanedFills({
-      pending: [order('TLT', 'SELL', 3, 249.88)],
-      history: [rec({ symbol: 'TLT', action: 'BUY', qty: 10, fillPrice: 81.7 })],
-      positions: [pos('TLT', 7, 81.7)],
+      pending: [order('LLL', 'SELL', 3, 120)],
+      history: [rec({ symbol: 'LLL', action: 'BUY', qty: 10, fillPrice: 81.7 })],
+      positions: [pos('LLL', 7, 81.7)],
       baselineSignature: '',
       now: NOW,
     });
@@ -235,14 +235,14 @@ describe('recoverOrphanedFills — partial and multi-order cases', () => {
 
   it('does not let a buy surplus retire a sell, or the reverse', () => {
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'SELL', 4, 615.48)],
+      pending: [order('HHH', 'SELL', 4, 402)],
       history: [],
-      positions: [pos('VST', 4, 153.545)],
+      positions: [pos('HHH', 4, 100)],
       baselineSignature: '',
       now: NOW,
     });
     expect(out.recovered).toEqual([]);
-    expect(out.unexplained).toEqual([{ symbol: 'VST', delta: 4 }]);
+    expect(out.unexplained).toEqual([{ symbol: 'HHH', delta: 4 }]);
   });
 });
 
@@ -252,36 +252,36 @@ describe('recoverOrphanedFills — drift no staged order explains', () => {
     // can safely be inferred about them, so they must be reported, not hidden.
     const out = recoverOrphanedFills({
       pending: [],
-      history: [rec({ symbol: 'LLY', action: 'BUY', qty: 1, fillPrice: 1204.425 })],
-      positions: [pos('LLY', 2, 1169.89)],
+      history: [rec({ symbol: 'JJJ', action: 'BUY', qty: 1, fillPrice: 200 })],
+      positions: [pos('JJJ', 2, 195)],
       baselineSignature: '',
       now: NOW,
     });
     expect(out.recovered).toEqual([]);
-    expect(out.unexplained).toEqual([{ symbol: 'LLY', delta: 1 }]);
+    expect(out.unexplained).toEqual([{ symbol: 'JJJ', delta: 1 }]);
   });
 
   it('folds unexplained drift into the baseline it hands back', () => {
     // Reported once, then accepted — otherwise it re-alerts every single run.
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48)],
-      history: [rec({ symbol: 'LLY', action: 'BUY', qty: 1 })],
-      positions: [pos('LLY', 2, 1169.89), pos('VST', 4, 153.545)],
+      pending: [order('HHH', 'BUY', 4, 402)],
+      history: [rec({ symbol: 'JJJ', action: 'BUY', qty: 1 })],
+      positions: [pos('JJJ', 2, 195), pos('HHH', 4, 100)],
       baselineSignature: '',
       now: NOW,
     });
     expect(out.recovered).toHaveLength(1);
-    expect(out.unexplained).toEqual([{ symbol: 'LLY', delta: 1 }]);
-    expect(out.baseline).toBe('LLY:1');
+    expect(out.unexplained).toEqual([{ symbol: 'JJJ', delta: 1 }]);
+    expect(out.baseline).toBe('JJJ:1');
   });
 
   it('does not treat an empty baseline as an absent one', () => {
     // '' is a real answer — "the ledger explains every share" — not an absence.
     const out = recoverOrphanedFills({
-      pending: [], history: [], positions: [pos('LLY', 1)], baselineSignature: '', now: NOW,
+      pending: [], history: [], positions: [pos('JJJ', 1)], baselineSignature: '', now: NOW,
     });
     expect(out.blocked).toBeNull();
-    expect(out.unexplained).toEqual([{ symbol: 'LLY', delta: 1 }]);
+    expect(out.unexplained).toEqual([{ symbol: 'JJJ', delta: 1 }]);
   });
 
   it('reports a symbol the broker no longer holds at all', () => {
@@ -289,13 +289,13 @@ describe('recoverOrphanedFills — drift no staged order explains', () => {
     // untrustworthy and blocks instead (see 'refuses to guess').
     const out = recoverOrphanedFills({
       pending: [],
-      history: [rec({ symbol: 'ARM', action: 'BUY', qty: 5 }), rec({ symbol: 'NET', action: 'BUY', qty: 7 })],
-      positions: [pos('NET', 7, 188.82)],
+      history: [rec({ symbol: 'BBB', action: 'BUY', qty: 5 }), rec({ symbol: 'DDD', action: 'BUY', qty: 7 })],
+      positions: [pos('DDD', 7, 40)],
       baselineSignature: '',
       now: NOW,
     });
     expect(out.blocked).toBeNull();
-    expect(out.unexplained).toEqual([{ symbol: 'ARM', delta: -5 }]);
+    expect(out.unexplained).toEqual([{ symbol: 'BBB', delta: -5 }]);
   });
 });
 
@@ -308,10 +308,10 @@ describe('recoverOrphanedFills — degenerate inputs', () => {
   });
 
   it('does not mutate the inputs it was given', () => {
-    const pending = [order('VST', 'BUY', 4, 615.48)];
+    const pending = [order('HHH', 'BUY', 4, 402)];
     const history: TradeRecord[] = [];
     recoverOrphanedFills({
-      pending, history, positions: [pos('VST', 4, 153.545)], baselineSignature: '', now: NOW,
+      pending, history, positions: [pos('HHH', 4, 100)], baselineSignature: '', now: NOW,
     });
     expect(pending).toHaveLength(1);
     expect(pending[0].qty).toBe(4);
@@ -321,21 +321,21 @@ describe('recoverOrphanedFills — degenerate inputs', () => {
   it('still records the fill when the broker reports no average cost', () => {
     // No price is better than no record — the ledger must not lose the shares.
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48)],
+      pending: [order('HHH', 'BUY', 4, 402)],
       history: [],
-      positions: [pos('VST', 4, undefined)],
+      positions: [pos('HHH', 4, undefined)],
       baselineSignature: '',
       now: NOW,
     });
     expect(out.recovered).toHaveLength(1);
     expect(out.recovered[0].trade.qty).toBe(4);
     expect(out.recovered[0].trade.fillPrice).toBeUndefined();
-    expect(out.recovered[0].trade.estimatedValue).toBeCloseTo(615.48, 2);
+    expect(out.recovered[0].trade.estimatedValue).toBeCloseTo(402, 2);
   });
 
   it('ignores a zeroed-out position row rather than reading it as a sale', () => {
     const out = recoverOrphanedFills({
-      pending: [], history: [], positions: [pos('VST', 0, 153.545)], baselineSignature: '', now: NOW,
+      pending: [], history: [], positions: [pos('HHH', 0, 100)], baselineSignature: '', now: NOW,
     });
     expect(out.unexplained).toEqual([]);
   });
@@ -349,9 +349,9 @@ describe('recoverOrphanedFills — refuses to guess', () => {
   // the tax ledger. There is no safe guess, so it must not guess.
   it('blocks instead of adopting when no baseline has been accepted', () => {
     const out = recoverOrphanedFills({
-      pending: [order('NET', 'BUY', 10, 2853)],
+      pending: [order('DDD', 'BUY', 10, 400)],
       history: [],
-      positions: [pos('NET', 50, 188.82)],
+      positions: [pos('DDD', 50, 40)],
       baselineSignature: undefined,
       now: NOW,
     });
@@ -365,9 +365,9 @@ describe('recoverOrphanedFills — refuses to guess', () => {
     // Storing the adopted drift would bury any real orphan inside it, and the
     // staged order it belongs to would then look unexplained and be re-placed.
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48)],
+      pending: [order('HHH', 'BUY', 4, 402)],
       history: [],
-      positions: [pos('VST', 4, 153.545)],
+      positions: [pos('HHH', 4, 100)],
       baselineSignature: undefined,
       now: NOW,
     });
@@ -381,8 +381,8 @@ describe('recoverOrphanedFills — refuses to guess', () => {
     // literally that is "everything was sold", which would retire every staged
     // SELL as already-filled and write sales that never happened.
     const out = recoverOrphanedFills({
-      pending: [order('TLT', 'SELL', 3, 249.88)],
-      history: [rec({ symbol: 'TLT', action: 'BUY', qty: 10 })],
+      pending: [order('LLL', 'SELL', 3, 120)],
+      history: [rec({ symbol: 'LLL', action: 'BUY', qty: 10 })],
       positions: [],
       baselineSignature: '',
       now: NOW,
@@ -395,7 +395,7 @@ describe('recoverOrphanedFills — refuses to guess', () => {
   it('still works on a genuinely empty account', () => {
     // No positions AND nothing in the ledger is consistent, not suspicious.
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48)],
+      pending: [order('HHH', 'BUY', 4, 402)],
       history: [], positions: [], baselineSignature: '', now: NOW,
     });
     expect(out.blocked).toBeNull();
@@ -409,23 +409,23 @@ describe('recoverOrphanedFills — cost basis must never be fabricated', () => {
     // what production actually passes. Recording it would put a $0 cost basis
     // in the tax ledger and turn the eventual sale into 100% capital gain.
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48)],
+      pending: [order('HHH', 'BUY', 4, 402)],
       history: [],
-      positions: [pos('VST', 4, 0)],
+      positions: [pos('HHH', 4, 0)],
       baselineSignature: '',
       now: NOW,
     });
     expect(out.recovered).toHaveLength(1);
     const t = out.recovered[0].trade;
     expect(t.fillPrice).toBeUndefined();
-    expect(t.estimatedValue).toBeCloseTo(615.48, 2);
+    expect(t.estimatedValue).toBeCloseTo(402, 2);
     expect(t.reason).toContain('no fill price');
   });
 
   it('treats a negative average cost as absent too', () => {
     const out = recoverOrphanedFills({
-      pending: [order('VST', 'BUY', 4, 615.48)],
-      history: [], positions: [pos('VST', 4, -1)], baselineSignature: '', now: NOW,
+      pending: [order('HHH', 'BUY', 4, 402)],
+      history: [], positions: [pos('HHH', 4, -1)], baselineSignature: '', now: NOW,
     });
     expect(out.recovered[0].trade.fillPrice).toBeUndefined();
   });
@@ -437,7 +437,7 @@ describe('formatDriftSignature — ordering must not depend on the locale', () =
     // its spelling must be stable. localeCompare collates punctuation
     // differently and is ICU-dependent: it would re-spell an unchanged drift
     // and raise a "ledger drift changed" critical about nothing.
-    const symbols = ['BRKB', 'BRK-B', 'BF.B', 'AMZN', 'ARM'];
+    const symbols = ['CCCC', 'CC-C', 'CC.C', 'AAA', 'BBB'];
     const m = new Map(symbols.map((s, i) => [s, i + 1]));
     const got = formatDriftSignature(m).split(',').map(e => e.slice(0, e.lastIndexOf(':')));
     expect(got).toEqual([...symbols].sort());
