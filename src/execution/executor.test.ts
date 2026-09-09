@@ -745,10 +745,10 @@ describe('executeQueue — avg-cost fallback for cost basis (no FIFO lot)', () =
   });
 });
 
-describe('phase reporting — the breadcrumb a killed run leaves behind', () => {
-  // On 2026-09-08 two runs were killed between placing an order and its fill
-  // confirming, and left no record of where they got to. The executor has to
-  // announce that boundary so the agent can put it on disk before the axe.
+describe('each order announces the step it is on', () => {
+  // A run killed between placing an order and confirming its fill leaves the
+  // shares at the broker and nothing in the ledger. The caller can only record
+  // that boundary if the executor announces it as it crosses it.
   it('announces placing and confirming for each order, in order', async () => {
     const { deps } = makeDeps();
     const phases: string[] = [];

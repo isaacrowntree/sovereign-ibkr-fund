@@ -28,7 +28,7 @@ const pos = (symbol: string, qty: number, avgCost?: number): BrokerPosition =>
 const NOW = new Date('2026-09-09T00:00:00.000Z');
 
 describe('parseDriftSignature / formatDriftSignature', () => {
-  it('round-trips the real baseline signature', () => {
+  it('round-trips a multi-symbol signature unchanged', () => {
     const sig = 'AMZN:4,ARM:5,BRK-B:10,NET:50,PLTR:10,TSLA:10,TWLO:20';
     expect(formatDriftSignature(parseDriftSignature(sig))).toBe(sig);
   });
@@ -65,16 +65,15 @@ describe('ledgerImpliedShares', () => {
   });
 });
 
-describe('recoverOrphanedFills — the 2026-09-08 VST incident', () => {
-  // The directed-deposit queue was XLE, NET, VST. The run was killed after VST
-  // filled at IBKR but before the fill was recorded or the queue shrunk, so
-  // pendingOrders still held the VST buy and the next window would have bought
-  // it a second time. getExecutions() returned [] so the fill-level reconcile
-  // could not see it — only the POSITION proves it happened.
+describe('a staged order that already filled is retired, not placed again', () => {
+  // A run that dies between a fill and its ledger write leaves the order in the
+  // queue with the shares already at the broker. Neither session-scoped source
+  // can see it — a filled order is not "working", and getExecutions() forgets
+  // across a session bounce — so the position is the only proof it happened.
   const baseline = 'AMZN:4,ARM:5,BRK-B:10,NET:50,PLTR:10,TSLA:10,TWLO:20';
-  // The book the baseline describes: shares that pre-date the ledger, so with
-  // an empty ledger these positions ARE the baseline. VST sits on top of it —
-  // recovery has to find one orphan inside a book full of accepted drift.
+  // The book that baseline describes. With an empty ledger these positions ARE
+  // the baseline, so recovery must find one orphan inside a book full of
+  // accepted drift rather than in isolation.
   const BASELINE_POSITIONS: BrokerPosition[] = [
     pos('AMZN', 4, 184.4), pos('ARM', 5, 88.6), pos('BRK-B', 10, 497.18),
     pos('NET', 50, 188.82), pos('PLTR', 10, 85.58), pos('TSLA', 10, 240.34),
@@ -249,8 +248,8 @@ describe('recoverOrphanedFills — partial and multi-order cases', () => {
 
 describe('recoverOrphanedFills — drift no staged order explains', () => {
   it('reports an unexplained surplus instead of swallowing it', () => {
-    // The LLY:+1 from the same incident: real shares at the broker that no
-    // pending order accounts for. Nothing can safely be inferred — say so.
+    // Real shares at the broker that no pending order accounts for. Nothing
+    // can safely be inferred about them, so they must be reported, not hidden.
     const out = recoverOrphanedFills({
       pending: [],
       history: [rec({ symbol: 'LLY', action: 'BUY', qty: 1, fillPrice: 1204.425 })],
@@ -434,9 +433,10 @@ describe('recoverOrphanedFills — cost basis must never be fabricated', () => {
 
 describe('formatDriftSignature — ordering must not depend on the locale', () => {
   it('orders by code unit, matching the signature already stored on disk', () => {
-    // The reconciler used to sort with a plain Array.sort(). localeCompare
-    // collates punctuation differently, so switching would re-spell an
-    // unchanged drift and fire a spurious "ledger drift changed" critical.
+    // The signature is compared as a string against one already on disk, so
+    // its spelling must be stable. localeCompare collates punctuation
+    // differently and is ICU-dependent: it would re-spell an unchanged drift
+    // and raise a "ledger drift changed" critical about nothing.
     const symbols = ['BRKB', 'BRK-B', 'BF.B', 'AMZN', 'ARM'];
     const m = new Map(symbols.map((s, i) => [s, i + 1]));
     const got = formatDriftSignature(m).split(',').map(e => e.slice(0, e.lastIndexOf(':')));

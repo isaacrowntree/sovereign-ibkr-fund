@@ -46,10 +46,10 @@ describe('describeAbandonedRun — the post-mortem the next run reports', () => 
     expect(describeAbandonedRun(fresh, new Date(T0.getTime() + 120_000), alive)).toBeNull();
   });
 
-  it('names the phase the run died in, which is the whole point', () => {
-    // 2026-09-08: the run placed VST at 18:56:18 and was killed while waiting
-    // for the fill to confirm. Nothing in-process survives a SIGKILL, so the
-    // last phase written to disk is the only evidence of where it got to.
+  it('names the phase the run was in when it stopped', () => {
+    // Nothing in-process survives a SIGKILL — no handler, no finally, no exit
+    // hook — so the last phase written to disk is the only evidence of where
+    // the run got to. Naming it is the entire purpose of the record.
     const dying = enterPhase(run(), 'confirming:VST', new Date('2026-09-08T18:56:18.000Z'), 190 * MB);
     const out = describeAbandonedRun(dying, later, dead);
     expect(out).not.toBeNull();

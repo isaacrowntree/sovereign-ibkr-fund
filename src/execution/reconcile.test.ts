@@ -139,12 +139,11 @@ describe('reconcileExecutions: partial fills (per-order ledger vs per-execution 
   });
 });
 
-describe('fills recorded with no broker identifiers (statement / position backfills)', () => {
-  // orphan-recovery and a statement repair both write fills we KNOW happened
-  // but for which IBKR published neither an order id nor an execution id — the
-  // daily trade report carries neither. Such a record matches an execution by
-  // neither route, so without this the same fill is backfilled a second time
-  // the moment /iserver/account/trades starts serving that day.
+describe('a fill recorded with no broker identifiers', () => {
+  // Fills reconciled from positions, or repaired from a daily trade report,
+  // are known to have happened but carry neither an order id nor an execution
+  // id — the statement publishes neither. Matched by neither route above, they
+  // would be backfilled again the moment IBKR starts serving that day.
   const noIds = (over: Partial<TradeRecord>): TradeRecord =>
     rec({ orderId: 0, execId: undefined, ...over });
 
