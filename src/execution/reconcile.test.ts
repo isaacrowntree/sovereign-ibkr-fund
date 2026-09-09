@@ -138,3 +138,67 @@ describe('reconcileExecutions: partial fills (per-order ledger vs per-execution 
     expect(out.map(t => t.execId)).toEqual(['o1']);
   });
 });
+
+describe('fills recorded with no broker identifiers (statement / position backfills)', () => {
+  // orphan-recovery and a statement repair both write fills we KNOW happened
+  // but for which IBKR published neither an order id nor an execution id — the
+  // daily trade report carries neither. Such a record matches an execution by
+  // neither route, so without this the same fill is backfilled a second time
+  // the moment /iserver/account/trades starts serving that day.
+  const noIds = (over: Partial<TradeRecord>): TradeRecord =>
+    rec({ orderId: 0, execId: undefined, ...over });
+
+  it('credits an execution against a same-day record that has no ids', () => {
+    const history = [noIds({ symbol: 'VST', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
+    const out = reconcileExecutions(history, [
+      exec('REAL-1', 'VST', 'BUY', 4, 153.295, 999, '2026-09-08T18:56:18Z'),
+    ]);
+    expect(out).toEqual([]);
+  });
+
+  it('covers partial executions from one pooled record, like the order-level credit', () => {
+    const history = [noIds({ symbol: 'VST', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
+    const out = reconcileExecutions(history, [
+      exec('R1', 'VST', 'BUY', 2, 153.29, 999, '2026-09-08T18:56:18Z'),
+      exec('R2', 'VST', 'BUY', 2, 153.30, 999, '2026-09-08T18:56:19Z'),
+    ]);
+    expect(out).toEqual([]);
+  });
+
+  it('still backfills a genuinely extra fill beyond what the record covers', () => {
+    const history = [noIds({ symbol: 'VST', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
+    const out = reconcileExecutions(history, [
+      exec('R1', 'VST', 'BUY', 4, 153.295, 999, '2026-09-08T18:56:18Z'),
+      exec('R2', 'VST', 'BUY', 1, 153.400, 998, '2026-09-08T19:10:00Z'),
+    ]);
+    expect(out.map(t => t.execId)).toEqual(['R2']);
+    expect(out[0].qty).toBe(1);
+  });
+
+  it('does not let one day cover a different day', () => {
+    const history = [noIds({ symbol: 'VST', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
+    const out = reconcileExecutions(history, [
+      exec('R1', 'VST', 'BUY', 4, 153.295, 999, '2026-09-09T18:56:18Z'),
+    ]);
+    expect(out).toHaveLength(1);
+  });
+
+  it('does not let a BUY record cover a SELL execution, or another symbol', () => {
+    const history = [noIds({ symbol: 'VST', action: 'BUY', qty: 4, timestamp: '2026-09-08T18:56:18Z' })];
+    expect(reconcileExecutions(history, [exec('R1', 'VST', 'SELL', 4, 153, 9, '2026-09-08T18:56:18Z')])).toHaveLength(1);
+    expect(reconcileExecutions(history, [exec('R2', 'LLY', 'BUY', 4, 153, 9, '2026-09-08T18:56:18Z')])).toHaveLength(1);
+  });
+
+  it('leaves the existing orderId route untouched when ids ARE present', () => {
+    // A record with a real orderId must keep matching by order, not by day —
+    // otherwise two orders for one symbol on one day would cover each other.
+    const history = [
+      rec({ orderId: 111, action: 'BUY', symbol: 'NET', qty: 4, execId: undefined, timestamp: '2026-09-08T18:53:18Z' }),
+    ];
+    const out = reconcileExecutions(history, [
+      exec('E1', 'NET', 'BUY', 4, 285.32, 111, '2026-09-08T18:53:18Z'),
+      exec('E2', 'NET', 'BUY', 3, 285.40, 222, '2026-09-08T19:00:00Z'),
+    ]);
+    expect(out.map(t => t.execId)).toEqual(['E2']);
+  });
+});
