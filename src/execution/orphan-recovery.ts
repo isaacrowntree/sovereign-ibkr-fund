@@ -1,44 +1,37 @@
 /**
  * Recover staged orders that already filled — self-healing for an orphaned queue.
  *
- * ## The failure this exists for (2026-09-08)
+ * ## The gap this closes
  *
- * The directed-deposit queue was XLE, NET, VST. XLE and NET filled and were
- * recorded. Then the run was killed — `executionRunLock` was left holding a
- * dead pid, so it never reached the `finally` that releases it. VST had already
- * filled at IBKR, but the fill was never written to the ledger and the order was
- * never removed from `pendingOrders`. The next execution window would have
- * bought it a second time.
+ * A run killed between a fill and its ledger write leaves the order in
+ * `pendingOrders` with the shares already at the broker. Placed again next
+ * window, it buys twice. Neither existing guard can see it, because both read
+ * session-scoped sources:
  *
- * Nothing in place caught it:
+ * - the executor's idempotency guard asks `getLiveOrders()` for orders still
+ *   WORKING at IBKR, and a filled order is not working;
+ * - `reconcileExecutions()` backfills from `getExecutions()`
+ *   (`/iserver/account/trades`), which IBKR scopes to the session and which
+ *   returns nothing for a fill that predates a reconnect.
  *
- * - The executor's idempotency guard asks `getLiveOrders()` for orders still
- *   WORKING at IBKR. A filled order is not working, so it is invisible there.
- * - `reconcileExecutions()` backfills the ledger from `getExecutions()`, which
- *   is `/iserver/account/trades` — and that came back `[]`, because IBKR scopes
- *   it to the session and the session had been re-established since the fill.
- *
- * Both sources are session-scoped and both had forgotten. The POSITION had not:
- * IBKR reported 4 shares of VST that our ledger could not account for. Positions
- * are the one broker fact that survives a session bounce, so that is what this
- * reconciles against.
+ * Positions are the one broker fact that survives a session bounce, so that is
+ * what this reconciles the queue against.
  *
  * ## Why a baseline is required
  *
- * "Broker shares minus ledger-implied shares" is NOT zero in the steady state —
- * the account pre-dates the ledger, so there is a permanent difference
- * (AMZN:4, ARM:5, BRK-B:10, NET:50, …). Treating that as unrecorded fills would
- * retire every staged order on the first run and silently cancel real trades.
- * So the caller passes the accepted baseline and only drift BEYOND it is treated
- * as a fill we missed. With no baseline at all there is no safe reading, and
- * this refuses to run rather than pick one — see `blocked`.
+ * "Broker shares minus ledger-implied shares" is NOT zero in the steady state:
+ * an account that pre-dates the ledger carries a permanent difference. Reading
+ * that as unrecorded fills would retire every staged order and silently cancel
+ * real trades, so the caller passes the drift already accepted and only what
+ * exceeds it counts as a fill we missed. With no baseline there is no safe
+ * reading at all, and this refuses to run rather than pick one — see `blocked`.
  *
  * ## The direction the uncertainty falls
  *
- * A staged order is retired only when the shares are demonstrably already there.
- * Where this is wrong, it is wrong by skipping a buy the strategist will
- * regenerate at the next rebalance — not by buying twice. Unrecoverable money
- * errors are duplicates; a missed order is a delay. The bias is deliberate.
+ * An order is retired only when the shares are demonstrably already there.
+ * Where that inference is wrong it errs by skipping a buy the strategist
+ * regenerates at the next rebalance, never by buying twice: a duplicate cannot
+ * be undone, a delay can. The bias is deliberate.
  *
  * Pure: no I/O, no clock, no mutation of its inputs. The caller appends
  * `recovered[].trade`, persists `remaining` as the new queue, alerts on

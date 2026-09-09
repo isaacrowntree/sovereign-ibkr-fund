@@ -156,10 +156,10 @@ async function run(): Promise<void> {
     //     look explained and get placed a second time.
     //
     // Only a genuine first run seeds the baseline here. Once a signature
-    // exists, the difference may already contain an unrecorded fill (it did on
-    // 2026-09-08), and adopting that would hide exactly what recovery hunts
-    // for. From then on the baseline is execution-bot's to advance, because
-    // only it knows which part of the drift the queue accounts for.
+    // exists the difference may already contain an unrecorded fill, and
+    // adopting that would hide exactly what recovery hunts for. From then on
+    // the baseline is execution-bot's to advance, because only it knows which
+    // part of the drift the queue accounts for.
     const updates: Record<string, unknown> = {
       ledgerDriftSignature: signature,
       lastReconcileAt: new Date().toISOString(),

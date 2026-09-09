@@ -373,11 +373,11 @@ async function run(): Promise<void> {
     }
 
     // Self-heal an orphaned queue. reconcileExecutions above works at the FILL
-    // level and is session-scoped — on 2026-09-08 it returned [] for a VST buy
-    // that had genuinely filled, because the session had been re-established
-    // since. Positions survive that, so cross-check the queue against them:
-    // any staged order whose shares are already at the broker beyond the
-    // accepted baseline has run, and must be retired rather than placed again.
+    // level and is session-scoped: it returns nothing for a fill that predates
+    // a reconnect, however real that fill was. Positions survive a session
+    // bounce, so cross-check the queue against them — a staged order whose
+    // shares are already at the broker, beyond the accepted baseline, has
+    // already run and must be retired rather than placed again.
     //
     // FAIL CLOSED, like the getLiveOrders guard inside the executor: a queue we
     // cannot verify against positions is a queue that might double-spend. Skip
@@ -593,8 +593,8 @@ async function run(): Promise<void> {
       isWindowOpen: isExecutionWindow,
       log: (msg) => log(msg, AGENT),
       logError: (msg, err) => logError(msg, err, AGENT),
-      // Both 2026-09-08 deaths happened between placing an order and its fill
-      // confirming, so that boundary is exactly what has to reach disk.
+      // The window between placing an order and confirming its fill is where
+      // a kill costs most, so that boundary is what has to reach disk.
       onPhase: (name) => phase(name),
     };
 

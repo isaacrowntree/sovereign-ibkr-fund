@@ -1,37 +1,27 @@
 /**
  * Flight recorder for execution runs — so a killed run leaves evidence.
  *
- * ## Why this exists (2026-09-08)
+ * ## The problem
  *
- * Two execution runs died the same way, four hours apart. Each placed an order,
- * waited ~3 minutes for the fill to confirm, recorded it, placed the NEXT order
- * one second later, and then vanished — before recording that one. Both left
- * `executionRunLock` holding a pid that no longer existed, which means the
- * process never reached the `finally` that releases it: it was killed, not
- * thrown out of.
- *
- *     14:47:47  BUY 21 XLE   → recorded 14:50:47
- *     14:50:49  BUY  1 LLY   → never recorded, process gone
- *     18:53:18  BUY  4 NET   → recorded 18:56:17
- *     18:56:18  BUY  4 VST   → never recorded, process gone
- *
- * Nothing said why. The host showed no OOM kill, the container had not
- * restarted, and the supervisor's own logs carry no entry for the agent at all.
- * The evidence did not exist to be read.
+ * A run that is killed rather than thrown out of never reaches the `finally`
+ * that releases its lock, and says nothing about where it got to. If it died
+ * mid-order the shares are at the broker with nothing in the ledger, and the
+ * cause is unavailable afterwards: a kill leaves no entry in the host log, the
+ * container's, or the supervisor's.
  *
  * ## What survives a kill
  *
- * Nothing in-process does. `SIGKILL` runs no handler, no `finally`, no exit
- * hook — so anything we want to know afterwards has to already be on disk when
- * the axe falls. That is the whole design: the run writes a breadcrumb as it
- * enters each phase, and the NEXT run finds the abandoned breadcrumb and
- * reports the post-mortem. The dead run cannot tell us anything; its successor
- * can.
+ * Nothing in-process. `SIGKILL` runs no handler, no `finally`, no exit hook,
+ * so anything worth knowing afterwards has to already be on disk before the
+ * process stops. Hence the design: a run writes a breadcrumb as it enters
+ * each phase, and the NEXT run finds the abandoned breadcrumb and reports the
+ * post-mortem.
+ * The dead run cannot report itself; its successor can.
  *
- * The one thing that CAN be caught is a polite shutdown — `SIGTERM`/`SIGINT`
- * mean a supervisor asked first, which points at a timeout or a deploy. So the
- * absence of a recorded signal is itself the finding: it narrows the cause to
- * `SIGKILL`, a segfault, or the machine stopping.
+ * A polite shutdown CAN be caught — `SIGTERM`/`SIGINT` mean a supervisor asked
+ * first, which points at a timeout or a deploy. So the absence of a recorded
+ * signal is itself the finding, narrowing the cause to `SIGKILL`, a crash, or
+ * the machine stopping.
  *
  * Pure: no I/O, no clock, no mutation. The caller persists the record and does
  * the alerting.
@@ -132,7 +122,7 @@ export function describeAbandonedRun(
     detail:
       `A run (pid ${pid}) started ${rec.at} never released its lock. Last phase: "${phase}", ` +
       `entered ${rec.phaseAt} and still in it after ${humanMs(phaseMs)}. Memory at that point: ` +
-      `${rec.rssMb}MB. ${cause} Any order in flight at that moment filled without being recorded — ` +
-      'orphan recovery reconciles it against broker positions, but the cause is still unfixed.',
+      `${rec.rssMb}MB. ${cause} Any order in flight at that moment may have filled without being ` +
+      'recorded; orphan recovery reconciles that against broker positions on the next run.',
   };
 }
