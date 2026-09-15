@@ -83,6 +83,8 @@ const DEBUG_DIR = process.env.ASSISTED_DEBUG_DIR ?? '/tmp/bezant-assisted-shots'
 // successful approval into a timeout.
 const TOTAL_BUDGET_MS = Number(process.env.ASSISTED_BUDGET_MS ?? 20 * 60 * 1000);
 const POLL_MS = 3_000;
+/** How long a push screen may sit with no session before the reload probe. */
+const PUSH_PROBE_MS = Number(process.env.ASSISTED_PUSH_PROBE_MS ?? 45_000);
 // Pixel coordinates of the challenge form in the default 1280x720 viewport,
 // measured off the run's own screenshots. Used only when the DOM cannot be
 // reached at all — see the fallback in run().
@@ -538,6 +540,17 @@ async function run(browser: Browser): Promise<boolean> {
   // A code the operator has written while the response box is not on screen.
   // Logged once; retried every poll until the form surfaces.
   let heldCode: string | null = null;
+  // The push-wait probe. 2026-09-15: four pushes approved on the phone — the
+  // app said "login approved" each time — and the gateway never authenticated,
+  // while IBKR's page sat on "tap the notification" until it lapsed. On every
+  // earlier success the tap flipped /health within 30s. So once per push
+  // screen, after PUSH_PROBE_MS without a session, the page is reloaded: if
+  // IBKR holds the approval server-side and only this page has stopped
+  // advancing, that finishes the login; if not, what IBKR shows instead is
+  // logged, and that is the diagnosis. Never twice for one push, and never
+  // before an operator has had time to tap.
+  let pushSeenAt: number | null = null;
+  let probedThisPush = false;
   let shot = 0;
 
   while (Date.now() - started < TOTAL_BUDGET_MS) {
@@ -629,6 +642,25 @@ async function run(browser: Browser): Promise<boolean> {
     const rotated = challenge !== null && challengeAtSubmit !== null
       && challenge !== challengeAtSubmit;
     const awaitingPush = PUSH_WAIT_RE.test(text);
+    if (!awaitingPush) {
+      pushSeenAt = null;
+      probedThisPush = false;
+    } else if (pushSeenAt === null) {
+      pushSeenAt = Date.now();
+    } else if (!probedThisPush && Date.now() - pushSeenAt > PUSH_PROBE_MS) {
+      probedThisPush = true;
+      log(`${Math.round((Date.now() - pushSeenAt) / 1000)}s on the push screen with no session — reloading the login page once to see whether IBKR holds an approval this page has not picked up`);
+      await page.screenshot({ path: `${DEBUG_DIR}/pre-probe.png` }).catch(() => {});
+      await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 }).catch((e) => {
+        log(`probe: reload failed — ${String((e as Error).message ?? e).split('\n')[0]}`);
+      });
+      await page.waitForTimeout(3_000);
+      const after = await deepText(page);
+      await page.screenshot({ path: `${DEBUG_DIR}/post-probe.png` }).catch(() => {});
+      log(`probe: now at ${page.url()} — on screen: "${after.visible.replace(/\s+/g, ' ').slice(0, 160)}"`);
+      // Whatever came back is handled by the next poll like any other screen.
+      continue;
+    }
     // Say it out loud. This transition is the difference between an operator
     // tapping a notification and an operator typing a code, and leaving it
     // implicit is what made the stuck-in-pushwait bug so hard to see from the
