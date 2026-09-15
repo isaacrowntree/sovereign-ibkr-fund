@@ -85,7 +85,8 @@ async function freePort() {
 }
 
 async function scenario({ mode = 'challenge', crossOrigin = false, respondWith = null,
-                          pushInShell = false, approveAfterMs = null, name }) {
+                          pushInShell = false, approveAfterMs = null, rotateAfterMs = null,
+                          budgetMs = 45_000, name }) {
   SKIPPING = Boolean(ONLY) && !name.includes(ONLY);
   if (SKIPPING) {
     console.log(`\n${name}\n  skip (ONLY=${ONLY})`);
@@ -113,6 +114,7 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
     ...(crossOrigin ? ['--cross-origin'] : []),
     ...(pushInShell ? ['--push-in-shell'] : []),
     ...(approveAfterMs !== null ? ['--approve-after-ms', String(approveAfterMs)] : []),
+    ...(rotateAfterMs !== null ? ['--rotate-after-ms', String(rotateAfterMs)] : []),
   ], { stdio: ['ignore', 'pipe', 'pipe'] });
   await until(async () => {
     try {
@@ -133,7 +135,7 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
       BEZANT_RELOGIN_STATE_DIR: stateDir,
       ASSISTED_IO_DIR: ioDir,
       ASSISTED_DEBUG_DIR: path.join(work, 'shots'),
-      ASSISTED_BUDGET_MS: '45000',
+      ASSISTED_BUDGET_MS: String(budgetMs),
       ASSISTED_WEB_URL: 'http://pi.lan/ibkr',
       // Use whatever chromium build this machine already has: the pinned
       // download is a 150MB detour that tells us nothing about the script.
@@ -170,7 +172,7 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
 
   const exit = await new Promise((resolve) => {
     child.on('exit', (code) => resolve(code));
-    setTimeout(() => { child.kill('SIGKILL'); resolve('killed'); }, 70_000);
+    setTimeout(() => { child.kill('SIGKILL'); resolve('killed'); }, budgetMs + 25_000);
   });
 
   const serverState = await fetch(`http://localhost:${port}/_test/state`).then((r) => r.json());
@@ -180,6 +182,10 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
   const sentinel = await fs.access(path.join(stateDir, 'disabled')).then(() => 'present', () => 'gone');
   server.kill('SIGKILL');
   console.log(`\n${name}`);
+  // VERBOSE=1 prints the script's own log for each scenario. Without it a
+  // failing assertion says only "expected X, got Y", and the reason is in a
+  // temp dir the harness has already stopped naming.
+  if (process.env.VERBOSE) console.log(out.split('\n').map((l) => `     | ${l}`).join('\n'));
   return { out, exit, serverState, stateJson, sentinel, status };
 }
 
@@ -367,6 +373,73 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
   // transition is what matters and it happens mid-run.
   wantIncludes('  ...and stops asking for a tap once IBKR has moved on',
                r.out, 'push wait is over, asking for a new code');
+}
+
+// ── 11. what is in the DOM is not what is on screen ─────────────────────────
+// 2026-09-14, from the run's own screenshots. IBKR's push screen carries the
+// NEXT challenge form in the DOM, hidden, digits and error copy included. Read
+// with textContent, the script saw a rotated challenge and an "Authentication
+// failed" that nobody was looking at, told the operator their correct code was
+// rejected, and showed them digits IBKR was not asking for. Twice. The push
+// that the code had earned went untapped and the login timed out.
+//
+// The rule these three pin down: the page is what the screenshot shows.
+{
+  // (a) push tapped while the hidden form is present: nothing to announce.
+  const r = await scenario({
+    name: 'a hidden challenge form is not a challenge',
+    crossOrigin: true,
+    mode: 'push-hidden-form',
+    // The tap lands before the push lapses, so the form never surfaces.
+    approveAfterMs: 3_000,
+    rotateAfterMs: 60_000,
+  });
+  // The first push in this mode is never tapped; this scenario is the one where
+  // the operator's code is never needed because the form never surfaces —
+  // there is no code, so the run must simply end quietly. What must NOT
+  // happen is an announcement of digits that were never on screen.
+  wantNotIncludes('announces no challenge while the push screen is up', r.out, 'CHALLENGE CODE');
+  want('  ...and publishes none for the page', r.status?.challenge ?? null, null);
+  want('  ...sending nothing to IBKR', r.serverState.submissions.length, 0);
+}
+{
+  // (b) the exact sequence from the 14th: push lapses, form appears, correct
+  // code, push screen again with the rotated form hidden behind it, tap.
+  const r = await scenario({
+    name: 'a correct code, with the rotated form hidden behind the push screen',
+    crossOrigin: true,
+    mode: 'push-hidden-form',
+    respondWith: '99887766',
+    rotateAfterMs: 6_000,
+    approveAfterMs: 12_000,
+  });
+  wantIncludes('announces the challenge once it is on screen', r.out, 'CHALLENGE CODE: 111 222');
+  want('submits the code once', r.serverState.submissions.length, 1);
+  wantIncludes('recognises the code was ACCEPTED', r.out, 'Response accepted');
+  wantNotIncludes('  ...never calls it a rejection', r.out, 'IBKR rejected the submitted code');
+  wantNotIncludes('  ...and never announces the digits hidden behind the push', r.out, 'CHALLENGE CODE: 641 654');
+  want('  ...the tap completes the login', r.serverState.authenticated, true);
+  want('  ...exit code 0', r.exit, 0);
+}
+{
+  // (c) a code that arrives while the box is off screen is held, not lost and
+  // not typed into nothing. The harness writes the code after 25s if no
+  // challenge was announced; the form surfaces at 30s.
+  const r = await scenario({
+    name: 'a code written while the push screen is up waits for the box',
+    crossOrigin: true,
+    mode: 'push-hidden-form',
+    respondWith: '99887766',
+    rotateAfterMs: 30_000,
+    approveAfterMs: 4_000,
+    budgetMs: 80_000,
+  });
+  wantIncludes('says the box is not on screen yet', r.out, 'holding it until the form is on screen');
+  want('submits the code exactly once, after the form surfaces', r.serverState.submissions.length, 1);
+  want('  ...with the right code', r.serverState.submissions[0], '99887766');
+  wantNotIncludes('  ...never a rejection', r.out, 'IBKR rejected the submitted code');
+  want('  ...and the login completes', r.serverState.authenticated, true);
+  want('  ...exit code 0', r.exit, 0);
 }
 
 console.log(`\n${PASS} passed, ${FAIL} failed`);

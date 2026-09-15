@@ -47,6 +47,7 @@ const flag = (name) => args.includes(`--${name}`);
 const PORT = Number(opt('port', 8099));
 const FRAME_PORT = PORT + 1;
 // challenge | push-only | wrong-code | push-wins | push-after-code
+// | push-then-rotate | push-hidden-form
 const MODE = opt('mode', 'challenge');
 const CROSS_ORIGIN = flag('cross-origin');
 /**
@@ -79,6 +80,23 @@ const CHALLENGE_2 = '641 654';
 // How long the push screen holds before rotating, in push-then-rotate mode.
 const ROTATE_AFTER_MS = Number(opt('rotate-after-ms', 6000));
 
+/**
+ * push-hidden-form — the shape observed on 2026-09-14, from the screenshots.
+ *
+ * While IBKR shows "Open the IBKR notification on your phone", the challenge
+ * form is ALREADY in the DOM, hidden, and it already holds the digits IBKR will
+ * ask for if the push goes untapped — along with the "Authentication failed"
+ * copy it would show under a wrong code. A detector reading textContent sees
+ * a challenge that is not on screen and an error that was never shown, and
+ * publishes both. That is how a correct code was reported as rejected, three
+ * times, while the push it had earned sat untapped on the phone.
+ *
+ * Timeline in this mode: the first push is never tapped and the form surfaces
+ * after ROTATE_AFTER_MS. A correct code is answered with the push screen again
+ * (hiding CHALLENGE_2), and THAT push is tapped APPROVE_AFTER_MS later.
+ */
+const HIDDEN_FORM = MODE === 'push-hidden-form';
+
 const state = {
   credentialsSeen: false,
   deviceSelected: false,
@@ -87,6 +105,7 @@ const state = {
   submissions: [],      // every response code the page received, in order
   codeAcceptedAt: null, // push-after-code: when a correct code was accepted
   rotateAt: null,       // push-then-rotate: when the challenge rotates
+  formVisible: false,   // push-hidden-form: the push has lapsed, the form is up
   authenticated: false,
 };
 
@@ -133,6 +152,27 @@ const pushPage = `<!doctype html><html><body style="font-family:sans-serif;text-
 </body></html>`;
 
 /**
+ * The push screen with the NEXT challenge form present but not rendered.
+ * The form is in the iframe like the visible one; the iframe document hides
+ * it behind display:none, which is where a textContent walk still finds it.
+ */
+const pushWithHiddenForm = (frameOrigin) => `<!doctype html><html><body style="margin:0;font-family:sans-serif">
+  <div style="text-align:center;padding-top:120px">
+    <h3>Open the IBKR notification on your phone</h3>
+    <p>IBKR sent you a notification to your phone. Tap the notification to complete two-factor authentication.</p>
+    <p>Didn't receive the notification?</p>
+  </div>
+  <iframe src="${frameOrigin}/challenge-frame?hidden=1" style="border:0;width:1280px;height:300px"></iframe>
+  <script>
+    setInterval(async () => {
+      const r = await fetch('/_test/approved').then((x) => x.json()).catch(() => ({ approved: false }));
+      const s = await fetch('/_test/state').then((x) => x.json()).catch(() => null);
+      if (r.approved || (s && s.formVisible)) location.href = '/';
+    }, 500);
+  </script>
+</body></html>`;
+
+/**
  * The page the automation actually has to beat: an EMPTY top-level document
  * whose only content is an iframe. Nothing here is readable from the main
  * frame's DOM, exactly as observed in production.
@@ -143,8 +183,8 @@ const challengeShell = (frameOrigin) => `<!doctype html><html><body style="margi
 </body></html>`;
 
 /** Geometry matches the real form in a 1280x720 viewport. */
-const challengeFrame = (error, challenge = CHALLENGE) => `<!doctype html><html><body style="margin:0;font-family:sans-serif;text-align:center">
-  <div style="padding-top:140px">
+const challengeFrame = (error, challenge = CHALLENGE, hidden = false) => `<!doctype html><html><body style="margin:0;font-family:sans-serif;text-align:center">
+  <div style="padding-top:140px${hidden ? ';display:none' : ''}">
     <p>Enter the challenge code below into the IBKR Mobile app to generate a response code.</p>
     <p>Challenge: ${challenge}</p>
     <form method="POST" action="/challenge-frame" style="margin:0">
@@ -161,10 +201,14 @@ function route(req, res, isFramePort) {
   const url = new URL(req.url, `http://localhost:${isFramePort ? FRAME_PORT : PORT}`);
   const frameOrigin = CROSS_ORIGIN ? `http://127.0.0.1:${FRAME_PORT}` : '';
 
+  // Ticks on EVERY request, the push page's own state poll included — that
+  // poll is what navigates it to the surfaced form.
+  if (HIDDEN_FORM && state.rotateAt !== null && Date.now() >= state.rotateAt) state.formVisible = true;
+
   if (url.pathname === '/health') {
     // push-after-code: the tap that follows an accepted code is what finally
     // authenticates the session.
-    if (MODE === 'push-after-code' && state.codeAcceptedAt !== null && approved()) {
+    if ((MODE === 'push-after-code' || HIDDEN_FORM) && state.codeAcceptedAt !== null && approved()) {
       state.authenticated = true;
     }
     // push-wins: the tap authenticates the SESSION, not the page. The real
@@ -199,6 +243,11 @@ function route(req, res, isFramePort) {
   }
   if (url.pathname === '/sso/Device' && req.method === 'POST') {
     state.deviceSelected = true;
+    if (HIDDEN_FORM) {
+      // First push: never tapped. The form surfaces when it lapses.
+      state.rotateAt = Date.now() + ROTATE_AFTER_MS;
+      return send(res, 200, pushWithHiddenForm(frameOrigin));
+    }
     // The push is "approved" on the operator's phone a moment later.
     state.pushApprovedAt = Date.now() + APPROVE_AFTER_MS;
     return send(res, 200, pushPage);
@@ -233,13 +282,34 @@ function route(req, res, isFramePort) {
             state.pushApprovedAt = Date.now() + APPROVE_AFTER_MS;
             return send(res, 200, pushPage);
           }
+          if (HIDDEN_FORM) {
+            // The push screen again, CHALLENGE_2 pre-loaded and hidden. This
+            // push is the one that gets tapped.
+            state.codeAcceptedAt = Date.now();
+            state.formVisible = false;
+            state.rotateAt = null;
+            state.pushApprovedAt = Date.now() + APPROVE_AFTER_MS;
+            return send(res, 200, pushWithHiddenForm(frameOrigin));
+          }
           state.authenticated = true;
           return send(res, 200, '<html><body>Welcome</body></html>');
         }
         return send(res, 200, challengeFrame(true));
       });
     }
+    if (HIDDEN_FORM) {
+      const digits = state.codeAcceptedAt !== null ? CHALLENGE_2 : CHALLENGE;
+      // ?hidden=1 is the frame inside the push screen: same form, same digits,
+      // plus the error copy — none of it rendered.
+      return send(res, 200, challengeFrame(url.searchParams.get('hidden') === '1', digits,
+        url.searchParams.get('hidden') === '1'));
+    }
     return send(res, 200, challengeFrame(false, rotated ? CHALLENGE_2 : CHALLENGE));
+  }
+
+  if (HIDDEN_FORM && state.deviceSelected) {
+    if (state.formVisible) return send(res, 200, challengeShell(frameOrigin));
+    return send(res, 200, pushWithHiddenForm(frameOrigin));
   }
 
   // Root: whichever screen the flow is currently on.

@@ -5,8 +5,7 @@
  * IBKR offers TWO routes through 2FA, at the same time:
  *
  *   - the IB Key push, tapped on the phone; and
- *   - a challenge/response form, shown on the page within seconds of the
- *     device selection:
+ *   - a challenge/response form:
  *
  *     Enter the challenge code below into the IBKR Mobile app to generate a
  *     response code.   Challenge: 111 222   [ Enter Response Code ]  [Login]
@@ -16,6 +15,14 @@
  * The form appearing is therefore NOT evidence that the push has died, and is
  * not a reason to stop waiting — an earlier version of index.ts treated it as
  * both, and would have abandoned that login three seconds before it succeeded.
+ *
+ * The form is in the DOM from the moment the device is selected, but it is
+ * SHOWN only once the push screen lapses (about two minutes, per the
+ * screenshots of 2026-09-14) — and while the push screen is up the hidden
+ * form already carries the digits IBKR will ask for next. This script reports
+ * what is on screen, never what is merely in the DOM: a challenge the operator
+ * cannot see is not a challenge, and a code typed into the hidden form is not
+ * a submission IBKR honours. See `deepText`.
  *
  * What an unattended run cannot do is ANSWER the form; that needs a person with
  * IBKR Mobile. When nobody taps in time the run ends with the form on screen
@@ -217,7 +224,7 @@ const SSO_FAULT_THRESHOLD = 3;
  * walk of `document` alone returns 0 characters and the detector concludes
  * there is nothing on screen while the screenshot shows the form plainly.
  */
-async function deepText(page: Page): Promise<string> {
+async function deepText(page: Page): Promise<PageText> {
   // Retried once because a frame that is mid-navigation destroys its execution
   // context and `evaluate` throws — a transient that must not be reported as
   // "the page is empty", which is exactly how a broken read looks.
@@ -226,13 +233,16 @@ async function deepText(page: Page): Promise<string> {
       // Never swallow this silently: an unreadable frame and an empty frame look
       // identical downstream, and telling them apart is most of the debugging.
       lastReadError = `${f.url()}: ${String((e as Error).message ?? e).split('\n')[0]}`;
-      return '';
+      return { visible: '', all: '' };
     })));
-    const joined = texts.join(' ').trim();
-    if (joined) return joined;
+    const joined = {
+      visible: texts.map((t) => t.visible).join(' ').trim(),
+      all: texts.map((t) => t.all).join(' ').trim(),
+    };
+    if (joined.all) return joined;
     await sleep(250);
   }
-  return '';
+  return { visible: '', all: '' };
 }
 
 let lastReadError: string | null = null;
@@ -254,16 +264,52 @@ let lastReadError: string | null = null;
  * written here. Nothing inside these strings may rely on TypeScript.
  */
 const DEEP_TEXT_JS = `(() => {
-  var out = [];
+  var vis = [];
+  var all = [];
+  var visible = function (el) {
+    if (!el) return true;
+    if (el.checkVisibility) {
+      try {
+        return el.checkVisibility({ opacityProperty: true, visibilityProperty: true,
+                                    checkOpacity: true, checkVisibilityCSS: true });
+      } catch (e) { /* fall through */ }
+    }
+    return el.getClientRects().length > 0;
+  };
   var walk = function (root) {
-    out.push(root.textContent || '');
+    var it = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    var n;
+    while ((n = it.nextNode())) {
+      var t = n.textContent || '';
+      if (!t.trim()) continue;
+      all.push(t);
+      if (visible(n.parentElement)) vis.push(t);
+    }
     root.querySelectorAll('*').forEach(function (el) {
       if (el.shadowRoot) walk(el.shadowRoot);
     });
   };
   if (document.body) walk(document.body);
-  return out.join(' ');
+  return JSON.stringify({ visible: vis.join(' '), all: all.join(' ') });
 })()`;
+
+/**
+ * What the page SHOWS, and separately everything it contains.
+ *
+ * The distinction is the 2026-09-14 failure. IBKR's "tap the notification"
+ * screen carries the NEXT challenge form in the DOM, hidden — its digits and
+ * its "Authentication failed" copy included. A textContent walk read all of
+ * it, so after a correct code the script saw an error nobody was shown and a
+ * challenge IBKR was not asking, published both, and the operator generated
+ * two more codes while the push their first one had earned went untapped.
+ * Every decision below is made on `visible`; `all` exists so the log can say
+ * when the two disagree, which is the one diagnostic that would have named
+ * this bug from the journal alone.
+ */
+interface PageText {
+  visible: string;
+  all: string;
+}
 
 /**
  * `strict` picks ONLY a box that identifies itself as the response field.
@@ -289,12 +335,16 @@ const submitJs = (code: string, strict: boolean) => `(() => {
   var ident = function (i) {
     return (i.placeholder || '') + ' ' + (i.name || '') + ' ' + (i.id || '');
   };
-  var box = inputs.filter(function (i) { return /response|challenge/i.test(ident(i)); })[0];
+  // ON SCREEN, in both passes. The response box exists in the DOM behind
+  // IBKR's push screen too, and a code typed into that one is submitted into
+  // a form nobody is looking at — which IBKR answers by rotating the challenge.
+  var shown = function (i) { return i.offsetParent !== null || i.getClientRects().length > 0; };
+  var box = inputs.filter(function (i) { return shown(i) && /response|challenge/i.test(ident(i)); })[0];
   ${'' /* the loose pass is opt-in */}
   if (!box && ${strict ? 'false' : 'true'}) {
     box = inputs.filter(function (i) {
       // never the credential fields, whatever else happens
-      return i.type === 'text' && i.offsetParent !== null && !/user|login|email/i.test(ident(i));
+      return i.type === 'text' && shown(i) && !/user|login|email/i.test(ident(i));
     })[0];
   }
   if (!box) return '';
@@ -314,8 +364,9 @@ const submitJs = (code: string, strict: boolean) => `(() => {
   return (ident(box).trim() || 'unnamed input') + ' @ ' + location.host;
 })()`;
 
-async function frameText(frame: Frame): Promise<string> {
-  return frame.evaluate(DEEP_TEXT_JS) as Promise<string>;
+async function frameText(frame: Frame): Promise<PageText> {
+  const raw = await frame.evaluate(DEEP_TEXT_JS) as string;
+  return JSON.parse(raw) as PageText;
 }
 
 /**
@@ -482,6 +533,11 @@ async function run(browser: Browser): Promise<boolean> {
   // moved on and the operator needs to answer the new one.
   let challengeAtSubmit: string | null = null;
   let announcedChallenge: string | null = null;
+  let notedHidden: string | null = null;
+  let warnedBlindWalk = false;
+  // A code the operator has written while the response box is not on screen.
+  // Logged once; retried every poll until the form surfaces.
+  let heldCode: string | null = null;
   let shot = 0;
 
   while (Date.now() - started < TOTAL_BUDGET_MS) {
@@ -527,14 +583,34 @@ async function run(browser: Browser): Promise<boolean> {
       return true;
     }
 
-    const text = await deepText(page);
-    if (!announcedChallenge && text.length < 40) {
+    const page_text = await deepText(page);
+    if (!announcedChallenge && page_text.all.length < 40) {
       // One line per poll would be noise; this fires only while the page is
       // opaque to us, which is exactly when we want to know about it.
-      log(`(diag: deepText=${text.length} chars, frames=${page.frames().length}, url=${page.url()}` +
+      log(`(diag: deepText=${page_text.all.length} chars, frames=${page.frames().length}, url=${page.url()}` +
           `${lastReadError ? `, lastReadError=${lastReadError}` : ''})`);
     }
+    // Decisions are made on what is rendered. If the visibility walk comes
+    // back empty while the DOM has content, the walk is what is broken, not
+    // the page — fall back to the old whole-DOM read rather than go blind, and
+    // say so, because that is a regression worth a journal line.
+    let text = page_text.visible;
+    if (!text && page_text.all) {
+      if (!warnedBlindWalk) {
+        log(`(diag: visibility walk saw nothing on a page with ${page_text.all.length} chars — using the whole DOM)`);
+        warnedBlindWalk = true;
+      }
+      text = page_text.all;
+    }
     const challenge = text.match(CHALLENGE_RE)?.[1].trim() ?? null;
+    // The one diagnostic that would have named the 2026-09-14 bug from the
+    // journal: digits present in the DOM that are not on screen. Once per
+    // set of digits, so it reads as an event rather than a heartbeat.
+    const hiddenChallenge = page_text.all.match(CHALLENGE_RE)?.[1].trim() ?? null;
+    if (hiddenChallenge && hiddenChallenge !== challenge && hiddenChallenge !== notedHidden) {
+      log(`(diag: challenge ${hiddenChallenge} is in the DOM but not on screen — not announcing it)`);
+      notedHidden = hiddenChallenge;
+    }
 
     // The push screen is checked FIRST and short-circuits the rejection test
     // below. Both can look similar in page text, and calling a push wait a
@@ -552,18 +628,25 @@ async function run(browser: Browser): Promise<boolean> {
     // moving to different digits is the gateway telling us directly.
     const rotated = challenge !== null && challengeAtSubmit !== null
       && challenge !== challengeAtSubmit;
+    const awaitingPush = PUSH_WAIT_RE.test(text);
     // Say it out loud. This transition is the difference between an operator
     // tapping a notification and an operator typing a code, and leaving it
     // implicit is what made the stuck-in-pushwait bug so hard to see from the
     // outside — the page simply stopped changing.
-    if (rotated && ui.status === 'pushwait') {
-      log('IBKR rotated the challenge — push wait is over, asking for a new code');
+    if (ui.status === 'pushwait' && !awaitingPush && challenge) {
+      log(`IBKR ${rotated ? 'rotated the challenge' : 'has taken the push screen down'} — push wait is over, asking for a new code`);
     }
-    const awaitingPush = PUSH_WAIT_RE.test(text);
+    // Now that `text` is what is rendered, the push copy and a rotated
+    // challenge are never on screen together: the push wait lasts exactly as
+    // long as IBKR shows the push screen. The earlier `!rotated` gate read
+    // the hidden form's new digits as "IBKR has moved on" and turned every
+    // accepted code into a rejection.
     const postSubmitPush = awaitingPush
-      && (ui.status === 'submitting' || ui.status === 'pushwait')
-      && !rotated;
-    if (postSubmitPush) {
+      && (ui.status === 'submitting' || ui.status === 'pushwait');
+    // The visible-text rule cuts both ways: an error IBKR is not showing is
+    // not a rejection either.
+    const rejectedOnScreen = /authentication failed|invalid|incorrect/i.test(text);
+    if (postSubmitPush && !rejectedOnScreen) {
       if (ui.status !== 'pushwait') {
         await publishStatus({
           status: 'pushwait',
@@ -576,7 +659,7 @@ async function run(browser: Browser): Promise<boolean> {
     // IBKR rejects a code on the page, not over the API, so the page text is
     // the only place this is visible. Seeing it matters: it is what turns a
     // silent 20-minute wait into "generate another one".
-    else if (/authentication failed|invalid|incorrect/i.test(text) && ui.status === 'submitting') {
+    else if (rejectedOnScreen && ui.status === 'submitting') {
       await publishStatus({
         status: 'rejected',
         note: 'IBKR rejected that code. Generate a new one — codes are single-use.',
@@ -616,42 +699,59 @@ async function run(browser: Browser): Promise<boolean> {
       // Skip codes already sent: re-submitting a single-use code is guaranteed
       // to fail and spends one of the few wrong answers IBKR tolerates.
       if (code && CODE_RE.test(code) && !sentToIbkr.has(code)) {
-        log(`Response code received (${code.length} chars) — submitting`);
+        if (code !== heldCode) log(`Response code received (${code.length} chars) — submitting`);
         let typed = await submitResponse(page, code);
-        if (!typed) {
-          // Every DOM route has failed on this page: main-frame CSS, a
-          // frame-by-frame innerText scan, and the shadow-piercing walk above,
-          // all while page.screenshot() showed the form perfectly. Whatever
-          // renders it is not reachable from the main execution context — so
-          // stop asking the DOM and use the pixels, which are the one thing
-          // demonstrably right. The response box sits mid-form and the Login
-          // button below it in a 1280x720 viewport; a click focuses it however
-          // it is implemented.
-          log('DOM submission found no box — falling back to mouse + keyboard');
-          await page.mouse.click(RESPONSE_BOX_XY.x, RESPONSE_BOX_XY.y);
-          await page.keyboard.type(code, { delay: 40 });
-          await page.screenshot({ path: `${DEBUG_DIR}/typed.png` }).catch(() => {});
-          // EXACTLY ONE submission. The first version pressed Enter and then
-          // clicked Login, which submits a single-use response code twice: the
-          // second attempt is rejected no matter what the first did, and the
-          // page ends on "Authentication failed" over a code that may well have
-          // been right. Observed 2026-09-02 with challenge 111 222.
-          await page.mouse.click(LOGIN_BUTTON_XY.x, LOGIN_BUTTON_XY.y);
-          typed = `pixel fallback @ ${RESPONSE_BOX_XY.x},${RESPONSE_BOX_XY.y}`;
+        if (!typed && !challenge) {
+          // No box on screen and no challenge on screen: IBKR is showing the
+          // push screen. The form is in the DOM behind it, and typing into
+          // that is how a code gets "rejected" by a page nobody can see. Hold
+          // the code; the form comes back when the push lapses, and the poll
+          // after that sends it. Not counted as an attempt — nothing reached IBKR.
+          if (code !== heldCode) {
+            log('Response box is not on screen (IBKR is asking for a tap) — holding it until the form is on screen');
+            await publishStatus({
+              note: 'IBKR is asking for a tap right now, so your code is being held — it goes in the moment the form comes back. Tap the notification if it arrives.',
+            });
+            heldCode = code;
+          }
+        } else {
+          heldCode = null;
+          if (!typed) {
+            // Every DOM route has failed on this page: main-frame CSS, a
+            // frame-by-frame innerText scan, and the shadow-piercing walk above,
+            // all while page.screenshot() showed the form perfectly. Whatever
+            // renders it is not reachable from the main execution context — so
+            // stop asking the DOM and use the pixels, which are the one thing
+            // demonstrably right. The response box sits mid-form and the Login
+            // button below it in a 1280x720 viewport; a click focuses it however
+            // it is implemented. Only with a challenge on screen: on any other
+            // screen those coordinates are nothing, and the code is spent for it.
+            log('DOM submission found no box — falling back to mouse + keyboard');
+            await page.mouse.click(RESPONSE_BOX_XY.x, RESPONSE_BOX_XY.y);
+            await page.keyboard.type(code, { delay: 40 });
+            await page.screenshot({ path: `${DEBUG_DIR}/typed.png` }).catch(() => {});
+            // EXACTLY ONE submission. The first version pressed Enter and then
+            // clicked Login, which submits a single-use response code twice: the
+            // second attempt is rejected no matter what the first did, and the
+            // page ends on "Authentication failed" over a code that may well have
+            // been right. Observed 2026-09-02 with challenge 111 222.
+            await page.mouse.click(LOGIN_BUTTON_XY.x, LOGIN_BUTTON_XY.y);
+            typed = `pixel fallback @ ${RESPONSE_BOX_XY.x},${RESPONSE_BOX_XY.y}`;
+          }
+          sentToIbkr.add(code);
+          challengeAtSubmit = ui.challenge;
+          await publishStatus({
+            status: 'submitting',
+            attemptsLeft: MAX_SUBMISSIONS - sentToIbkr.size,
+            note: null,
+          });
+          await page.waitForTimeout(3_000);
+          await page.screenshot({ path: `${DEBUG_DIR}/post-response.png` }).catch(() => {});
+          // WHICH field took the code, by name — so "are you sure it went in the
+          // right box?" is answerable from the log instead of by inference. The
+          // code itself is never logged; only its length, above.
+          log(`Submitted into [${typed}]. Post-submit URL: ${page.url()}`);
         }
-        sentToIbkr.add(code);
-        challengeAtSubmit = ui.challenge;
-        await publishStatus({
-          status: 'submitting',
-          attemptsLeft: MAX_SUBMISSIONS - sentToIbkr.size,
-          note: null,
-        });
-        await page.waitForTimeout(3_000);
-        await page.screenshot({ path: `${DEBUG_DIR}/post-response.png` }).catch(() => {});
-        // WHICH field took the code, by name — so "are you sure it went in the
-        // right box?" is answerable from the log instead of by inference. The
-        // code itself is never logged; only its length, above.
-        log(`Submitted into [${typed}]. Post-submit URL: ${page.url()}`);
       }
     }
 
