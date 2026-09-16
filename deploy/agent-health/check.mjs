@@ -87,7 +87,7 @@ try {
     select a.id, a.name, a.status,
            coalesce((a.runtime_config->'heartbeat'->>'intervalSec')::int, 14400) as interval_sec,
            (a.runtime_config->'heartbeat'->>'enabled')::boolean as hb_enabled
-      from paperclip.agents a
+      from agents a
      where a.status = any(${INVOKABLE})
      order by a.name`;
 
@@ -97,13 +97,13 @@ try {
     const [last] = await sql`
       select status, error_code, started_at,
              extract(epoch from (now() - started_at)) as age_sec
-        from paperclip.heartbeat_runs
+        from heartbeat_runs
        where agent_id = ${a.id} and started_at is not null
        order by started_at desc limit 1`;
     const [recent] = await sql`
       select count(*) filter (where status = 'failed')    as failed,
              count(*) filter (where status = 'succeeded') as ok
-        from paperclip.heartbeat_runs
+        from heartbeat_runs
        where agent_id = ${a.id}
          and started_at > now() - make_interval(secs => ${a.interval_sec * FACTOR})`;
     rows.push({

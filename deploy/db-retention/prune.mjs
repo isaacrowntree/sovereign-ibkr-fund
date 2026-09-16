@@ -42,8 +42,8 @@ const sql = loadPostgres()(DB, { max: 1, idle_timeout: 5, connect_timeout: 10 })
 try {
   const [before] = await sql`
     select count(*)::int as n,
-           pg_size_pretty(pg_total_relation_size('paperclip.heartbeat_runs')) as size
-      from paperclip.heartbeat_runs
+           pg_size_pretty(pg_total_relation_size('heartbeat_runs')) as size
+      from heartbeat_runs
      where started_at < now() - make_interval(days => ${DAYS})
        and (stdout_excerpt is not null or stderr_excerpt is not null
             or context_snapshot is not null or result_json is not null or usage_json is not null)`;
@@ -57,13 +57,13 @@ try {
   for (;;) {
     const rows = await sql`
       with victims as (
-        select id from paperclip.heartbeat_runs
+        select id from heartbeat_runs
          where started_at < now() - make_interval(days => ${DAYS})
            and (stdout_excerpt is not null or stderr_excerpt is not null
                 or context_snapshot is not null or result_json is not null or usage_json is not null)
          limit 500
       )
-      update paperclip.heartbeat_runs r
+      update heartbeat_runs r
          set stdout_excerpt = null, stderr_excerpt = null,
              context_snapshot = null, result_json = null, usage_json = null
         from victims v where r.id = v.id
@@ -73,7 +73,7 @@ try {
   }
   console.log(`[retention] redacted blobs on ${total} run(s)`);
 
-  const [after] = await sql`select pg_size_pretty(pg_total_relation_size('paperclip.heartbeat_runs')) as size`;
+  const [after] = await sql`select pg_size_pretty(pg_total_relation_size('heartbeat_runs')) as size`;
   console.log(`[retention] heartbeat_runs now ${after.size} (VACUUM reclaims to disk lazily)`);
   await sql.end();
 } catch (err) {

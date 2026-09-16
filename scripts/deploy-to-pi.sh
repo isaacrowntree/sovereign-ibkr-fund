@@ -99,7 +99,7 @@ IN_FLIGHT_JS='const {createRequire}=require("node:module");const {globSync}=requ
 const r=createRequire("/app/x.js");let P;for(const p of ["postgres",...globSync("/app/node_modules/.pnpm/postgres@*/node_modules/postgres")]){try{P=r(p);break}catch{}}
 if(!P){console.log("DRIVER_MISSING");process.exit(0)}
 const sql=P(process.env.DATABASE_URL,{max:1,idle_timeout:3,connect_timeout:8});
-sql`select a.name from paperclip.heartbeat_runs h join paperclip.agents a on a.id=h.agent_id where h.status=${"running"} and h.finished_at is null`
+sql`select a.name from heartbeat_runs h join agents a on a.id=h.agent_id where h.status=${"running"} and h.finished_at is null`
  .then(rs=>{console.log(rs.map(x=>x.name).join(",")||"NONE");return sql.end()})
  .catch(e=>{console.log("QUERY_FAILED:"+e.message);return sql.end()});'
 echo "[deploy] checking for in-flight agent runs (via heartbeat_runs)"
