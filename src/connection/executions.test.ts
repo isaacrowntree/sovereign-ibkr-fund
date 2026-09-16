@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseExecutions } from './gateway.js';
+import { parseExecutions, parseTradeTime } from './gateway.js';
 
 // Real CPAPI /trades rows from 2026-07-06: the TSLA sale plus the IDEALPRO FX
 // auto-liquidation IBKR booked to settle it.
@@ -46,5 +46,40 @@ describe('parseExecutions', () => {
       { symbol: 'NET', side: 'S', size: 0, price: '240', sec_type: 'STK', execution_id: 'X' },
     ];
     expect(parseExecutions(rows as any)).toHaveLength(0);
+  });
+});
+
+describe('parseTradeTime', () => {
+  // The real VST row from 2026-09-15: IBKR's own statement shows the fill at
+  // 01:19:30 AEST = 15:19:30Z, and trade_time_r agrees to the second.
+  it('prefers trade_time_r (epoch ms) and renders ISO UTC', () => {
+    expect(parseTradeTime({ trade_time_r: 1789485571000, trade_time: '20260915-15:19:31' }))
+      .toBe('2026-09-15T15:19:31.000Z');
+  });
+
+  it('parses CPAPI\'s YYYYMMDD-HH:MM:SS as UTC when trade_time_r is absent', () => {
+    expect(parseTradeTime({ trade_time: '20260706-14:15:33' })).toBe('2026-07-06T14:15:33.000Z');
+  });
+
+  it('returns empty rather than a garbage date when neither is usable', () => {
+    expect(parseTradeTime({})).toBe('');
+    expect(parseTradeTime({ trade_time: 'yesterday', trade_time_r: 'n/a' })).toBe('');
+  });
+
+  it('gives reconcile an ISO day to key on — the raw form never matched the ledger', () => {
+    const [e] = parseExecutions([ROWS[1]] as any);
+    expect(e.time.slice(0, 10)).toBe('2026-07-06');
+  });
+});
+
+describe('parseExecutions commission', () => {
+  it('carries the commission IBKR reports, as a number', () => {
+    const [e] = parseExecutions([{ ...ROWS[1], commission: '1.0' }] as any);
+    expect(e.commission).toBe(1);
+  });
+
+  it('leaves commission undefined when the row has none, rather than inventing $0', () => {
+    const [e] = parseExecutions([ROWS[1]] as any);
+    expect(e.commission).toBeUndefined();
   });
 });

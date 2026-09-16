@@ -420,10 +420,30 @@ export interface Execution {
   action: 'BUY' | 'SELL';
   qty: number;
   price: number;
-  /** IBKR trade time (as reported). */
+  /**
+   * When the fill happened, ISO 8601 UTC. Normalised from CPAPI's `trade_time_r`
+   * (epoch ms) — the raw `trade_time` is `YYYYMMDD-HH:MM:SS`, and a ledger
+   * timestamp in that form never matches the ISO day the rest of the system
+   * keys on. Empty string when IBKR gave neither.
+   */
   time: string;
+  /** Commission IBKR charged on this execution, when reported. */
+  commission?: number;
   /** Originating order id, when present. */
   orderId?: number;
+}
+
+/**
+ * CPAPI reports trade time two ways: `trade_time_r` as epoch milliseconds and
+ * `trade_time` as `YYYYMMDD-HH:MM:SS` in UTC. Prefer the unambiguous one; parse
+ * the other as UTC when it is all we have. Exported for tests.
+ */
+export function parseTradeTime(row: { trade_time_r?: unknown; trade_time?: unknown }): string {
+  const ms = Number(row.trade_time_r);
+  if (Number.isFinite(ms) && ms > 0) return new Date(ms).toISOString();
+  const m = String(row.trade_time ?? '').match(/^(\d{4})(\d{2})(\d{2})-(\d{2}):(\d{2}):(\d{2})$/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}.000Z`;
+  return '';
 }
 
 /**
@@ -448,7 +468,8 @@ export function parseExecutions(rows: Array<Record<string, unknown>>): Execution
         action: (side === 'S' || side === 'SELL' ? 'SELL' : 'BUY') as 'BUY' | 'SELL',
         qty: Number(t.size ?? t.quantity ?? 0),
         price: Number(t.price ?? 0),
-        time: String(t.trade_time ?? t.trade_time_r ?? ''),
+        time: parseTradeTime(t),
+        commission: Number.isFinite(Number(t.commission)) && t.commission != null ? Number(t.commission) : undefined,
         orderId: t.order_id != null ? Number(t.order_id)
           : (t.order_ref != null ? Number(t.order_ref) : undefined),
       };
