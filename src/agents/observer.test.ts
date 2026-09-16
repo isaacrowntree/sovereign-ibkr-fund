@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { appendToBuffer, formatEvent, observedToState } from './observer.js';
+import { appendToBuffer, formatEvent, judgeStream, observedToState } from './observer.js';
 import type { ObservedEvent } from '../observability/event-types.js';
 import type { ObservedEventState } from '../state/store.js';
 
@@ -129,3 +129,31 @@ function fakeEvent(cursor: number): ObservedEventState {
     observedAt: '2026-05-06T00:00:00Z',
   };
 }
+
+describe('judgeStream — is the stream telling us what we rely on it for?', () => {
+  it('a connected socket whose orders subscription CPAPI refused is NOT healthy', () => {
+    // The Sep 2026 condition: connected, heartbeating, no gaps — and no fill
+    // could ever arrive. Every older signal said fine.
+    const v = judgeStream({ connected: true, subscriptions: { orders: 'refused', pnl: 'subscribed' } }, 0)!;
+    expect(v).not.toBeNull();
+    expect(v.reason).toBe('orders-refused');
+    expect(v.title).toContain('refused');
+  });
+
+  it('pending counts as not delivering too — a subscribe CPAPI never answered', () => {
+    expect(judgeStream({ connected: true, subscriptions: { orders: 'pending' } }, 0)?.reason).toBe('orders-pending');
+  });
+
+  it('a bezant that predates the field is judged on the old signals only', () => {
+    expect(judgeStream({ connected: true }, 0)).toBeNull();
+    expect(judgeStream({ connected: true }, 1)?.reason).toBe('gaps');
+  });
+
+  it('disconnected outranks everything', () => {
+    expect(judgeStream({ connected: false, subscriptions: { orders: 'refused' } }, 2)?.reason).toBe('disconnected');
+  });
+
+  it('subscribed, connected, no gaps: nothing to say', () => {
+    expect(judgeStream({ connected: true, subscriptions: { orders: 'subscribed', pnl: 'subscribed' } }, 0)).toBeNull();
+  });
+});

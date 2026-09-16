@@ -20,7 +20,7 @@ import {
   reconcileMarketDataCursor,
   getEventsStatus,
 } from '../observability/event-poller.js';
-import type { GapEvent, ObservedEvent } from '../observability/event-types.js';
+import type { EventsStatus, GapEvent, ObservedEvent } from '../observability/event-types.js';
 import { loadState, mergeState, appendObservedEvents, type ObservedEventState } from '../state/store.js';
 import { notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
@@ -132,33 +132,70 @@ async function reportStreamHealth(gaps: number): Promise<void> {
     return;
   }
 
-  if (status.connected && gaps === 0) return;
+  const verdict = judgeStream(status, gaps);
+  if (!verdict) return;
 
-  const reason = !status.connected ? 'disconnected' : 'gaps';
   await notify(
     {
       severity: 'warn',
-      title: status.connected
-        ? `Event stream gap — ${gaps} topic${gaps === 1 ? '' : 's'} lost continuity`
-        : 'Event stream DISCONNECTED from bezant',
-      body: status.connected
-        ? 'The cursor jumped, so events between the old and new positions were never seen. Fill confirmation and ' +
-          'intraday drawdown are both derived from this stream.'
-        : 'No live event feed. Fill confirmations and intraday drawdown enrichment are blind until it reconnects.',
+      title: verdict.title,
+      body: verdict.body,
       fields: [
         { label: 'Connected', value: String(status.connected) },
+        { label: 'Orders subscription', value: status.subscriptions?.orders ?? 'unknown (old bezant)' },
         { label: 'Last message', value: status.lastMessageAt ?? 'never' },
         { label: 'Reconnects', value: String(status.reconnectCount) },
+        ...(status.subscribeRefusals ? [{ label: 'Refusals', value: String(status.subscribeRefusals) }] : []),
         ...(gaps ? [{ label: 'Gaps this run', value: String(gaps) }] : []),
       ],
       agent: AGENT,
       // Coarse: reconnectCount and uptime change constantly, so fingerprinting
       // on them would alert every poll. This is one condition — "the stream is
       // unhealthy" — that re-nags on its ttl until it clears.
-      dedupe: { key: 'observer:stream-health', fingerprint: reason },
+      dedupe: { key: 'observer:stream-health', fingerprint: verdict.reason },
     },
     storeHooks,
   );
+}
+
+/**
+ * Is the stream telling us what we rely on it for? Pure, so the cases are
+ * pinned in tests. Ranked: a socket that is up but whose `orders` subscription
+ * CPAPI refused is the condition that lost fills in Sep 2026 — it looks
+ * healthy on every older signal (connected, heartbeating, no gaps).
+ */
+export function judgeStream(
+  status: Pick<EventsStatus, 'connected' | 'subscriptions'>,
+  gaps: number,
+): { reason: string; title: string; body: string } | null {
+  if (!status.connected) {
+    return {
+      reason: 'disconnected',
+      title: 'Event stream DISCONNECTED from bezant',
+      body: 'No live event feed. Fill confirmations and intraday drawdown enrichment are blind until it reconnects.',
+    };
+  }
+  const orders = status.subscriptions?.orders;
+  if (orders && orders !== 'subscribed') {
+    return {
+      reason: `orders-${orders}`,
+      title: `Order event stream not delivering — CPAPI ${orders === 'refused' ? 'refused' : 'has not honoured'} the subscription`,
+      body:
+        'The socket is up and heartbeating, but CPAPI is not sending order events on it, so no fill will arrive ' +
+        'this way. bezant retries the subscription with backoff; until it takes, the execution bot confirms fills ' +
+        'from IBKR executions instead (slower, and a second dependency).',
+    };
+  }
+  if (gaps > 0) {
+    return {
+      reason: 'gaps',
+      title: `Event stream gap — ${gaps} topic${gaps === 1 ? '' : 's'} lost continuity`,
+      body:
+        'The cursor jumped, so events between the old and new positions were never seen. Fill confirmation and ' +
+        'intraday drawdown are both derived from this stream.',
+    };
+  }
+  return null;
 }
 
 /** Convert a wire `ObservedEvent` to the persistent state shape. */

@@ -23,6 +23,7 @@ import type {
   ObservedEvent,
   ObserverCursor,
   PollResult,
+  SubscriptionState,
 } from './event-types.js';
 
 interface FetchLike {
@@ -137,6 +138,9 @@ interface RawStatus {
   reset_epoch: number;
   topics_subscribed: string[];
   buffer_sizes: Record<string, number>;
+  subscriptions?: Record<string, SubscriptionState>;
+  subscribe_refusals?: number;
+  session_rollovers?: number;
 }
 
 function parseEventsResponse<T>(
@@ -183,6 +187,9 @@ function statusFromRaw(r: RawStatus): EventsStatus {
     resetEpoch: r.reset_epoch,
     topicsSubscribed: r.topics_subscribed ?? [],
     bufferSizes: r.buffer_sizes ?? {},
+    subscriptions: r.subscriptions,
+    subscribeRefusals: r.subscribe_refusals,
+    sessionRollovers: r.session_rollovers,
   };
 }
 

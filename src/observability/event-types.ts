@@ -93,4 +93,14 @@ export interface EventsStatus {
   resetEpoch: number;
   topicsSubscribed: string[];
   bufferSizes: Record<string, number>;
+  /**
+   * What CPAPI actually honoured, per standing topic — `topicsSubscribed`
+   * is only what bezant asked for. Absent on a bezant that predates the
+   * field; treat absent as unknown, not as healthy.
+   */
+  subscriptions?: Record<string, SubscriptionState>;
+  subscribeRefusals?: number;
+  sessionRollovers?: number;
 }
+
+export type SubscriptionState = 'pending' | 'subscribed' | 'refused';
