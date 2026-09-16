@@ -121,12 +121,18 @@ if [ "${running:-NONE}" != "NONE" ]; then
 fi
 echo "[deploy] no agents in flight"
 
-echo "[deploy] pushing src/ + dist/ + scripts/ to ${HOST}:${REMOTE}"
+echo "[deploy] pushing src/ + dist/ + scripts/ + deploy/ to ${HOST}:${REMOTE}"
 rsync -a --delete "${EXCLUDES[@]}" src/     "${HOST}:${REMOTE}/src/"
 rsync -a --delete "${EXCLUDES[@]}" dist/    "${HOST}:${REMOTE}/dist/"
 # scripts/ too — run-agent.sh itself carries the .prebuilt handling, so a Pi
 # running an older copy of it would still try (and fail) to build.
 rsync -a --delete "${EXCLUDES[@]}" scripts/ "${HOST}:${REMOTE}/scripts/"
+# deploy/ too: the agent-health and db-retention units `docker exec` into the
+# container and run deploy/*/check.mjs from THIS checkout, which nothing else
+# updates (run-agent.sh skips git pull on a prebuilt host). Left out, the
+# checker ran a copy from a month earlier — and kept running it after the
+# schema it hardcoded had moved. No --delete: `.env` files may live there.
+rsync -a "${EXCLUDES[@]}" --exclude '.env' deploy/ "${HOST}:${REMOTE}/deploy/"
 
 # Content stamp, not mtimes. run-agent.sh recomputes this fingerprint on the Pi
 # and refuses to run if it differs — so a partial rsync, a clock step, or an
