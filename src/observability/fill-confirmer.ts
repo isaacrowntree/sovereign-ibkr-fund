@@ -6,6 +6,21 @@
  * Used by execution-bot in place of "trust the synchronous order
  * submission response" — that response only tells us the order was
  * accepted, not what actually filled.
+ *
+ * ## Two sources, one answer
+ *
+ * The stream is fast when it works and silent when it doesn't — and it
+ * doesn't more often than it does: CPAPI refuses the `sor` subscription on
+ * most reconnects, and a gateway re-login orphans a socket that keeps
+ * heartbeating. Every order placed on such a socket used to wait the full
+ * timeout for an event that could never come, and two of those in one run
+ * exceeded the orchestrator's budget and got the run killed mid-order.
+ *
+ * So the wait is also punctuated by an executions PROBE: IBKR's own
+ * `/iserver/account/trades`, the record the ledger is reconciled against
+ * anyway. A full fill there is a confirmed fill, whatever the stream says.
+ * `source` reports which one answered, so a run can tell "the stream is
+ * healthy" from "the stream is dead and the probe is carrying us".
  */
 import { pollTopic } from './event-poller.js';
 import type { ObservedEvent } from './event-types.js';
@@ -24,6 +39,21 @@ export interface FillConfirmation {
   events: ObservedEvent<RawOrderEvent>[];
   /** True if the timeout elapsed before reaching a terminal state. */
   timedOut: boolean;
+  /** Which source produced the answer. `none` when nothing was seen. */
+  source: 'stream' | 'executions' | 'none';
+  /** From the executions probe, when that is what confirmed: when IBKR says the fill happened. */
+  filledAt?: string;
+  /** From the executions probe, when that is what confirmed: total commission across the fills. */
+  commission?: number;
+}
+
+/** What the executions probe knows about one order. */
+export interface ExecutionsProbeResult {
+  filledQty: number;
+  avgPrice: number;
+  /** ISO time of the latest fill. */
+  filledAt?: string;
+  commission?: number;
 }
 
 interface RawOrderEvent {
@@ -51,6 +81,14 @@ export interface ConfirmFillOpts {
   pollIntervalMs?: number;
   /** Resume from this cursor (so we don't fetch events older than the order). */
   fromCursor?: number;
+  /**
+   * Ask IBKR's executions what filled. Called every `probeIntervalMs` while
+   * waiting; a full fill here ends the wait. Errors are swallowed — the probe
+   * is a second opinion, and the stream is still being watched.
+   */
+  probe?: () => Promise<ExecutionsProbeResult | null>;
+  /** Default 10s. */
+  probeIntervalMs?: number;
   /** Override pollTopic (for tests). */
   pollFn?: typeof pollTopic;
   /** Override the wall clock (for tests). */
@@ -96,6 +134,8 @@ export async function confirmFill(
     timeoutMs = 60_000,
     pollIntervalMs = 1_000,
     fromCursor = 0,
+    probe,
+    probeIntervalMs = 10_000,
     pollFn = pollTopic,
     now = () => Date.now(),
     sleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -107,8 +147,27 @@ export async function confirmFill(
   let lastStatus: FillStatus = 'pending';
   let lastFilledQty = 0;
   let lastAvgPrice = NaN;
+  let lastProbeAt = start;
 
   while (now() - start < timeoutMs) {
+    // Executions first: if IBKR already says it filled, there is nothing to
+    // wait for. Probed on its own cadence — /trades is a heavier call than a
+    // ring read, and one poll per second of it would be rude to the gateway.
+    // The first probe happens after one interval, not immediately: a market
+    // order takes a few seconds to appear there and the stream, when alive,
+    // answers sooner.
+    if (probe && now() - lastProbeAt >= probeIntervalMs) {
+      lastProbeAt = now();
+      const seen = await probe().catch(() => null);
+      if (seen && seen.filledQty >= targetQty && targetQty > 0) {
+        return {
+          ...finalize(orderId, targetQty, 'filled', seen.filledQty, seen.avgPrice, collected, false),
+          source: 'executions',
+          filledAt: seen.filledAt,
+          commission: seen.commission,
+        };
+      }
+    }
     const result = await pollFn<RawOrderEvent>('orders', cursor, 500);
     if (result.kind === 'cursor_expired') {
       // Catastrophic: server's ring overflowed. Reset to head; we may
@@ -186,6 +245,7 @@ function finalize(
     remainingQty: Math.max(0, targetQty - filled),
     events,
     timedOut,
+    source: events.length > 0 ? 'stream' : 'none',
   };
 }
 

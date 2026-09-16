@@ -69,7 +69,9 @@ async function reportRun(outcome: ExecutionOutcome, runAt: string): Promise<void
         severity: isDivergence ? 'critical' : 'warn',
         title: isDivergence
           ? `Ledger diverged from IBKR — ${a.symbol}`
-          : `Fill recovered from IBKR — ${a.symbol}`,
+          : a.kind === 'stream-silent'
+            ? 'Order event stream is silent — fills confirmed from executions instead'
+            : `Fill recovered from IBKR — ${a.symbol}`,
         body: a.detail,
         fields: [
           { label: 'Symbol', value: a.symbol },

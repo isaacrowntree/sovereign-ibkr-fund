@@ -250,3 +250,101 @@ describe('confirmFill', () => {
     expect(result.events[0].payload.orderId).toBe(2);
   });
 });
+
+describe('confirmFill — executions probe', () => {
+  // A clock the test advances by hand: each poll iteration "takes" one second,
+  // so the probe cadence and the timeout are both exercised deterministically.
+  function fakeClock() {
+    let t = 0;
+    return { now: () => t, sleepFn: async (ms: number) => { t += ms; } };
+  }
+
+  it('a dead stream no longer costs the whole timeout: the probe confirms the fill', async () => {
+    // Sep 8 / Sep 15 2026: CPAPI had refused the sor subscription, so the ring
+    // stayed empty for 180s while IBKR had filled the order within seconds.
+    const clock = fakeClock();
+    let probes = 0;
+    const result = await confirmFill(1699239940, {
+      targetQty: 1,
+      timeoutMs: 180_000,
+      pollFn: pollFnFromQueue([]) as any,
+      probeIntervalMs: 10_000,
+      probe: async () => {
+        probes += 1;
+        return { filledQty: 1, avgPrice: 141.72, filledAt: '2026-09-15T15:19:31.000Z', commission: 1 };
+      },
+      ...clock,
+    });
+    expect(result.status).toBe('filled');
+    expect(result.source).toBe('executions');
+    expect(result.timedOut).toBe(false);
+    expect(result.totalFilledQty).toBe(1);
+    expect(result.avgFillPrice).toBe(141.72);
+    expect(result.filledAt).toBe('2026-09-15T15:19:31.000Z');
+    expect(result.commission).toBe(1);
+    expect(probes, 'confirmed on the first probe').toBe(1);
+    expect(clock.now(), 'answered at the first probe interval, not the timeout').toBeLessThanOrEqual(11_000);
+  });
+
+  it('the stream still wins when it is alive — the probe is not consulted before its first interval', async () => {
+    const clock = fakeClock();
+    let probes = 0;
+    const result = await confirmFill(7, {
+      targetQty: 5,
+      timeoutMs: 60_000,
+      pollFn: pollFnFromQueue([ok([evt(1, { orderId: 7, status: 'Filled', cumFill: 5, avgPrice: 10 })])]) as any,
+      probe: async () => { probes += 1; return null; },
+      ...clock,
+    });
+    expect(result.source).toBe('stream');
+    expect(probes).toBe(0);
+  });
+
+  it('a partial in executions keeps waiting — more may come, and the stream may still finish the story', async () => {
+    const clock = fakeClock();
+    const result = await confirmFill(7, {
+      targetQty: 10,
+      timeoutMs: 30_000,
+      pollFn: pollFnFromQueue([]) as any,
+      probeIntervalMs: 10_000,
+      probe: async () => ({ filledQty: 4, avgPrice: 10 }),
+      ...clock,
+    });
+    // Timed out with nothing from the stream: the caller reconciles against
+    // executions itself and decides (partial ⇒ halt).
+    expect(result.timedOut).toBe(true);
+    expect(result.source).toBe('none');
+    expect(result.totalFilledQty).toBe(0);
+  });
+
+  it('a probe that throws is a missing second opinion, not a failed confirmation', async () => {
+    const clock = fakeClock();
+    const result = await confirmFill(7, {
+      targetQty: 1,
+      timeoutMs: 30_000,
+      pollFn: pollFnFromQueue([]) as any,
+      probeIntervalMs: 10_000,
+      probe: async () => { throw new Error('gateway 504'); },
+      ...clock,
+    });
+    expect(result.timedOut).toBe(true);
+    expect(result.source).toBe('none');
+  });
+
+  it('probes on its own cadence, not once per ring poll', async () => {
+    const clock = fakeClock();
+    let probes = 0;
+    await confirmFill(7, {
+      targetQty: 1,
+      timeoutMs: 60_000,
+      pollFn: pollFnFromQueue([]) as any,
+      pollIntervalMs: 1_000,
+      probeIntervalMs: 10_000,
+      probe: async () => { probes += 1; return null; },
+      ...clock,
+    });
+    // 60 ring polls; the probe at t=10,20,30,40,50 — the loop exits before 60.
+    expect(probes).toBeGreaterThanOrEqual(5);
+    expect(probes).toBeLessThanOrEqual(6);
+  });
+});

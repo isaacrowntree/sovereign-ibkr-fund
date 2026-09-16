@@ -22,7 +22,7 @@
  *     requeues verbatim.
  */
 import type { TradeResult } from '../connection/gateway.js';
-import type { FillConfirmation } from '../observability/fill-confirmer.js';
+import type { ExecutionsProbeResult, FillConfirmation } from '../observability/fill-confirmer.js';
 import type { TradeRecord } from '../state/store.js';
 import { createWashSaleEntry, type WashSaleEntry } from '../tax/harvesting.js';
 import { matchSellFifo } from '../tax/fifo.js';
@@ -65,10 +65,19 @@ export interface ExecutorDeps {
     strategy: AlgoPlan['strategy'],
     urgency: AlgoPriority,
   ): Promise<TradeResult>;
-  /** Wait for the order's terminal state on the event stream. */
+  /**
+   * Wait for the order's terminal state on the event stream, asking IBKR's
+   * executions along the way (`probe`) so a dead stream does not cost the
+   * whole timeout.
+   */
   confirmFill(
     orderId: number,
-    opts: { targetQty: number; timeoutMs: number; fromCursor?: number },
+    opts: {
+      targetQty: number;
+      timeoutMs: number;
+      fromCursor?: number;
+      probe?: () => Promise<ExecutionsProbeResult | null>;
+    },
   ): Promise<FillConfirmation>;
   /**
    * USD cash available for USD buys (incl. unsettled sale proceeds), fetched
@@ -86,7 +95,10 @@ export interface ExecutorDeps {
    * competing IBKR web login de-authed the event stream mid-order). Prevents a
    * real fill from being silently dropped/unrecorded.
    */
-  getExecutions?(): Promise<Array<{ execId: string; symbol: string; action: 'BUY' | 'SELL'; qty: number; price: number; orderId?: number }>>;
+  getExecutions?(): Promise<Array<{
+    execId: string; symbol: string; action: 'BUY' | 'SELL'; qty: number; price: number;
+    orderId?: number; time?: string; commission?: number;
+  }>>;
   /**
    * Per-symbol average cost from IBKR positions. Fallback cost basis for a
    * SELL when the ledger has no FIFO lots (the account's opening positions
@@ -139,10 +151,22 @@ export interface ExecutorDeps {
  * see post-run NAV/cash) do the telling.
  */
 export interface ExecutionAnomaly {
-  kind: 'ledger-diverged' | 'fill-recovered';
+  kind: 'ledger-diverged' | 'fill-recovered' | 'stream-silent';
   symbol: string;
   detail: string;
   orderId?: string | number;
+}
+
+/**
+ * What IBKR itself said about a fill, when we have it. The ledger prefers
+ * these to our own clock and to the placement response's commission (which
+ * CPAPI leaves empty).
+ */
+export interface FillProvenance {
+  /** ISO time IBKR reports the (last) execution at. */
+  filledAt?: string;
+  /** Commission summed across the order's executions. */
+  commission?: number;
 }
 
 export interface ExecutionOutcome {
@@ -195,6 +219,8 @@ export async function executeQueue(
   const washSales: WashSaleEntry[] = [];
   const anomalies: ExecutionAnomaly[] = [];
   const executed: StagedOrder[] = [];
+  /** Orders the executions probe confirmed because the stream never spoke. */
+  const streamSilent: string[] = [];
   let confirmedFill = false;
   let halted = false;
   let haltReason = '';
@@ -260,13 +286,16 @@ export async function executeQueue(
     fillPrice: number,
     status: string,
     result: TradeResult,
+    fill: FillProvenance = {},
   ): void => {
     const decisionPrice = order.estimatedValue / order.qty;
-    const commission = result.commission ?? 0;
+    const commission = fill.commission ?? result.commission ?? 0;
     deps.log(`Filled: orderId=${result.orderId} status=${status} filled=${filledQty}/${order.qty} fillPrice=$${fillPrice.toFixed(2)} commission=$${commission.toFixed(4)}`);
 
     const tradeRecord: TradeRecord = {
-      timestamp: new Date().toISOString(),
+      // When IBKR told us when it filled, that is the trade time. The clock
+      // here is when we found out, which on a dead stream is minutes later.
+      timestamp: fill.filledAt ?? new Date().toISOString(),
       symbol: order.symbol, action: order.action, qty: filledQty,
       estimatedValue: order.estimatedValue,
       fillPrice,
@@ -348,9 +377,10 @@ export async function executeQueue(
     fillPrice: number,
     status: string,
     result: TradeResult,
+    fill: FillProvenance = {},
   ): void => {
     try {
-      recordFilledTrade(order, filledQty, fillPrice, status, result);
+      recordFilledTrade(order, filledQty, fillPrice, status, result, fill);
     } catch (e) {
       // The fill DID happen — a failed trade-history/tax write must not
       // unwind the run (that would leave the filled order in the queue to
@@ -418,19 +448,38 @@ export async function executeQueue(
    * authoritative executions: if the order filled, RECORD it (never lose a real
    * fill) and return true. Returns false if it genuinely didn't fill.
    */
+  /**
+   * What IBKR's executions say about one order, summed across partials. Null
+   * when nothing has filled; throws when the executions can't be read. Used
+   * both as the probe during the wait and as the reconcile after a failed one.
+   */
+  const executionsFor = async (orderId: number): Promise<ExecutionsProbeResult | null> => {
+    if (!deps.getExecutions) return null;
+    const execs = await deps.getExecutions();
+    const fills = execs.filter(e => e.orderId === orderId && e.qty > 0);
+    const filledQty = fills.reduce((s, e) => s + e.qty, 0);
+    if (filledQty <= 0) return null;
+    const commissions = fills.map(e => e.commission).filter((c): c is number => typeof c === 'number' && Number.isFinite(c));
+    const times = fills.map(e => e.time).filter((t): t is string => !!t).sort();
+    return {
+      filledQty,
+      avgPrice: fills.reduce((s, e) => s + e.qty * e.price, 0) / filledQty,
+      filledAt: times.length ? times[times.length - 1] : undefined,
+      commission: commissions.length ? commissions.reduce((s, c) => s + c, 0) : undefined,
+    };
+  };
+
   const reconcileOrderFill = async (order: StagedOrder, orderId: number): Promise<number> => {
     if (!deps.getExecutions) return 0;
-    let execs;
+    let seen: ExecutionsProbeResult | null;
     try {
-      execs = await deps.getExecutions();
+      seen = await executionsFor(orderId);
     } catch (e) {
       deps.logError(`Could not fetch executions to verify ${order.symbol} fill`, e);
       return 0;
     }
-    const fills = execs.filter(e => e.orderId === orderId && e.qty > 0);
-    const filledQty = fills.reduce((s, e) => s + e.qty, 0);
-    if (filledQty <= 0) return 0;
-    const avgPrice = fills.reduce((s, e) => s + e.qty * e.price, 0) / filledQty;
+    if (!seen) return 0;
+    const { filledQty, avgPrice } = seen;
     deps.log(`RECONCILED from IBKR executions: ${order.action} ${filledQty} ${order.symbol} @ $${avgPrice.toFixed(2)} DID fill (confirmation misreported).`);
     // The WS confirmation said this didn't fill; IBKR's own execution history
     // says it did. We recovered, but the stream is lying to us — and every
@@ -444,7 +493,11 @@ export async function executeQueue(
         `IBKR's execution history shows it did. Recovered from executions; the WS stream misreported.`,
     });
     confirmedFill = true;
-    recordExecuted(order, filledQty, avgPrice, 'filled', { orderId, symbol: order.symbol, action: order.action, qty: filledQty, status: 'filled' } as TradeResult);
+    recordExecuted(
+      order, filledQty, avgPrice, 'filled',
+      { orderId, symbol: order.symbol, action: order.action, qty: filledQty, status: 'filled' } as TradeResult,
+      { filledAt: seen.filledAt, commission: seen.commission },
+    );
     return filledQty;
   };
 
@@ -552,6 +605,7 @@ export async function executeQueue(
       let actualFilledQty = order.qty;
       let actualStatus: string = result.status;
       let remainder: StagedOrder | null = null;
+      let provenance: FillProvenance = {};
 
       if (useFillConfirmer) {
         const timeoutMs = urgency === 'Patient' ? 180_000 : 60_000;
@@ -562,11 +616,19 @@ export async function executeQueue(
             targetQty: order.qty,
             timeoutMs,
             fromCursor: ctx.ordersCursorFloor,
+            probe: deps.getExecutions ? () => executionsFor(result.orderId) : undefined,
           });
         } catch (err) {
           deps.logError(`Fill confirmation failed for orderId=${result.orderId}`, err);
           await onConfirmationFailure(order, result.orderId, 'fill confirmation errored');
           continue;
+        }
+        provenance = { filledAt: conf.filledAt, commission: conf.commission };
+        if (conf.source === 'executions') {
+          // The order is fine; the stream is not. Counted so the run can say
+          // so once, rather than one warning per order.
+          deps.log(`${order.symbol}: confirmed by IBKR executions — the event stream reported nothing.`);
+          streamSilent.push(order.symbol);
         }
 
         // Adopt the confirmed filled quantity independently of price (a fill
@@ -614,7 +676,7 @@ export async function executeQueue(
                 `recording filled shares, cancelling remainder, dropping. Halting run.`,
             );
             drop(order);
-            recordExecuted(order, actualFilledQty, actualFillPrice, actualStatus, result);
+            recordExecuted(order, actualFilledQty, actualFillPrice, actualStatus, result, provenance);
             await cancelUnknown(result.orderId, order.symbol);
             halt(`partial fill timed out (${order.symbol})`);
             continue;
@@ -641,7 +703,7 @@ export async function executeQueue(
       // IBKR's authoritative execution log; a duplicate trade is not.
       if (remainder) replaceWith(order, remainder);
       else drop(order);
-      recordExecuted(order, actualFilledQty, actualFillPrice, actualStatus, result);
+      recordExecuted(order, actualFilledQty, actualFillPrice, actualStatus, result, provenance);
     }
   };
 
@@ -674,6 +736,20 @@ export async function executeQueue(
 
   if (halted) {
     deps.log(`Run halted early: ${haltReason} — ${remaining.length} order(s) remain queued`);
+  }
+
+  // One line for the whole run, not one per order: the fills are fine, the
+  // instrument that was supposed to report them is not, and that is worth a
+  // human knowing before the day the probe is also unavailable.
+  if (streamSilent.length > 0) {
+    anomalies.push({
+      kind: 'stream-silent',
+      symbol: streamSilent.join(','),
+      detail:
+        `${streamSilent.length} fill(s) this run (${streamSilent.join(', ')}) were confirmed from IBKR's executions ` +
+        `because the order event stream reported nothing. The fills are recorded; the stream is not delivering — ` +
+        `check bezant's /events/status for the sor subscription.`,
+    });
   }
 
   return {

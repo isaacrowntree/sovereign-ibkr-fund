@@ -31,6 +31,7 @@ const confirmation = (
   remainingQty: 0,
   events: [],
   timedOut: false,
+  source: 'stream',
   ...over,
 });
 
@@ -43,6 +44,8 @@ interface FakeOpts {
   zeroOrderId?: string[];
   /** Symbols whose confirmFill should throw. */
   failConfirm?: string[];
+  /** Symbols for which the event stream says nothing — only the executions probe can confirm. */
+  streamDead?: string[];
   cash?: number;
   /** getAccountCash rejects instead of returning. */
   cashThrows?: boolean;
@@ -54,7 +57,7 @@ interface FakeOpts {
   /** getLiveOrders rejects (idempotency guard unavailable). */
   liveOrdersThrows?: boolean;
   /** Executions returned by getExecutions (for reconcile-on-failure), keyed by nothing — a flat list. */
-  executions?: Array<{ execId: string; symbol: string; action: 'BUY' | 'SELL'; qty: number; price: number; orderId?: number }>;
+  executions?: Array<{ execId: string; symbol: string; action: 'BUY' | 'SELL'; qty: number; price: number; orderId?: number; time?: string; commission?: number }>;
   /** Per-symbol avg cost (fallback cost basis). */
   avgCosts?: Record<string, number>;
   /** appendTrade throws (simulate a trade-history write failure). */
@@ -79,11 +82,23 @@ function makeDeps(opts: FakeOpts = {}) {
       placed.push({ order: o, orderId });
       return accepted(o, orderId);
     },
-    confirmFill: async (orderId, { targetQty }) => {
+    confirmFill: async (orderId, { targetQty, probe }) => {
       const sym = placed[placed.length - 1].order.symbol;
       confirmCalls.push({ orderId, symbol: sym });
       calls.push(`confirm:${sym}`);
       if (opts.failConfirm?.includes(sym)) throw new Error(`confirm stream down for ${sym}`);
+      if (opts.streamDead?.includes(sym)) {
+        // The real confirmer on a dead ring: nothing from the stream, so the
+        // executions probe is what answers (or the wait times out).
+        const seen = probe ? await probe() : null;
+        if (seen && seen.filledQty >= targetQty) {
+          return confirmation(orderId, {
+            totalFilledQty: seen.filledQty, avgFillPrice: seen.avgPrice, remainingQty: 0,
+            source: 'executions', filledAt: seen.filledAt, commission: seen.commission,
+          });
+        }
+        return confirmation(orderId, { status: 'pending', totalFilledQty: 0, remainingQty: targetQty, timedOut: true, source: 'none' });
+      }
       return confirmation(orderId, {
         totalFilledQty: targetQty,
         remainingQty: 0,
@@ -779,5 +794,61 @@ describe('each order announces the step it is on', () => {
     const { deps } = makeDeps();
     const out = await executeQueue([order('VST', 'BUY', 600)], ctx({ validated: true }), deps);
     expect(out.executed).toHaveLength(1);
+  });
+});
+
+describe('executeQueue — fill provenance', () => {
+  // The Sep 15 2026 VST fill: IBKR executed at 15:19:31Z for $1.00 commission.
+  // The old ledger row said 15:22:30Z (when the 180s wait gave up) and no
+  // commission (the placement response never carries one).
+  const VST_EXEC = {
+    execId: '000249df.6aa94fd3.01.01', symbol: 'VST', action: 'BUY' as const, qty: 1, price: 141.72,
+    orderId: 100, time: '2026-09-15T15:19:31.000Z', commission: 1,
+  };
+
+  it('a fill confirmed by the executions probe is recorded at IBKR\'s time, with IBKR\'s commission', async () => {
+    const { deps, trades } = makeDeps({ streamDead: ['VST'], executions: [VST_EXEC] });
+    const outcome = await executeQueue([order('VST', 'BUY', 140.92, 1)], ctx(), deps);
+
+    expect(outcome.halted).toBe(false);
+    expect(trades).toHaveLength(1);
+    expect(trades[0].timestamp).toBe('2026-09-15T15:19:31.000Z');
+    expect(trades[0].commission).toBe(1);
+    expect(trades[0].fillPrice).toBe(141.72);
+  });
+
+  it('a dead stream is reported once for the run, not once per order — and the run is NOT halted', async () => {
+    const execs = [
+      { ...VST_EXEC, orderId: 100 },
+      { ...VST_EXEC, execId: 'x2', symbol: 'NET', qty: 4, price: 285.32, orderId: 101, commission: 1 },
+    ];
+    const { deps, trades } = makeDeps({ streamDead: ['VST', 'NET'], executions: execs });
+    const outcome = await executeQueue([order('VST', 'BUY', 140, 1), order('NET', 'BUY', 1140, 4)], ctx(), deps);
+
+    expect(outcome.halted).toBe(false);
+    expect(trades.map(t => t.symbol)).toEqual(['VST', 'NET']);
+    const silent = outcome.anomalies.filter(a => a.kind === 'stream-silent');
+    expect(silent).toHaveLength(1);
+    expect(silent[0].symbol).toBe('VST,NET');
+    // Not double-reported as a recovery: the probe is the normal path now.
+    expect(outcome.anomalies.filter(a => a.kind === 'fill-recovered')).toHaveLength(0);
+  });
+
+  it('a stream-confirmed fill still stamps our clock — IBKR\'s WS frames carry no trade time', async () => {
+    const { deps, trades } = makeDeps();
+    await executeQueue([order('VST', 'BUY', 140, 1)], ctx(), deps);
+    expect(trades[0].timestamp).not.toBe('2026-09-15T15:19:31.000Z');
+    expect(Date.parse(trades[0].timestamp)).toBeGreaterThan(Date.now() - 10_000);
+  });
+
+  it('a fill reconciled AFTER a timed-out wait also carries IBKR\'s time and commission', async () => {
+    const { deps, trades } = makeDeps({
+      confirm: { VST: { status: 'pending', totalFilledQty: 0, remainingQty: 1, timedOut: true, source: 'none' } },
+      executions: [VST_EXEC],
+    });
+    await executeQueue([order('VST', 'BUY', 140, 1)], ctx(), deps);
+    expect(trades).toHaveLength(1);
+    expect(trades[0].timestamp).toBe('2026-09-15T15:19:31.000Z');
+    expect(trades[0].commission).toBe(1);
   });
 });
