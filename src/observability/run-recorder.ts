@@ -109,20 +109,35 @@ export function describeAbandonedRun(
   }
   if (live && !stale) return null; // a healthy concurrent run, not a corpse
 
+  // A lock without a phase was written by the code that predates this
+  // recorder. It caught no signals and recorded no memory, so its silence
+  // says nothing about how it died — only that it did.
+  const legacy = typeof rec.phase !== 'string';
+
   const cause = rec.signal
     ? `It was sent ${rec.signal}${rec.signalAt ? ` at ${rec.signalAt}` : ''}, so something asked it to stop — ` +
       'look for a supervisor timeout, a deploy, or a container restart.'
-    : 'NO signal was recorded. SIGTERM and SIGINT are caught and would have been, so this was a ' +
-      'SIGKILL, a crash, or the machine going away — not a polite shutdown.';
+    : legacy
+      ? 'The lock predates the flight recorder, so no signal could have been recorded: this could equally be ' +
+        'a supervisor timeout (SIGTERM), a SIGKILL, a crash, or the machine going away. The orchestrator\'s ' +
+        'own run record is the place to look.'
+      : 'NO signal was recorded. SIGTERM and SIGINT are caught and would have been, so this was a ' +
+        'SIGKILL, a crash, or the machine going away — not a polite shutdown.';
+
+  const where = legacy
+    ? `It recorded no phase (pre-recorder lock), so where it got to is unknown; it had been running ${humanMs(runMs)}.`
+    : `Last phase: "${phase}", entered ${rec.phaseAt} and still in it after ${humanMs(phaseMs)}. ` +
+      `Memory at that point: ${rec.rssMb}MB.`;
 
   return {
     phase,
-    phaseMs,
-    title: `Previous execution run died in "${phase}"`,
+    phaseMs: legacy ? runMs : phaseMs,
+    title: legacy
+      ? 'Previous execution run died (pre-recorder lock, phase unknown)'
+      : `Previous execution run died in "${phase}"`,
     detail:
-      `A run (pid ${pid}) started ${rec.at} never released its lock. Last phase: "${phase}", ` +
-      `entered ${rec.phaseAt} and still in it after ${humanMs(phaseMs)}. Memory at that point: ` +
-      `${rec.rssMb}MB. ${cause} Any order in flight at that moment may have filled without being ` +
-      'recorded; orphan recovery reconciles that against broker positions on the next run.',
+      `A run (pid ${pid}) started ${rec.at} never released its lock. ${where} ${cause} ` +
+      'Any order in flight at that moment may have filled without being recorded; orphan recovery ' +
+      'reconciles that against broker positions on the next run.',
   };
 }

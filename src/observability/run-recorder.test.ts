@@ -88,6 +88,22 @@ describe('describeAbandonedRun — the post-mortem the next run reports', () => 
     expect(describeAbandonedRun(old, later, alive)).not.toBeNull();
   });
 
+  it('does not blame a SIGKILL for a lock written before there was a recorder', () => {
+    // The lock the Sep 15 2026 post-mortem found: `{at, pid}` from the code
+    // that predates run-recorder. Its run was in fact SIGTERM'd by a paperclip
+    // 300s timeout — a "polite" shutdown the old code simply never caught.
+    const legacy = { at: '2026-09-08T18:53:12.900Z', pid: 1537058 } as unknown as RunPhase;
+    const pm = describeAbandonedRun(legacy, new Date('2026-09-15T15:19:24.482Z'), dead)!;
+    expect(pm).not.toBeNull();
+    expect(pm.title).toContain('pre-recorder');
+    expect(pm.detail).not.toContain('not a polite shutdown');
+    expect(pm.detail).not.toContain('undefined');
+    expect(pm.detail).toContain('SIGTERM');
+    expect(pm.detail).toContain('164.4h');
+    // "Stuck for" on the alert is the run's age — there is no phase to age.
+    expect(Math.round(pm.phaseMs / 3_600_000)).toBe(164);
+  });
+
   it('survives a malformed record rather than taking the run down with it', () => {
     const junk = { pid: 'nope', phase: 42 } as unknown as RunPhase;
     expect(() => describeAbandonedRun(junk, later, dead)).not.toThrow();
