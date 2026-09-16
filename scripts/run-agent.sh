@@ -70,10 +70,31 @@ elif [ ! -f dist/index.js ] || [ -n "$(find src -name '*.ts' -newer dist/index.j
   need_build=1
 fi
 
+# The ops feed (pi.lan/ops) is where a refusal has to land. The orchestrator
+# only sees "exited 1", which its health summary folds into an adapter_failed
+# line — that hid six days of the execution bot refusing to run in Sep 2026
+# under the relogin noise. Same one-line JSON contract as src/notify/feed.ts;
+# PI_OPS_DIR overrides the container mount, as it does there. Written once per
+# stale tree: the sentinel remembers which fingerprint was already reported, so
+# a 4-hourly heartbeat does not re-post the same fact until the tree changes.
+ops_feed_stale() {
+  dir="${PI_OPS_DIR:-/fund-state/state}"
+  [ -d "$dir" ] || return 0
+  now_fp="$1"
+  sentinel="dist/.stale-reported"
+  [ "$(cat "$sentinel" 2>/dev/null)" = "$now_fp" ] && return 0
+  at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  built="$(grep '^rev=' dist/.build-stamp 2>/dev/null | cut -d= -f2)"
+  printf '{"at":"%s","source":"run-agent","severity":"critical","title":"%s refused to run — deployed code is stale","detail":"dist/ was built from %s but src/ has moved on, and this host cannot build. Every heartbeat will refuse until scripts/deploy-to-pi.sh is run from a workstation. Nothing is trading."}\n' \
+    "$at" "$AGENT" "${built:-an unknown revision}" >> "$dir/ops-feed.jsonl" 2>/dev/null \
+    && printf '%s' "$now_fp" > "$sentinel" 2>/dev/null || true
+}
+
 if [ "$PREBUILT" = 1 ]; then
   # Never build here. Refuse to run rather than execute stale code against a
   # real account — the operator must redeploy from their workstation.
   if [ "$need_build" = 1 ]; then
+    ops_feed_stale "$(source_fingerprint)"
     echo "[run-agent] FATAL: this host is marked .prebuilt and dist/ does not match src/." >&2
     if [ ! -f dist/index.js ]; then
       echo "[run-agent] dist/index.js is missing entirely." >&2
