@@ -175,11 +175,16 @@ export function judgeStream(
       body: 'No live event feed. Fill confirmations and intraday drawdown enrichment are blind until it reconnects.',
     };
   }
+  // Only an explicit refusal is evidence. `pending` is silence, and CPAPI is
+  // silent on a subscribe it honoured when there are no orders to snapshot —
+  // seen 2026-09-16 after a fresh login: pnl confirmed, sor said nothing,
+  // nothing to be alarmed about until an order is placed and no event comes,
+  // which the execution bot reports on its own.
   const orders = status.subscriptions?.orders;
-  if (orders && orders !== 'subscribed') {
+  if (orders === 'refused') {
     return {
-      reason: `orders-${orders}`,
-      title: `Order event stream not delivering — CPAPI ${orders === 'refused' ? 'refused' : 'has not honoured'} the subscription`,
+      reason: 'orders-refused',
+      title: 'Order event stream not delivering — CPAPI refused the subscription',
       body:
         'The socket is up and heartbeating, but CPAPI is not sending order events on it, so no fill will arrive ' +
         'this way. bezant retries the subscription with backoff; until it takes, the execution bot confirms fills ' +

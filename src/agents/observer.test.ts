@@ -140,8 +140,8 @@ describe('judgeStream — is the stream telling us what we rely on it for?', () 
     expect(v.title).toContain('refused');
   });
 
-  it('pending counts as not delivering too — a subscribe CPAPI never answered', () => {
-    expect(judgeStream({ connected: true, subscriptions: { orders: 'pending' } }, 0)?.reason).toBe('orders-pending');
+  it('pending is silence, not evidence — CPAPI says nothing on a subscribe it honoured with no orders to snapshot', () => {
+    expect(judgeStream({ connected: true, subscriptions: { orders: 'pending', pnl: 'subscribed' } }, 0)).toBeNull();
   });
 
   it('a bezant that predates the field is judged on the old signals only', () => {
