@@ -138,6 +138,7 @@ async function reportStreamHealth(gaps: number): Promise<void> {
   await notify(
     {
       severity: 'warn',
+      channel: verdict.channel,
       title: verdict.title,
       body: verdict.body,
       fields: [
@@ -167,10 +168,11 @@ async function reportStreamHealth(gaps: number): Promise<void> {
 export function judgeStream(
   status: Pick<EventsStatus, 'connected' | 'subscriptions'>,
   gaps: number,
-): { reason: string; title: string; body: string } | null {
+): { reason: string; title: string; body: string; channel: 'slack' | 'ops' } | null {
   if (!status.connected) {
     return {
       reason: 'disconnected',
+      channel: 'slack',
       title: 'Event stream DISCONNECTED from bezant',
       body: 'No live event feed. Fill confirmations and intraday drawdown enrichment are blind until it reconnects.',
     };
@@ -184,6 +186,7 @@ export function judgeStream(
   if (orders === 'refused') {
     return {
       reason: 'orders-refused',
+      channel: 'slack',
       title: 'Order event stream not delivering — CPAPI refused the subscription',
       body:
         'The socket is up and heartbeating, but CPAPI is not sending order events on it, so no fill will arrive ' +
@@ -192,8 +195,13 @@ export function judgeStream(
     };
   }
   if (gaps > 0) {
+    // Record-only. A gap is what every reconnect leaves behind, and reconnects
+    // are routine: IBKR closes the socket a few times a day and re-keys it
+    // nightly, bezant is back in seconds, and fills no longer depend on the
+    // stream. It belongs on the page as a fact, not on a phone as a task.
     return {
       reason: 'gaps',
+      channel: 'ops',
       title: `Event stream gap — ${gaps} topic${gaps === 1 ? '' : 's'} lost continuity`,
       body:
         'The cursor jumped, so events between the old and new positions were never seen. Fill confirmation and ' +

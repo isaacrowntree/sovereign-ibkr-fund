@@ -153,6 +153,15 @@ describe('judgeStream — is the stream telling us what we rely on it for?', () 
     expect(judgeStream({ connected: false, subscriptions: { orders: 'refused' } }, 2)?.reason).toBe('disconnected');
   });
 
+  it('a gap is recorded, not pushed — every reconnect leaves one and nobody can act on it', () => {
+    expect(judgeStream({ connected: true, subscriptions: { orders: 'subscribed' } }, 1)?.channel).toBe('ops');
+  });
+
+  it('disconnected and refused still interrupt', () => {
+    expect(judgeStream({ connected: false }, 0)?.channel).toBe('slack');
+    expect(judgeStream({ connected: true, subscriptions: { orders: 'refused' } }, 0)?.channel).toBe('slack');
+  });
+
   it('subscribed, connected, no gaps: nothing to say', () => {
     expect(judgeStream({ connected: true, subscriptions: { orders: 'subscribed', pnl: 'subscribed' } }, 0)).toBeNull();
   });
