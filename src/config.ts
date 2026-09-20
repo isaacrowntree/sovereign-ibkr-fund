@@ -62,6 +62,20 @@ export const config = {
      */
     cashFlowRebuyGuardDays: parseInt(process.env.CASH_FLOW_REBUY_GUARD_DAYS || '0', 10),
     /**
+     * Cash the cash-flow path never deploys. Two ways to state it:
+     *   CASH_FLOW_RESERVE_BASE — in the account's BASE currency (AUD here),
+     *     converted with the ledger's USD exchange rate each run. This is the
+     *     figure an operator actually thinks in, since IBKR reports cash in
+     *     base. Wins when set and a rate is available.
+     *   CASH_FLOW_RESERVE_USD — in USD (default 1000). The fallback, and what
+     *     the strategist used unconditionally before 2026-09-20, when
+     *     ~$1,016 USD (≈ $1,427 AUD, the digest's "cash") sat one share short
+     *     of deploying for a week because the floor was a hard-coded 1000.
+     */
+    cashFlowReserveUsd: parseFloat(process.env.CASH_FLOW_RESERVE_USD || '1000'),
+    cashFlowReserveBase: process.env.CASH_FLOW_RESERVE_BASE
+      ? parseFloat(process.env.CASH_FLOW_RESERVE_BASE) : null,
+    /**
      * Fill mode when buy notional exceeds available cash:
      *   'greedy' — sort by drift desc, fully fill largest gaps first, drop
      *     the lowest-priority buys when cash runs out. Decisive — moves the

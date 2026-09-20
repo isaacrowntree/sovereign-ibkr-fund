@@ -338,6 +338,12 @@ export interface UsdBalances {
   usdSettledCash: number;
   /** Total portfolio net liquidation value expressed in USD. */
   usdNav: number;
+  /**
+   * Base currency per 1 USD, from the USD ledger row (`exchangerate`). Lets a
+   * threshold the operator thinks of in base currency (an AUD reserve) be
+   * compared with the USD figures above. null when the ledger carries none.
+   */
+  baseRatePerUsd: number | null;
 }
 
 /**
@@ -366,6 +372,7 @@ export function deriveUsdBalances(ledger: Record<string, LedgerRow>): UsdBalance
     // would deploy more than exists.
     usdSettledCash: Math.min(usd?.settledcash ?? 0, usdCash),
     usdNav,
+    baseRatePerUsd: usdRate && usdRate > 0 ? usdRate : null,
   };
 }
 

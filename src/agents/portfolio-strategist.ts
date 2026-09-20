@@ -9,6 +9,7 @@ import { decideDeposit } from '../portfolio/deposit-policy.js';
 import { loadDepositPolicy } from '../portfolio/deposit-policy-file.js';
 import { planDepositBuy } from '../portfolio/deposit-plan.js';
 import { allocateCashFlow, recentlySoldSymbols } from '../portfolio/cashflow-rebalance.js';
+import { resolveCashReserveUsd } from '../portfolio/cash-reserve.js';
 import {
   computeTargetWeights,
   computeDrift,
@@ -390,8 +391,18 @@ async function run(): Promise<void> {
     } else if (decision === 'within-threshold') {
       log('Portfolio within drift threshold — no rebalance needed', AGENT);
 
-      // Cash-flow rebalancing for deposits (USD cash — buys are USD).
-      const CASH_THRESHOLD = 1000;
+      // Cash-flow rebalancing for deposits (USD cash — buys are USD). The
+      // reserve is stated in base currency when the operator set it that way
+      // (CASH_FLOW_RESERVE_BASE) and converted at the ledger's rate.
+      const reserve = resolveCashReserveUsd({
+        reserveUsd: config.rebalance.cashFlowReserveUsd,
+        reserveBase: config.rebalance.cashFlowReserveBase,
+        baseRatePerUsd: usd.baseRatePerUsd,
+      });
+      const CASH_THRESHOLD = reserve.reserveUsd;
+      log(`Cash reserve: $${CASH_THRESHOLD.toFixed(2)} USD (${reserve.source === 'base'
+        ? `${config.rebalance.cashFlowReserveBase} base @ ${usd.baseRatePerUsd}`
+        : 'USD setting'}); deployable $${Math.max(0, cashUsd - CASH_THRESHOLD).toFixed(2)}`, AGENT);
       if (cashUsd > CASH_THRESHOLD) {
         const holdings = TARGET_PORTFOLIO.map((t, i) => ({
           symbol: t.symbol,
