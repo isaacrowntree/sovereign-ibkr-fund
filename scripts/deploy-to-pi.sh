@@ -179,4 +179,11 @@ ssh "$HOST" "cd '$REMOTE' && \
      echo \"  stamped=\$stamped\"; echo \"  on disk=\$remote_fp\"; exit 1; fi; \
   echo \"[deploy] OK — \$(ls dist/agents/*.js | wc -l | tr -d ' ') agents, fingerprint \${remote_fp:0:12}… verified on the Pi\""
 
+# Units are installed by hand (they need a daemon-reload and sometimes a
+# supervised restart), so a deploy only REPORTS where the host has drifted from
+# the repo — the reconciler unit lived on the Pi alone, untimed, until someone
+# looked.
+echo "[deploy] comparing installed systemd units with the repo"
+bash "$DIR/scripts/diff-units.sh" "$HOST" "$REMOTE" || true
+
 echo "[deploy] done"

@@ -34,6 +34,10 @@ systemctl --user daemon-reload
 Each unit reads its own `.env` (see the `.env.example` beside it). All are
 `0600` and gitignored.
 
+`scripts/diff-units.sh <host> <remote-path>` shows how the installed units differ
+from these (rendered with your ids); `deploy-to-pi.sh` runs it at the end of
+every deploy. It only reports — installing stays a deliberate step.
+
 ## STATE_DIR is not optional
 
 `backup-to-slack.mjs` and `daily-summary.js` both do `process.env.STATE_DIR || '.'`
