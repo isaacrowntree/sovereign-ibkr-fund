@@ -99,11 +99,17 @@ export interface MarketDataFreshnessInput {
   maxQuantAgeMs: number;
   /** Max calendar days between the newest stored trading day and now. */
   maxHistoryGapDays: number;
+  /**
+   * F8 (2026-09-24): require quant-analyst to have run SINCE this instant —
+   * the strategist passes its own previous run, so it only ever sizes against
+   * this cycle's quant output. Absent = no ordering requirement (legacy).
+   */
+  requireQuantAfter?: string;
 }
 
 export type MarketDataFreshness =
   | { fresh: true; ageMs: number }
-  | { fresh: false; reason: 'missing' | 'stale' | 'clock'; detail: string };
+  | { fresh: false; reason: 'missing' | 'stale' | 'clock' | 'not-this-cycle'; detail: string };
 
 /**
  * FAIL SAFE: refuse to size orders against market data we cannot prove is current.
@@ -125,7 +131,7 @@ export type MarketDataFreshness =
  * at all. Only staleness blocks.
  */
 export function marketDataFreshness(input: MarketDataFreshnessInput): MarketDataFreshness {
-  const { lastQuantAt, priceHistoryDates, now, maxQuantAgeMs, maxHistoryGapDays } = input;
+  const { lastQuantAt, priceHistoryDates, now, maxQuantAgeMs, maxHistoryGapDays, requireQuantAfter } = input;
 
   if (!lastQuantAt) {
     return { fresh: false, reason: 'missing', detail: 'no lastQuantAt — quant-analyst has never written market data' };
@@ -163,6 +169,17 @@ export function marketDataFreshness(input: MarketDataFreshnessInput): MarketData
         fresh: false,
         reason: 'stale',
         detail: `newest stored trading day is ${newest}, ${gapDays.toFixed(1)} days ago (limit ${maxHistoryGapDays})`,
+      };
+    }
+  }
+
+  if (requireQuantAfter) {
+    const after = new Date(requireQuantAfter).getTime();
+    if (Number.isFinite(after) && at <= after) {
+      return {
+        fresh: false,
+        reason: 'not-this-cycle',
+        detail: `quant-analyst last ran ${lastQuantAt}, not since the previous strategist run (${requireQuantAfter})`,
       };
     }
   }

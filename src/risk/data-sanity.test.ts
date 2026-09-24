@@ -68,6 +68,18 @@ describe('marketDataFreshness', () => {
   const NOW = new Date('2026-08-19T02:00:00Z');
   const base = { now: NOW, maxQuantAgeMs: 12 * 3_600_000, maxHistoryGapDays: 6 };
 
+  it('F8: with requireQuantAfter, quant must have run since the previous strategist run', () => {
+    const fresh = { ...base, lastQuantAt: '2026-08-19T01:35:00Z', priceHistoryDates: ['2026-08-18'] };
+    expect(marketDataFreshness({ ...fresh, requireQuantAfter: '2026-08-18T22:00:00Z' }).fresh).toBe(true);
+    const r = marketDataFreshness({ ...fresh, requireQuantAfter: '2026-08-19T01:40:00Z' });
+    expect(r).toMatchObject({ fresh: false, reason: 'not-this-cycle' });
+    // Equal instants are not "since".
+    expect(marketDataFreshness({ ...fresh, requireQuantAfter: '2026-08-19T01:35:00Z' }).fresh).toBe(false);
+    // An unparseable marker imposes nothing; absent is the legacy gate.
+    expect(marketDataFreshness({ ...fresh, requireQuantAfter: 'garbage' }).fresh).toBe(true);
+    expect(marketDataFreshness(fresh).fresh).toBe(true);
+  });
+
   it('passes on data written within the window', () => {
     const r = marketDataFreshness({
       ...base,

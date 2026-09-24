@@ -239,3 +239,59 @@ describe('allocateCashFlow — greedy fill mode', () => {
     expect(a).toEqual(b);
   });
 });
+
+import { rebuyGuardExclusions, saleTargetPct } from './cashflow-rebalance.js';
+
+describe('target-aware rebuy guard (F3)', () => {
+  const now = Date.parse('2026-09-24T00:00:00Z');
+  const sell = (symbol: string, daysAgo: number, reason: string) => ({
+    symbol, action: 'SELL' as const, timestamp: new Date(now - daysAgo * 86_400_000).toISOString(), reason,
+  });
+
+  it('reads the target a sale aimed at from either reason format', () => {
+    expect(saleTargetPct('rebalance: 9.1% → 7.0% (static) (P&L/share: +$3.00)')).toBe(7);
+    expect(saleTargetPct('bands URGENT: 9.1% → 7.5% (target 7.0%, band ±1.8pp)')).toBe(7);
+    expect(saleTargetPct('orphan recovery')).toBeNull();
+    expect(saleTargetPct(undefined)).toBeNull();
+  });
+
+  it('keeps excluding while the sale still agrees with the target', () => {
+    const r = rebuyGuardExclusions([sell('A', 5, 'rebalance: 9.0% → 7.0% (static)')], 30, new Map([['A', 7]]), now);
+    expect([...r.excluded]).toEqual(['A']);
+  });
+
+  it('lifts the guard once the model has raised the target past what the sale aimed at', () => {
+    const r = rebuyGuardExclusions([sell('A', 5, 'rebalance: 9.0% → 7.0% (static)')], 30, new Map([['A', 8]]), now);
+    expect(r.excluded.size).toBe(0);
+    expect(r.lifted).toEqual([{ symbol: 'A', soldTo: 7, targetNow: 8 }]);
+  });
+
+  it('an unreadable sale keeps the conservative exclusion; expired sales and 0 days exclude nothing', () => {
+    expect([...rebuyGuardExclusions([sell('A', 5, 'manual')], 30, new Map([['A', 50]]), now).excluded]).toEqual(['A']);
+    expect(rebuyGuardExclusions([sell('A', 31, 'manual')], 30, new Map(), now).excluded.size).toBe(0);
+    expect(rebuyGuardExclusions([sell('A', 5, 'manual')], 0, new Map(), now).excluded.size).toBe(0);
+  });
+
+  it('the latest sale of a name decides', () => {
+    const r = rebuyGuardExclusions([
+      sell('A', 20, 'manual'),
+      sell('A', 2, 'rebalance: 9.0% → 7.0% (static)'),
+    ], 30, new Map([['A', 8]]), now);
+    expect(r.excluded.size).toBe(0);
+  });
+});
+
+describe('greedy half-share rule (F4)', () => {
+  it('does not buy a share for a deficit under half its price', () => {
+    const prices = new Map([['A', 1000], ['B', 5000]]); // B unaffordable: only A competes
+    // Portfolio 10k after deposit; A target 10% (1,000) holding 700 → deficit 300 < 500.
+    const holdings = [
+      { symbol: 'A', currentValue: 700, targetPct: 10 },
+      { symbol: 'B', currentValue: 8_300, targetPct: 90 },
+    ];
+    const legacy = allocateCashFlow(holdings, 1_000, 100, prices, undefined, 'greedy');
+    expect(legacy.find(o => o.symbol === 'A')).toBeDefined(); // overshoots A by $700
+    const half = allocateCashFlow(holdings, 1_000, 100, prices, undefined, 'greedy', 0.5);
+    expect(half).toEqual([]);
+  });
+});
