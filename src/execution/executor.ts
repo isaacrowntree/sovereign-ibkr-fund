@@ -16,8 +16,10 @@
  *   - A confirmation timeout is NOT requeued — the order may still be
  *     working at IBKR, and a requeue would double-trade. The strategist
  *     rebuilds the queue from live positions, which reconciles it.
- *   - A failed submission IS requeued (nothing reached IBKR) but still
- *     halts the run.
+ *   - A submission with no usable answer (timeout, 5xx, no order id) is
+ *     looked up by its cOID; found → confirmed as usual, not found → dropped
+ *     and never re-placed, and the run halts. A submission that provably
+ *     never went live (a refused confirmation prompt) stays queued.
  *   - Once halted, no further order is placed; the untouched remainder
  *     requeues verbatim.
  */
@@ -30,6 +32,8 @@ import { computeShortfall, type ShortfallResult } from './shortfall.js';
 import { selectExecutionStrategy, selectUrgency, type AlgoPriority, type ExecutionPlan as AlgoPlan } from './algo-orders.js';
 import { planExecution, gateBuysByCash, type StagedOrder } from './staging.js';
 import { orderCapViolation, type NotionalCaps } from '../risk/data-sanity.js';
+import { RUN_BUDGET_MARGIN_MS } from './kill-switches.js';
+import { isWorkingOrder, DEFAULT_INACTIVE_WORKING_MS } from './order-status.js';
 
 export interface ExecutorContext {
   /** Has a live fill ever been confirmed? False → validation mode. */
@@ -56,6 +60,14 @@ export interface ExecutorContext {
    * breaches them halts the run. Omit to disable (tests).
    */
   caps?: NotionalCaps;
+  /**
+   * Short id for this run. When present every placement carries a unique cOID
+   * `${runId}-${symbol}-${side}-${attempt}`, which is how an order whose
+   * placement timed out is found again. Omit → no cOIDs (tests).
+   */
+  runId?: string;
+  /** How long an `Inactive` order still counts as working (order-status.ts). Default 6 h. */
+  inactiveWorkingMs?: number;
 }
 
 export interface ExecutorDeps {
@@ -64,7 +76,15 @@ export interface ExecutorDeps {
     order: StagedOrder,
     strategy: AlgoPlan['strategy'],
     urgency: AlgoPriority,
+    /** cOID for this placement (see ExecutorContext.runId); undefined when there is no runId. */
+    clientOrderId?: string,
   ): Promise<TradeResult>;
+  /**
+   * Find an order by the cOID it was placed with, after a placement whose
+   * answer never came back. Null = not found, which is NOT proof it was never
+   * placed. Optional: absent → an ambiguous placement is dropped unlooked-up.
+   */
+  findOrderByRef?(clientOrderId: string): Promise<{ orderId: number; status: string } | null>;
   /**
    * Wait for the order's terminal state on the event stream, asking IBKR's
    * executions along the way (`probe`) so a dead stream does not cost the
@@ -116,7 +136,12 @@ export interface ExecutorDeps {
    * placing a duplicate for a symbol+side that already has a live order — the
    * central guard against cross-run duplicates. Optional: absent → no guard.
    */
-  getLiveOrders?(): Promise<Array<{ symbol: string; action: 'BUY' | 'SELL'; status: string }>>;
+  getLiveOrders?(): Promise<Array<{ symbol: string; action: 'BUY' | 'SELL'; status: string; ageMs?: number }>>;
+  /**
+   * Persist a cancel the moment it is requested, so it is resolved next run
+   * even if this one dies. Optional (tests may omit).
+   */
+  recordCancelPending?(req: CancelRequest): void;
   /**
    * Persist the still-to-do queue after every terminal order outcome, so a
    * crash/kill/exception mid-run leaves only UNEXECUTED orders on disk instead
@@ -132,6 +157,18 @@ export interface ExecutorDeps {
    * when absent the window is treated as always open (tests, backfills).
    */
   isWindowOpen?(): boolean;
+  /**
+   * Anything else that must stop placement mid-run, checked before every
+   * order: returns why, or null to carry on. Wired to the run lock (a run that
+   * lost its lease must not keep placing). Optional.
+   */
+  placementBlocker?(): string | null;
+  /**
+   * Milliseconds left in this run's budget (RUN_BUDGET_SEC). An order is only
+   * placed when its fill wait plus a margin still fits; otherwise the run
+   * stops cleanly and the rest stays queued. Optional: absent → no budget.
+   */
+  timeRemainingMs?(): number;
   log(message: string): void;
   logError(message: string, err: unknown): void;
 }
@@ -151,7 +188,7 @@ export interface ExecutorDeps {
  * see post-run NAV/cash) do the telling.
  */
 export interface ExecutionAnomaly {
-  kind: 'ledger-diverged' | 'fill-recovered' | 'stream-silent';
+  kind: 'ledger-diverged' | 'fill-recovered' | 'stream-silent' | 'order-refused' | 'placement-unknown';
   symbol: string;
   detail: string;
   orderId?: string | number;
@@ -177,6 +214,12 @@ export interface ExecutionOutcome {
   executed: StagedOrder[];
   halted: boolean;
   haltReason: string;
+  /**
+   * Set when the run stopped placing for an ordinary reason — its time budget
+   * ran out — rather than a fault. Not a halt: nothing went wrong, the rest of
+   * the queue simply waits for the next run.
+   */
+  stoppedReason?: string;
   /** At least one fill was confirmed (or acceptance-trusted on opt-out). */
   confirmedFill: boolean;
   /** True when a validation run ended without a confirmed fill. */
@@ -185,15 +228,24 @@ export interface ExecutionOutcome {
   washSales: WashSaleEntry[];
   /** Correctness events worth a human's attention. See ExecutionAnomaly. */
   anomalies: ExecutionAnomaly[];
+  /** Cancels requested this run, to be confirmed on a later one. */
+  cancelRequests: CancelRequest[];
 }
 
-/** CPAPI order statuses that mean the order is no longer working. */
-const TERMINAL_ORDER_STATUSES = new Set(['filled', 'cancelled', 'inactive', 'rejected']);
-
-/** Is a live order still working (could still fill) vs terminal? */
-function isWorkingOrder(status: string): boolean {
-  const s = status.toLowerCase().replace(/[^a-z]/g, '');
-  return !TERMINAL_ORDER_STATUSES.has(s);
+/**
+ * A cancel we asked IBKR for and have not yet seen take effect. Persisted
+ * (state `cancelPending`) the moment it is requested, and resolved on a later
+ * run against the live orders — see cancel-pending.ts. Until then the order
+ * is treated as possibly still working.
+ */
+export interface CancelRequest {
+  orderId: number;
+  symbol: string;
+  action: 'BUY' | 'SELL';
+  requestedAt: string;
+  reason: string;
+  /** Whether the DELETE itself went through (it can fail; the order still needs resolving). */
+  requestOk: boolean;
 }
 
 export async function executeQueue(
@@ -224,6 +276,7 @@ export async function executeQueue(
   let confirmedFill = false;
   let halted = false;
   let haltReason = '';
+  let stoppedReason: string | undefined;
   let runNotional = 0; // cumulative USD notional placed this run (for the per-run cap)
   let avgCosts = new Map<string, number>(); // per-symbol avg cost, fetched at run start
 
@@ -264,14 +317,25 @@ export async function executeQueue(
    * strategist from regenerating the same order and double-trading it. Never
    * throws — a failed cancel just leaves the pre-existing risk in place.
    */
-  const cancelUnknown = async (orderId: number, symbol: string): Promise<void> => {
+  const cancelRequests: CancelRequest[] = [];
+  const cancelUnknown = async (orderId: number, order: StagedOrder, reason: string): Promise<void> => {
     if (!deps.cancelOrder) return;
+    let requestOk = false;
     try {
       await deps.cancelOrder(orderId);
-      deps.log(`Cancel requested for unconfirmed orderId=${orderId} (${symbol})`);
+      requestOk = true;
+      deps.log(`Cancel requested for orderId=${orderId} (${order.symbol}): ${reason}`);
     } catch (err) {
-      deps.logError(`Best-effort cancel failed for orderId=${orderId} (${symbol})`, err);
+      deps.logError(`Best-effort cancel failed for orderId=${orderId} (${order.symbol})`, err);
     }
+    // A cancel is a request, not a result: record it either way, and let a
+    // later run see whether the order actually stopped.
+    const req: CancelRequest = {
+      orderId, symbol: order.symbol, action: order.action,
+      requestedAt: new Date().toISOString(), reason, requestOk,
+    };
+    cancelRequests.push(req);
+    try { deps.recordCancelPending?.(req); } catch (e) { deps.logError('Could not persist cancelPending', e); }
   };
 
   /**
@@ -409,8 +473,9 @@ export async function executeQueue(
   if (deps.getLiveOrders && plan.orders.length > 0) {
     try {
       const live = await deps.getLiveOrders();
+      const inactiveMax = ctx.inactiveWorkingMs ?? DEFAULT_INACTIVE_WORKING_MS;
       for (const lo of live) {
-        if (isWorkingOrder(lo.status)) working.add(`${lo.action}:${lo.symbol}`);
+        if (isWorkingOrder(lo.status, lo.ageMs, inactiveMax)) working.add(`${lo.action}:${lo.symbol}`);
       }
       if (working.size > 0) {
         deps.log(`Working orders already at IBKR (won't duplicate): ${[...working].join(', ')}`);
@@ -433,6 +498,7 @@ export async function executeQueue(
         shortfalls,
         washSales,
         anomalies,
+        cancelRequests,
       };
     }
   }
@@ -518,16 +584,68 @@ export async function executeQueue(
       return; // NOT halted — the order actually succeeded
     }
     if (filledQty === 0) {
-      await cancelUnknown(orderId, order.symbol);
+      await cancelUnknown(orderId, order, reason);
     } else {
-      deps.log(`${order.symbol}: partial ${filledQty}/${order.qty} per executions — remainder unknown, halting.`);
+      // The remainder may still be working. Cancel it: an order we have
+      // dropped from the queue must not go on filling unwatched.
+      deps.log(`${order.symbol}: partial ${filledQty}/${order.qty} per executions — cancelling the remainder, halting.`);
+      await cancelUnknown(orderId, order, `partial ${filledQty}/${order.qty} after '${reason}' — remainder cancelled`);
     }
     halt(`${reason} (${order.symbol})`);
   };
 
+  // cOID attempt counter per side+symbol, so a second placement of the same
+  // name in one run (a remainder) still gets an id IBKR has never seen.
+  const attempts = new Map<string, number>();
+  const nextClientOrderId = (order: StagedOrder): string | undefined => {
+    if (!ctx.runId) return undefined;
+    const k = `${order.action}:${order.symbol}`;
+    const n = (attempts.get(k) ?? 0) + 1;
+    attempts.set(k, n);
+    return `${ctx.runId}-${order.symbol}-${order.action}-${n}`;
+  };
+
+  /**
+   * A placement with no usable answer (timeout, 5xx, no order id) may still
+   * have gone live. Look it up by its cOID; found → carry on as if the answer
+   * had arrived. Not found → the state is unknown: never place it again this
+   * run (the caller drops it and halts), and say so loudly.
+   */
+  const recoverAmbiguous = async (
+    order: StagedOrder,
+    clientOrderId: string | undefined,
+    why: string,
+  ): Promise<TradeResult | null> => {
+    if (!clientOrderId || !deps.findOrderByRef) return null;
+    deps.log(`${order.symbol}: ${why} — looking the order up by cOID ${clientOrderId}…`);
+    let found: { orderId: number; status: string } | null = null;
+    try {
+      deps.onPhase?.(`lookup:${order.symbol}`);
+      found = await deps.findOrderByRef(clientOrderId);
+    } catch (e) {
+      deps.logError(`Lookup by cOID ${clientOrderId} failed`, e);
+    }
+    if (found && found.orderId > 0) {
+      deps.log(`${order.symbol}: found at IBKR as orderId=${found.orderId} (${found.status}) — confirming as usual`);
+      return { orderId: found.orderId, symbol: order.symbol, action: order.action, qty: order.qty, status: found.status };
+    }
+    anomalies.push({
+      kind: 'placement-unknown',
+      symbol: order.symbol,
+      detail:
+        `${order.action} ${order.qty} ${order.symbol}: ${why}, and no order with cOID ${clientOrderId} turned up at IBKR. ` +
+        'It may still be live. It was dropped from the queue and will not be placed again; the next run\'s ' +
+        'working-order guard and position check will catch it if it went through.',
+    });
+    return null;
+  };
+
+  /** Longest this run may wait for one order's fill (Patient 180s, else 60s). */
+  const fillWaitMs = (urgency: AlgoPriority): number => (urgency === 'Patient' ? 180_000 : 60_000);
+
   const executeBatch = async (batch: StagedOrder[]): Promise<void> => {
     for (const order of batch) {
-      if (halted) return;
+      if (halted || stoppedReason) return;
 
       // Re-check the trading window before every placement: a full queue of
       // Patient orders can take longer than the window is open, and we must
@@ -535,6 +653,13 @@ export async function executeQueue(
       if (deps.isWindowOpen && !deps.isWindowOpen()) {
         deps.log(`Execution window closed mid-run before ${order.symbol} — halting; ${remaining.length} order(s) stay queued`);
         halt('execution window closed mid-run');
+        return;
+      }
+
+      const blocked = deps.placementBlocker?.() ?? null;
+      if (blocked) {
+        deps.log(`Placement blocked before ${order.symbol}: ${blocked} — halting; ${remaining.length} order(s) stay queued`);
+        halt(blocked);
         return;
       }
 
@@ -563,37 +688,73 @@ export async function executeQueue(
 
       const strategy = selectExecutionStrategy(order.estimatedValue, ctx.nav);
       const urgency = selectUrgency(false, true, ctx.regime);
+
+      // Run budget: never place an order whose confirmation might still be
+      // waiting when the orchestrator kills the run — that leaves a live order
+      // with nothing recorded. Stop instead; it places next run.
+      if (deps.timeRemainingMs) {
+        const left = deps.timeRemainingMs();
+        const need = (useFillConfirmer ? fillWaitMs(urgency) : 0) + RUN_BUDGET_MARGIN_MS;
+        if (left < need) {
+          stoppedReason = `run budget: ${Math.max(0, Math.round(left / 1000))}s left, ${order.symbol} needs up to ${need / 1000}s`;
+          deps.log(`Stopping before ${order.symbol} — ${stoppedReason}; ${remaining.length} order(s) stay queued for the next run`);
+          return;
+        }
+      }
+
       const decisionPrice = order.estimatedValue / order.qty;
       deps.log(`${order.action} ${order.qty} ${order.symbol} via ${strategy} (${urgency}) — ${order.reason}`);
 
+      const clientOrderId = nextClientOrderId(order);
       let result: TradeResult;
       try {
         deps.onPhase?.(`placing:${order.symbol}`);
-        result = await deps.placeOrder(order, strategy, urgency);
+        result = await deps.placeOrder(order, strategy, urgency, clientOrderId);
       } catch (err) {
         deps.logError(`Order submission failed: ${order.action} ${order.qty} ${order.symbol}`, err);
-        // AMBIGUOUS: a client-side timeout / 5xx can occur AFTER IBKR accepted
-        // the order (placement is non-idempotent — no client order id), so
-        // requeueing verbatim risks a duplicate. Drop it and halt. Next run's
-        // idempotency guard skips it if it went live; else the strategist
-        // regenerates it from positions.
-        drop(order);
-        halt(`order submission failed (${order.symbol})`);
-        continue;
+        if ((err as { notPlaced?: unknown } | null)?.notPlaced === true) {
+          // PROVABLY not placed (a confirmation prompt was refused under
+          // REPLY_POLICY=enforce): nothing reached IBKR, so the order stays
+          // queued. Halt — the prompt means something is wrong that a human
+          // should look at before anything else is placed.
+          const msg = err instanceof Error ? err.message : String(err);
+          anomalies.push({ kind: 'order-refused', symbol: order.symbol, detail: msg });
+          halt(`order not placed (${order.symbol}): confirmation prompt refused`);
+          continue;
+        }
+        // An explicit IBKR rejection is definite: the order is not live, and
+        // retrying verbatim just rejects again. Drop, halt.
+        const rejected = (err as { rejected?: unknown } | null)?.rejected === true;
+        // Otherwise AMBIGUOUS: a timeout / 5xx can arrive AFTER IBKR accepted
+        // the order, so requeueing verbatim risks a duplicate. Look it up by
+        // cOID; if it can't be found, drop it and halt. Next run's idempotency
+        // guard skips it if it went live; else the strategist regenerates it.
+        const found = rejected
+          ? null
+          : await recoverAmbiguous(order, clientOrderId, `submission failed (${err instanceof Error ? err.message : String(err)})`);
+        if (!found) {
+          drop(order);
+          halt(`order submission failed (${order.symbol})`);
+          continue;
+        }
+        result = found;
       }
 
-      // An accepted response with no usable orderId (gateway coerces a
-      // missing/unparseable CPAPI order_id — e.g. a confirmation prompt — to
-      // 0) means we can neither confirm nor safely retry. Drop, halt.
+      // An accepted response with no usable orderId means we can neither
+      // confirm nor safely retry. Look it up by cOID, else drop and halt.
       if (!result.orderId || result.orderId <= 0) {
         deps.logError(
           `Order accepted with no usable orderId (${order.action} ${order.qty} ${order.symbol}) — ` +
-            `cannot confirm; dropping (idempotency guard catches it if live). Halting run.`,
+            `cannot confirm without finding it.`,
           undefined,
         );
-        drop(order);
-        halt(`no usable orderId (${order.symbol})`);
-        continue;
+        const found = await recoverAmbiguous(order, clientOrderId, 'accepted with no usable orderId');
+        if (!found) {
+          drop(order);
+          halt(`no usable orderId (${order.symbol})`);
+          continue;
+        }
+        result = found;
       }
 
       // The order reached IBKR — count it toward the per-run notional cap.
@@ -608,7 +769,7 @@ export async function executeQueue(
       let provenance: FillProvenance = {};
 
       if (useFillConfirmer) {
-        const timeoutMs = urgency === 'Patient' ? 180_000 : 60_000;
+        const timeoutMs = fillWaitMs(urgency);
         let conf: FillConfirmation;
         try {
           deps.onPhase?.(`confirming:${order.symbol}`);
@@ -677,12 +838,16 @@ export async function executeQueue(
             );
             drop(order);
             recordExecuted(order, actualFilledQty, actualFillPrice, actualStatus, result, provenance);
-            await cancelUnknown(result.orderId, order.symbol);
+            await cancelUnknown(result.orderId, order, `partial ${conf.totalFilledQty}/${order.qty}, confirmation timed out`);
             halt(`partial fill timed out (${order.symbol})`);
             continue;
           }
           // Terminal partial: the remainder stays queued, estimatedValue
           // scaled to the remaining shares so the next run sizes it right.
+          // Cancel the original first — if its remainder is in fact still
+          // working, the requeued copy would double it. The cancel is resolved
+          // next run, and until then the working-order guard sees it.
+          await cancelUnknown(result.orderId, order, `partial ${conf.totalFilledQty}/${order.qty} — remainder requeued`);
           const perShare = order.estimatedValue / order.qty;
           remainder = {
             ...order,
@@ -711,7 +876,7 @@ export async function executeQueue(
 
   // Buys stay in `remaining` until executed/deferred, so a halt before this
   // point leaves them queued automatically.
-  if (buys.length > 0 && !halted) {
+  if (buys.length > 0 && !halted && !stoppedReason) {
     // Cash gate: fetch USD cash after the sells so their proceeds count.
     let cash: number | undefined;
     try {
@@ -758,10 +923,12 @@ export async function executeQueue(
     executed,
     halted,
     haltReason,
+    stoppedReason,
     confirmedFill,
-    validationFailed: plan.mode === 'validate' && !confirmedFill,
+    validationFailed: plan.mode === 'validate' && !confirmedFill && !stoppedReason,
     shortfalls,
     washSales,
     anomalies,
+    cancelRequests,
   };
 }

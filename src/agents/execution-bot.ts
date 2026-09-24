@@ -20,21 +20,27 @@ import {
   placeMarketOrder,
   placeAdaptiveOrder,
   placeMidpriceOrder,
+  findOrderByRef,
   type TradeResult,
   type AdaptivePriority,
+  type OrderReply,
 } from '../connection/gateway.js';
-import { executeQueue, type ExecutorDeps } from '../execution/executor.js';
+import { executeQueue, type ExecutorDeps, type CancelRequest } from '../execution/executor.js';
+import { resolveCancelPending } from '../execution/cancel-pending.js';
+import { inactiveWorkingMs } from '../execution/order-status.js';
 import { reconcileExecutions } from '../execution/reconcile.js';
 import { recoverOrphanedFills } from '../execution/orphan-recovery.js';
 import {
   startRun, enterPhase, recordSignal, describeAbandonedRun, RUN_STALE_MS,
   type RunPhase,
 } from '../observability/run-recorder.js';
-import type { StagedOrder } from '../execution/staging.js';
+import { createRunLock, runLeaseMs, type RunLock } from '../execution/run-lock.js';
+import { partitionExpired, stagedOrderTtlMs, type StagedOrder } from '../execution/staging.js';
 import type { AlgoPriority, ExecutionPlan as AlgoPlan } from '../execution/algo-orders.js';
-import { isExecutionWindow, describeWindow, EXECUTION_WINDOW } from '../strategy/market-hours.js';
+import { isExecutionWindow, describeWindow, EXECUTION_WINDOW, calendarCoverage, calendarFailOpen } from '../strategy/market-hours.js';
+import { executionDisabledReason, runBudgetMs } from '../execution/kill-switches.js';
 import { confirmFill } from '../observability/fill-confirmer.js';
-import { loadState, mergeState, appendTrade, loadTradeHistory } from '../state/store.js';
+import { loadState, loadStateKey, mergeState, appendTrade, loadTradeHistory } from '../state/store.js';
 import type { WashSaleEntry } from '../tax/harvesting.js';
 import { alert, notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
@@ -64,7 +70,7 @@ const usd = (n: number): string => `$${n.toLocaleString('en-US', { maximumFracti
 async function reportRun(outcome: ExecutionOutcome, runAt: string): Promise<void> {
   // Anomalies first, individually: these are correctness events, not volume.
   for (const a of outcome.anomalies) {
-    const isDivergence = a.kind === 'ledger-diverged';
+    const isDivergence = a.kind === 'ledger-diverged' || a.kind === 'placement-unknown';
     await notify(
       {
         severity: isDivergence ? 'critical' : 'warn',
@@ -72,7 +78,11 @@ async function reportRun(outcome: ExecutionOutcome, runAt: string): Promise<void
           ? `Ledger diverged from IBKR — ${a.symbol}`
           : a.kind === 'stream-silent'
             ? 'Order event stream is silent — fills confirmed from executions instead'
-            : `Fill recovered from IBKR — ${a.symbol}`,
+            : a.kind === 'order-refused'
+              ? `Order not placed — IBKR confirmation prompt refused (${a.symbol})`
+              : a.kind === 'placement-unknown'
+                ? `Order state unknown — placement unanswered and not found (${a.symbol})`
+                : `Fill recovered from IBKR — ${a.symbol}`,
         body: a.detail,
         fields: [
           { label: 'Symbol', value: a.symbol },
@@ -103,6 +113,7 @@ async function reportRun(outcome: ExecutionOutcome, runAt: string): Promise<void
     { label: 'Notional', value: usd(notional) },
     ...(avgBps !== null ? [{ label: 'Avg shortfall', value: `${avgBps.toFixed(1)} bps` }] : []),
     ...(outcome.requeue.length ? [{ label: 'Still queued', value: String(outcome.requeue.length) }] : []),
+    ...(outcome.stoppedReason ? [{ label: 'Stopped', value: outcome.stoppedReason }] : []),
   ];
 
   if (outcome.validationFailed) {
@@ -171,16 +182,16 @@ const RISK_STALE_MS = (() => {
 })();
 
 /**
- * A run holds the queue in memory and only writes back at the end, so two
- * overlapping runs would double-place. Paperclip already serialises heartbeat
- * runs per agent; this state-file lock is defence-in-depth against a manual
- * invocation overlapping a scheduled run. Considered stale after this long
- * (longer than the worst-case run of 10 Patient confirmations).
+ * Two overlapping runs would double-place, so a run holds a lease on
+ * `executionRunLock` (see execution/run-lock.ts): compare-and-set to take it,
+ * a heartbeat to keep it, and a run that stops renewing loses it within
+ * RUN_LEASE_SEC. Paperclip already serialises heartbeat runs per agent; this is
+ * defence-in-depth against a manual invocation overlapping a scheduled run.
  *
  * The lock doubles as the flight recorder: it carries the phase the run is in,
  * so a run that is killed leaves behind WHERE it died. See run-recorder.ts.
  */
-const RUN_LOCK_STALE_MS = RUN_STALE_MS;
+let runLock: RunLock | null = null;
 
 /**
  * The live run's breadcrumb. Module-scoped because the signal handlers need to
@@ -190,10 +201,10 @@ let runPhase: RunPhase | null = null;
 
 /** Persist where we are, so a SIGKILL still leaves the phase on disk. */
 function phase(name: string): void {
-  if (!runPhase) return;
+  if (!runPhase || !runLock) return;
   runPhase = enterPhase(runPhase, name, new Date(), process.memoryUsage().rss);
   try {
-    mergeState({ executionRunLock: runPhase });
+    runLock.update({ ...runPhase });
   } catch (e) {
     logError('Could not persist run phase', e, AGENT);
   }
@@ -211,7 +222,7 @@ function watchForShutdown(): void {
       log(`Received ${sig} during "${runPhase?.phase ?? 'unknown'}" — recording before exit`, AGENT);
       if (runPhase) {
         runPhase = recordSignal(runPhase, sig, new Date());
-        try { mergeState({ executionRunLock: runPhase }); } catch { /* best effort */ }
+        try { runLock?.update({ ...runPhase }); } catch { /* best effort */ }
       }
       process.exit(143);
     });
@@ -220,7 +231,7 @@ function watchForShutdown(): void {
     logError(`Uncaught exception during "${runPhase?.phase ?? 'unknown'}"`, e, AGENT);
     if (runPhase) {
       runPhase = recordSignal(runPhase, `uncaughtException: ${e instanceof Error ? e.message : String(e)}`, new Date());
-      try { mergeState({ executionRunLock: runPhase }); } catch { /* best effort */ }
+      try { runLock?.update({ ...runPhase }); } catch { /* best effort */ }
     }
     process.exit(1);
   });
@@ -229,11 +240,33 @@ function watchForShutdown(): void {
   });
 }
 
+/** Most recent confirmation prompts kept in state (`orderReplyLog`). */
+const REPLY_LOG_CAP = 200;
+
+/**
+ * Keep every confirmation prompt IBKR raised, with its ids and full text. This
+ * is what REPLY_POLICY=log exists for: a couple of weeks of real prompts is how
+ * the allowlist gets its missing ids before REPLY_POLICY=enforce.
+ */
+function recordReplies(order: StagedOrder, replies: OrderReply[] | undefined): void {
+  if (!replies?.length) return;
+  try {
+    const prior = loadStateKey('orderReplyLog');
+    const kept = Array.isArray(prior) ? prior : [];
+    const rows = replies.map(r => ({ ...r, symbol: order.symbol, action: order.action }));
+    mergeState({ orderReplyLog: [...kept, ...rows].slice(-REPLY_LOG_CAP) });
+  } catch (e) {
+    logError('Could not record order confirmation prompts', e, AGENT);
+  }
+}
+
 async function placeOrder(
   order: StagedOrder,
   strategy: AlgoPlan['strategy'],
   urgency: AlgoPriority,
+  cOID?: string,
 ): Promise<TradeResult> {
+  const opts = cOID ? { cOID } : undefined;
   // Wire the execution strategy. CPAPI passthrough doesn't have a tested
   // TWAP/VWAP path, so those route to Adaptive(Patient) which gives a
   // similar slippage profile for retail-size orders. MIDPRICE is currently
@@ -241,28 +274,73 @@ async function placeOrder(
   // we want to be very passive.
   switch (strategy) {
     case 'adaptive':
-      return placeAdaptiveOrder(order.symbol, order.action, order.qty, urgency as AdaptivePriority);
+      return placeAdaptiveOrder(order.symbol, order.action, order.qty, urgency as AdaptivePriority, opts);
     case 'twap':
     case 'vwap':
       log(`${strategy.toUpperCase()} not yet wired in CPAPI passthrough — using Adaptive(Patient) instead`, AGENT);
-      return placeAdaptiveOrder(order.symbol, order.action, order.qty, 'Patient');
+      return placeAdaptiveOrder(order.symbol, order.action, order.qty, 'Patient', opts);
     case 'limit':
-      return placeMidpriceOrder(order.symbol, order.action, order.qty);
+      return placeMidpriceOrder(order.symbol, order.action, order.qty, opts);
     case 'market':
     default:
-      return placeMarketOrder(order.symbol, order.action, order.qty);
+      return placeMarketOrder(order.symbol, order.action, order.qty, opts);
   }
 }
 
+/** A position's quantity, or a throw when the broker did not give a usable one. */
+function requireQty(p: { symbol: string; qty: unknown; qtyMissing?: true }): number {
+  if (p.qtyMissing || typeof p.qty !== 'number' || !Number.isFinite(p.qty)) {
+    throw new Error(`position ${p.symbol} has no usable quantity from IBKR`);
+  }
+  return p.qty;
+}
+
+/** Regime labels quant-analyst writes and selectUrgency understands. */
+const KNOWN_REGIMES = new Set(['risk_on', 'neutral', 'risk_off', 'crisis']);
+
 async function run(): Promise<void> {
   log('Execution check starting', AGENT);
+  // The run budget counts from here: connect, reconcile and recovery all spend it.
+  const runStartedAt = Date.now();
+  const budgetMs = runBudgetMs();
 
   const state = loadState();
   const pendingOrders = (state.pendingOrders || []) as StagedOrder[];
+  const cancelPending = (Array.isArray(state.cancelPending) ? state.cancelPending : []) as CancelRequest[];
 
-  if (pendingOrders.length === 0) {
+  // A cancel from an earlier run still needs confirming even with nothing queued.
+  if (pendingOrders.length === 0 && cancelPending.length === 0) {
     log('No pending orders', AGENT);
     return;
+  }
+
+  // Global kill switch — env or the hub's toggle. Checked again before every
+  // order (placementBlocker below), so flipping it mid-run stops the next one.
+  const disabled = executionDisabledReason(process.env, state.executionEnabled);
+  if (disabled) {
+    log(`${pendingOrders.length} pending order(s) but ${disabled} — queue untouched`, AGENT);
+    return;
+  }
+
+  // The holiday table is finite. Past its end the window is a plain weekday
+  // check again (or closed, with CALENDAR_FAIL_OPEN=0) — say so, once a day.
+  const coverage = calendarCoverage(new Date());
+  if (!coverage.covered) {
+    log(`NYSE calendar ends ${coverage.validThrough} — holidays are no longer known`, AGENT);
+    await notify(
+      {
+        severity: 'warn',
+        title: 'NYSE holiday calendar has run out',
+        body:
+          `src/strategy/nyse-calendar.json covers dates up to ${coverage.validThrough}. Until it is extended ` +
+          (calendarFailOpen()
+            ? 'execution treats every weekday as a regular session, holidays included.'
+            : 'execution is closed on every day the table does not cover (CALENDAR_FAIL_OPEN=0).'),
+        agent: AGENT,
+        dedupe: { key: 'exec:calendar-expired', fingerprint: coverage.validThrough },
+      },
+      storeHooks,
+    );
   }
 
   // Trading window: skip the first 30 min after open (high volatility, wide
@@ -279,25 +357,35 @@ async function run(): Promise<void> {
     return;
   }
 
-  // Defence-in-depth run lock: refuse to start if another run is holding the
-  // lock and it isn't stale.
-  const existingLock = state.executionRunLock as RunPhase | undefined;
-  if (existingLock && Date.now() - new Date(existingLock.at).getTime() < RUN_LOCK_STALE_MS) {
+  // Defence-in-depth run lock: take the lease, or refuse to start if another
+  // run holds a live one. A lock from the previous build ({at, pid}, no lease)
+  // is honoured by the old 35-minute rule so a deploy mid-run is safe.
+  runPhase = startRun(new Date(), process.pid, process.memoryUsage().rss);
+  runLock = createRunLock({
+    leaseMs: runLeaseMs(),
+    legacyStaleMs: RUN_STALE_MS,
+    onError: (msg, err) => logError(msg, err, AGENT),
+  });
+  const lease = runLock.acquire({ ...runPhase });
+  if (!lease.acquired) {
+    const other = lease.previous as Partial<RunPhase> & { leaseUntil?: string } | null;
     log(
-      `Another execution run holds the lock (pid ${existingLock.pid}, since ${existingLock.at}) — skipping to avoid double-execution`,
+      `Another execution run holds the lock (since ${other?.at ?? '?'}, lease until ${other?.leaseUntil ?? 'n/a'}) — ` +
+        'skipping to avoid double-execution',
       AGENT,
     );
+    runLock = null;
+    runPhase = null;
     return;
   }
 
   // The previous run left a lock behind, which means it was killed rather than
   // finishing — the `finally` that releases it never ran. It cannot report its
   // own death, so we report it: this is the only place the cause ever surfaces.
-  const postMortem = describeAbandonedRun(
-    existingLock ?? null,
-    new Date(),
-    (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } },
-  );
+  // Its lease had lapsed (or we could not have taken it), so it is not alive
+  // whatever its pid now points at.
+  const existingLock = (lease.previous ?? null) as RunPhase | null;
+  const postMortem = describeAbandonedRun(existingLock, new Date(), () => false);
   if (postMortem) {
     log(postMortem.detail, AGENT);
     await notify(
@@ -319,8 +407,6 @@ async function run(): Promise<void> {
   }
 
   watchForShutdown();
-  runPhase = startRun(new Date(), process.pid, process.memoryUsage().rss);
-  mergeState({ executionRunLock: runPhase });
 
   // Floor for fill-confirmation event matching: only consider order events
   // at/after the cursor the observer has already reached, so a recycled
@@ -338,6 +424,38 @@ async function run(): Promise<void> {
     phase('connect');
     await connect();
     connected = true;
+
+    // Cancels earlier runs requested: did they take? Resolved before anything
+    // is placed, so the working-order guard below sees any that did not.
+    if (cancelPending.length > 0) {
+      phase('cancel-pending');
+      const r = await resolveCancelPending(cancelPending, {
+        getLiveOrders: () => getLiveOrders(),
+        cancelOrder: (id) => cancelOrder(id),
+        log: (m) => log(m, AGENT),
+        logError: (m, e) => logError(m, e, AGENT),
+      }, inactiveWorkingMs());
+      if (r.checked) mergeState({ cancelPending: r.pending });
+      if (r.stuck.length > 0) {
+        const detail = r.stuck.map(c => `${c.action} ${c.symbol} (order ${c.orderId}, asked ${c.requestedAt})`).join(', ');
+        await notify(
+          {
+            severity: 'warn',
+            title: `Cancel not taken — ${r.stuck.length} order${r.stuck.length === 1 ? '' : 's'} still working at IBKR`,
+            body:
+              `A cancel sent on an earlier run has not taken effect: ${detail}. The cancel was sent again. ` +
+              'Until it takes, the order can still fill, and no duplicate will be placed for it.',
+            agent: AGENT,
+            dedupe: { key: 'exec:cancel-stuck', fingerprint: r.stuck.map(c => c.orderId).sort().join(',') },
+          },
+          storeHooks,
+        );
+      }
+    }
+    if (pendingOrders.length === 0) {
+      log('No pending orders (cancel check only)', AGENT);
+      return;
+    }
 
     // Reconcile the ledger against IBKR's authoritative executions BEFORE
     // executing — captures any fill the WS stream missed on a prior run so
@@ -394,7 +512,10 @@ async function run(): Promise<void> {
         pending: queue,
         history: loadTradeHistory(),
         positions: summary.positions.map(p => ({
-          symbol: p.symbol, qty: p.qty ?? 0, avgCost: p.avgCost,
+          // Fail closed: a position without a quantity is not a position of
+          // zero, and reading it as one would "recover" fills that never
+          // happened. Throwing lands in the catch below — session skipped.
+          symbol: p.symbol, qty: requireQty(p), avgCost: p.avgCost,
         })),
         baselineSignature: state.ledgerDriftBaseline as string | undefined,
         now: new Date(),
@@ -499,8 +620,32 @@ async function run(): Promise<void> {
     // next run agree on what drift is already accepted.
     mergeState({ ledgerDriftBaseline: recovery.baseline });
 
+    // Expiry: an order was sized against the book at the time it was staged.
+    // Past STAGED_ORDER_TTL_TRADING_HOURS of trading time that is a guess
+    // about a book that has moved — drop it; the strategist restages from
+    // live positions if the trade is still wanted. Directed deposits and
+    // orders from before createdAt existed never expire.
+    const { live: fresh, expired } = partitionExpired(queue, new Date(), stagedOrderTtlMs());
+    if (expired.length > 0) {
+      queue = fresh;
+      mergeState({ pendingOrders: queue });
+      const detail = expired.map(o => `${o.action} ${o.qty} ${o.symbol} (staged ${o.createdAt})`).join(', ');
+      log(`Dropped ${expired.length} expired order(s): ${detail}`, AGENT);
+      await notify(
+        {
+          severity: 'info',
+          title: `Dropped ${expired.length} stale staged order${expired.length === 1 ? '' : 's'}`,
+          body: `Older than ${stagedOrderTtlMs() / 3_600_000} trading hours, so sized against a book that has moved: ${detail}. ` +
+            'The strategist restages from live positions if the trade is still wanted.',
+          agent: AGENT,
+          dedupe: { key: 'exec:expired-orders', fingerprint: detail },
+        },
+        storeHooks,
+      );
+    }
+
     if (queue.length === 0) {
-      log('Queue was entirely orphaned fills — nothing left to execute', AGENT);
+      log('Queue was entirely orphaned fills or expired orders — nothing left to execute', AGENT);
       mergeState({ lastExecutionAt: new Date().toISOString() });
       return;
     }
@@ -574,8 +719,43 @@ async function run(): Promise<void> {
     phase('usd-balances');
     const startBalances = await getUsdBalances();
 
+    // Fail closed on NAV. It sizes the %-of-NAV order cap and the execution
+    // strategy; the old `|| 100000` fallback meant a missing ledger read
+    // silently sized every check against a made-up fund.
+    if (!(Number.isFinite(startBalances.usdNav) && startBalances.usdNav > 0)) {
+      log(`BLOCKED: USD NAV unreadable (${startBalances.usdNav}) — refusing to size orders against a guess`, AGENT);
+      await notify(
+        {
+          severity: 'warn',
+          title: 'Execution skipped — USD NAV unreadable',
+          body: 'The ledger returned no usable USD NAV, which the order caps are sized against. Nothing was placed; the queue is untouched.',
+          fields: [{ label: 'Queued', value: String(queue.length) }],
+          agent: AGENT,
+          dedupe: { key: 'exec:nav-unreadable', fingerprint: 'nav' },
+        },
+        storeHooks,
+      );
+      return;
+    }
+
+    // Regime only picks the algo urgency (crisis → Urgent, else Patient). An
+    // unknown or missing one gets the patient default, which is the cautious
+    // choice — but say so rather than silently calling it 'neutral'.
+    const rawRegime = (state.regime as { composite?: unknown } | null | undefined)?.composite;
+    const regime = typeof rawRegime === 'string' && KNOWN_REGIMES.has(rawRegime) ? rawRegime : 'unknown';
+    if (regime === 'unknown') log(`Regime unknown (${String(rawRegime)}) — using Patient urgency`, AGENT);
+
     const deps: ExecutorDeps = {
-      placeOrder,
+      placeOrder: async (order, strategy, urgency, cOID) => {
+        try {
+          const result = await placeOrder(order, strategy, urgency, cOID);
+          recordReplies(order, result.replies);
+          return result;
+        } catch (e) {
+          recordReplies(order, (e as { replies?: OrderReply[] } | null)?.replies);
+          throw e;
+        }
+      },
       confirmFill: (orderId, opts) => confirmFill(orderId, opts),
       // Fresh USD cash each call — invoked after the sells so their (unsettled)
       // proceeds are counted.
@@ -584,6 +764,13 @@ async function run(): Promise<void> {
       // Idempotency source: never place a duplicate for a symbol+side already
       // working at IBKR.
       getLiveOrders: () => getLiveOrders(),
+      // Every cancel is persisted as it is sent, and resolved next run.
+      recordCancelPending: (req) => {
+        const prior = loadStateKey('cancelPending');
+        mergeState({ cancelPending: [...(Array.isArray(prior) ? prior : []), req] });
+      },
+      // After a placement with no usable answer: find it by its cOID (~30 s).
+      findOrderByRef: (ref) => findOrderByRef(ref),
       // Authoritative executions — verifies a fill the WS stream missed so it's
       // never lost. Avg costs — fallback cost basis for sells with no FIFO lot.
       getExecutions: () => getExecutions(),
@@ -594,6 +781,17 @@ async function run(): Promise<void> {
       loadTradeHistory,
       appendTrade,
       isWindowOpen: isExecutionWindow,
+      placementBlocker: () => {
+        if (!runLock?.held()) return 'run lock lost (another run took it over)';
+        let flag: unknown;
+        try { flag = loadStateKey('executionEnabled'); } catch (e) {
+          // Can't read the toggle → can't know it is still on. Stop.
+          logError('Could not read executionEnabled', e, AGENT);
+          return 'execution toggle unreadable';
+        }
+        return executionDisabledReason(process.env, flag);
+      },
+      timeRemainingMs: budgetMs > 0 ? () => budgetMs - (Date.now() - runStartedAt) : undefined,
       log: (msg) => log(msg, AGENT),
       logError: (msg, err) => logError(msg, err, AGENT),
       // The window between placing an order and confirming its fill is where
@@ -606,8 +804,8 @@ async function run(): Promise<void> {
       queue,
       {
         validated,
-        nav: startBalances.usdNav || 100000,
-        regime: (state.regime as { composite: string } | null)?.composite || 'neutral',
+        nav: startBalances.usdNav,
+        regime,
         // Fill confirmation via the WS event stream is the default — the
         // synchronous response only proves acceptance, not fills. Set
         // FILL_CONFIRMATION_ENABLED=0 to trust acceptance (never during
@@ -615,6 +813,9 @@ async function run(): Promise<void> {
         fillConfirmationEnabled: (process.env.FILL_CONFIRMATION_ENABLED ?? '1') !== '0',
         cashHeadroomPct: config.execution.cashHeadroomPct,
         ordersCursorFloor,
+        // The lease holder token doubles as the run id: short, random, unique.
+        runId: runLock?.holder,
+        inactiveWorkingMs: inactiveWorkingMs(),
         caps: {
           maxOrderNotionalUsd: config.execution.maxOrderNotionalUsd,
           maxOrderPctNav: config.execution.maxOrderPctNav,
@@ -674,8 +875,9 @@ async function run(): Promise<void> {
   } finally {
     if (connected) disconnect();
     // Always release the run lock — even if connect() threw — so the next
-    // scheduled run can proceed.
-    mergeState({ executionRunLock: null });
+    // scheduled run can proceed. Only our own: a lease we lost is not ours.
+    runLock?.release();
+    runLock = null;
   }
 }
 

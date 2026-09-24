@@ -6,7 +6,16 @@ import {
   describeWindow,
   STRATEGIST_WINDOW,
   EXECUTION_WINDOW,
+  nyseSession,
+  isTradingDay,
+  calendarCoverage,
+  calendarFailOpen,
+  etClock,
+  NYSE_CALENDAR,
+  tradingMsBetween,
 } from './market-hours';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 /**
  * Helper: build a Date that, when formatted in America/New_York, gives
@@ -137,5 +146,129 @@ describe('public helpers', () => {
   it('describeWindow renders human-readable string', () => {
     expect(describeWindow(STRATEGIST_WINDOW)).toBe('09:30-16:00 ET, weekdays');
     expect(describeWindow(EXECUTION_WINDOW)).toBe('10:00-15:45 ET, weekdays');
+  });
+});
+
+describe('NYSE calendar — holidays and early closes', () => {
+  it('Good Friday 2026 is closed all day, both windows', () => {
+    const d = etDate(2026, 4, 3, 11, 0, 'EDT');
+    expect(nyseSession('2026-04-03').kind).toBe('holiday');
+    expect(isInWindow(d, STRATEGIST_WINDOW)).toBe(false);
+    expect(isInWindow(d, EXECUTION_WINDOW)).toBe(false);
+  });
+
+  it('observed holidays close the observed day, not the calendar one', () => {
+    // July 4 2026 is a Saturday → Friday July 3 closed.
+    expect(isInWindow(etDate(2026, 7, 3, 11, 0, 'EDT'), EXECUTION_WINDOW)).toBe(false);
+    // Christmas 2027 is a Saturday → Friday Dec 24 closed.
+    expect(nyseSession('2027-12-24').kind).toBe('holiday');
+    // Juneteenth 2027 is a Saturday → Friday June 18 closed.
+    expect(nyseSession('2027-06-18').kind).toBe('holiday');
+  });
+
+  it('New Year 2028 falls on a Saturday and NYSE observes no holiday for it', () => {
+    expect(nyseSession('2027-12-31').kind).toBe('regular');
+    expect(isInWindow(etDate(2027, 12, 31, 11, 0, 'EST'), EXECUTION_WINDOW)).toBe(true);
+  });
+
+  it('day after Thanksgiving closes at 13:00: execution stops at 12:45, strategist at 13:00', () => {
+    const day = (h: number, m: number) => etDate(2026, 11, 27, h, m, 'EST');
+    expect(nyseSession('2026-11-27')).toMatchObject({ kind: 'early-close', closeMinutes: 13 * 60 });
+    expect(isInWindow(day(12, 44), EXECUTION_WINDOW)).toBe(true);
+    expect(isInWindow(day(12, 45), EXECUTION_WINDOW)).toBe(false);
+    expect(isInWindow(day(12, 59), STRATEGIST_WINDOW)).toBe(true);
+    expect(isInWindow(day(13, 0), STRATEGIST_WINDOW)).toBe(false);
+    expect(isInWindow(day(14, 0), EXECUTION_WINDOW)).toBe(false);
+  });
+
+  it('holidays are looked up by the New York date, not the UTC or Sydney one', () => {
+    // 21:00 ET on Thursday 2026-04-02 is already Friday (Good Friday) in UTC
+    // and Sydney; the ET date is still the Thursday, a regular session.
+    const evening = etDate(2026, 4, 2, 21, 0, 'EDT');
+    expect(evening.getUTCDate()).toBe(3);
+    expect(etClock(evening).date).toBe('2026-04-02');
+    expect(isTradingDay(evening)).toBe(true);
+    expect(isTradingDay(etDate(2026, 4, 3, 10, 0, 'EDT'))).toBe(false);
+  });
+
+  it('every holiday and early close is a weekday, and the two lists do not overlap', () => {
+    for (const d of Object.keys(NYSE_CALENDAR.holidays)) {
+      expect(nyseSession(d).kind, d).toBe('holiday');
+      expect([0, 6]).not.toContain(new Date(`${d}T12:00:00Z`).getUTCDay());
+    }
+    for (const d of Object.keys(NYSE_CALENDAR.earlyCloses)) {
+      expect(NYSE_CALENDAR.holidays[d as keyof typeof NYSE_CALENDAR.holidays], d).toBeUndefined();
+      expect([0, 6]).not.toContain(new Date(`${d}T12:00:00Z`).getUTCDay());
+    }
+  });
+
+  it('has the ten-ish holidays NYSE publishes per year', () => {
+    const perYear = (y: string) => Object.keys(NYSE_CALENDAR.holidays).filter(d => d.startsWith(y)).length;
+    expect(perYear('2026')).toBe(10);
+    expect(perYear('2027')).toBe(10);
+    expect(perYear('2028')).toBe(9); // no New Year holiday observed in 2028
+  });
+});
+
+describe('NYSE calendar — past the end of the table', () => {
+  const beyond = etDate(2029, 3, 6, 11, 0, 'EST'); // a Tuesday in 2029
+
+  it('an uncovered weekday is unknown, and trades by default (fail open)', () => {
+    expect(nyseSession('2029-03-06').kind).toBe('unknown');
+    expect(calendarCoverage(beyond).covered).toBe(false);
+    expect(isInWindow(beyond, EXECUTION_WINDOW, {})).toBe(true);
+    expect(isTradingDay('2029-03-06', {})).toBe(true);
+  });
+
+  it('CALENDAR_FAIL_OPEN=0 closes every window on an uncovered day', () => {
+    const env = { CALENDAR_FAIL_OPEN: '0' };
+    expect(calendarFailOpen(env)).toBe(false);
+    expect(isInWindow(beyond, EXECUTION_WINDOW, env)).toBe(false);
+    expect(isTradingDay('2029-03-06', env)).toBe(false);
+  });
+
+  it('weekends stay closed past the table whatever the flag says', () => {
+    expect(isTradingDay('2029-03-03', {})).toBe(false);
+  });
+
+  it('the table has at least 90 days left — extend nyse-calendar.json from nyse.com when this fails', () => {
+    const cov = calendarCoverage(new Date());
+    expect(cov.daysLeft, `NYSE calendar runs out on ${cov.validThrough}`).toBeGreaterThanOrEqual(90);
+  });
+});
+
+describe('NYSE calendar — importable without a build step', () => {
+  it('is plain JSON a bare .mjs script can JSON.parse', () => {
+    const raw = JSON.parse(readFileSync(join(__dirname, 'nyse-calendar.json'), 'utf8'));
+    expect(raw.validThrough).toBe(NYSE_CALENDAR.validThrough);
+    expect(Object.keys(raw.holidays).length).toBeGreaterThan(20);
+  });
+});
+
+describe('tradingMsBetween', () => {
+  const H = 3600_000;
+  it('counts only session time: Friday 15:00 to Monday 10:30 ET is 2 h', () => {
+    // 2026-09-18 is a Friday, 2026-09-21 a Monday (EDT).
+    expect(tradingMsBetween(etDate(2026, 9, 18, 15, 0, 'EDT'), etDate(2026, 9, 21, 10, 30, 'EDT'))).toBe(2 * H);
+  });
+
+  it('a full regular session is 6.5 h', () => {
+    expect(tradingMsBetween(etDate(2026, 9, 22, 0, 0, 'EDT'), etDate(2026, 9, 23, 0, 0, 'EDT'))).toBe(6.5 * H);
+  });
+
+  it('skips holidays and stops at an early close', () => {
+    // Wed 25 Nov → Mon 30 Nov 2026: Wed full (6.5), Thu Thanksgiving (0), Fri 9:30-13:00 (3.5).
+    expect(tradingMsBetween(etDate(2026, 11, 25, 0, 0, 'EST'), etDate(2026, 11, 28, 0, 0, 'EST'))).toBe(10 * H);
+  });
+
+  it('is DST-correct across the November switch', () => {
+    // Fri 30 Oct (EDT) and Mon 2 Nov 2026 (EST): two full sessions.
+    expect(tradingMsBetween(etDate(2026, 10, 30, 0, 0, 'EDT'), etDate(2026, 11, 3, 0, 0, 'EST'))).toBe(13 * H);
+  });
+
+  it('is zero for a reversed or empty interval', () => {
+    const t = etDate(2026, 9, 22, 11, 0, 'EDT');
+    expect(tradingMsBetween(t, t)).toBe(0);
+    expect(tradingMsBetween(t, new Date(t.getTime() - H))).toBe(0);
   });
 });

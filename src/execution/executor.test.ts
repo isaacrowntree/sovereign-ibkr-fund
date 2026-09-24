@@ -852,3 +852,198 @@ describe('executeQueue — fill provenance', () => {
     expect(trades[0].commission).toBe(1);
   });
 });
+
+describe('executeQueue — placementBlocker', () => {
+  it('stops placing the moment the blocker speaks, and keeps the rest queued', async () => {
+    const { deps, calls } = makeDeps();
+    let checks = 0;
+    deps.placementBlocker = () => (++checks > 1 ? 'run lock lost (another run took it over)' : null);
+    const outcome = await executeQueue(MIXED_QUEUE, ctx(), deps);
+    expect(calls.filter(c => c.startsWith('place:'))).toEqual(['place:SELL:BRK-B']);
+    expect(outcome.halted).toBe(true);
+    expect(outcome.haltReason).toBe('run lock lost (another run took it over)');
+    expect(outcome.requeue.map(o => o.symbol)).toEqual(['NET', 'AVGO', 'GLD']);
+  });
+});
+
+describe('executeQueue — run budget', () => {
+  it('places while the fill wait fits, then stops cleanly with the rest queued (not a halt)', async () => {
+    const { deps, calls } = makeDeps();
+    // Each placement burns 60s of budget in this fake.
+    let left = 400_000;
+    deps.timeRemainingMs = () => left;
+    const place = deps.placeOrder;
+    deps.placeOrder = async (...a) => { left -= 60_000; return place(...a); };
+    const outcome = await executeQueue(MIXED_QUEUE, ctx(), deps);
+    // A Patient order needs its 180s wait + 15s margin = 195s: 400, 340, 280
+    // and 220 all cover it, so the whole queue goes.
+    expect(calls.filter(c => c.startsWith('place:'))).toEqual([
+      'place:SELL:BRK-B', 'place:SELL:NET', 'place:BUY:AVGO', 'place:BUY:GLD',
+    ]);
+    expect(outcome.halted).toBe(false);
+
+    const second = makeDeps();
+    let left2 = 250_000;
+    second.deps.timeRemainingMs = () => left2;
+    const place2 = second.deps.placeOrder;
+    second.deps.placeOrder = async (...a) => { left2 -= 60_000; return place2(...a); };
+    const out2 = await executeQueue(MIXED_QUEUE, ctx(), second.deps);
+    expect(second.calls.filter(c => c.startsWith('place:'))).toEqual(['place:SELL:BRK-B']);
+    expect(out2.halted).toBe(false);
+    expect(out2.stoppedReason).toMatch(/run budget/);
+    expect(out2.requeue.map(o => o.symbol)).toEqual(['NET', 'AVGO', 'GLD']);
+    // Buys never reached the cash gate — the run stopped in the sells.
+    expect(second.calls).not.toContain('cash');
+  });
+
+  it('a Normal-urgency order (crisis → Urgent) needs only its 60s wait', async () => {
+    const { deps, calls } = makeDeps();
+    deps.timeRemainingMs = () => 100_000;
+    await executeQueue([order('NET', 'SELL', 100)], ctx({ regime: 'crisis' }), deps);
+    expect(calls).toContain('place:SELL:NET');
+  });
+
+  it('stopping before the validation probe is not a failed validation', async () => {
+    const { deps } = makeDeps();
+    deps.timeRemainingMs = () => 10_000;
+    const outcome = await executeQueue(MIXED_QUEUE, ctx({ validated: false }), deps);
+    expect(outcome.validationFailed).toBe(false);
+    expect(outcome.stoppedReason).toBeDefined();
+  });
+});
+
+describe('executeQueue — a refused confirmation prompt', () => {
+  it('keeps the order queued (it never reached IBKR), halts, and raises an anomaly', async () => {
+    const { deps, calls } = makeDeps();
+    deps.placeOrder = async (o) => {
+      calls.push(`place:${o.action}:${o.symbol}`);
+      throw Object.assign(new Error(`order for ${o.symbol} not placed — prompt refused`), { notPlaced: true });
+    };
+    const outcome = await executeQueue(MIXED_QUEUE, ctx(), deps);
+    expect(calls.filter(c => c.startsWith('place:'))).toEqual(['place:SELL:BRK-B']);
+    expect(outcome.halted).toBe(true);
+    expect(outcome.haltReason).toMatch(/confirmation prompt refused/);
+    expect(outcome.requeue.map(o => o.symbol)).toEqual(['BRK-B', 'NET', 'AVGO', 'GLD']);
+    expect(outcome.anomalies).toEqual([expect.objectContaining({ kind: 'order-refused', symbol: 'BRK-B' })]);
+  });
+});
+
+describe('executeQueue — cOID per placement and lookup after an unanswered placement', () => {
+  it('gives every placement a unique cOID from the run id', async () => {
+    const { deps } = makeDeps();
+    const coids: Array<string | undefined> = [];
+    const place = deps.placeOrder;
+    deps.placeOrder = async (o, s, u, c) => { coids.push(c); return place(o, s, u, c); };
+    await executeQueue(MIXED_QUEUE, ctx({ runId: 'r1' }), deps);
+    expect(coids).toEqual(['r1-BRK-B-SELL-1', 'r1-NET-SELL-1', 'r1-AVGO-BUY-1', 'r1-GLD-BUY-1']);
+  });
+
+  it('no run id → no cOID (unchanged behaviour)', async () => {
+    const { deps } = makeDeps();
+    const coids: Array<string | undefined> = [];
+    const place = deps.placeOrder;
+    deps.placeOrder = async (o, s, u, c) => { coids.push(c); return place(o, s, u, c); };
+    await executeQueue([order('NET', 'SELL', 100)], ctx(), deps);
+    expect(coids).toEqual([undefined]);
+  });
+
+  it('a timed-out placement found by its cOID is confirmed and recorded like any other', async () => {
+    const { deps, calls, trades } = makeDeps({ failPlace: ['NET'] });
+    const lookups: string[] = [];
+    deps.findOrderByRef = async (ref) => { lookups.push(ref); return { orderId: 555, status: 'Submitted' }; };
+    const confirmIds: number[] = [];
+    const confirm = deps.confirmFill;
+    deps.confirmFill = async (id, o) => { confirmIds.push(id); return confirm(id, o); };
+    const outcome = await executeQueue(MIXED_QUEUE, ctx({ runId: 'r1' }), deps);
+    expect(lookups).toEqual(['r1-NET-SELL-1']);
+    expect(confirmIds).toContain(555);
+    expect(outcome.halted).toBe(false);
+    expect(trades.map(t => t.symbol)).toContain('NET');
+    // Never placed twice.
+    expect(calls.filter(c => c === 'place:SELL:NET')).toHaveLength(1);
+  });
+
+  it('not found → dropped, never re-placed, halted, and a placement-unknown anomaly', async () => {
+    const { deps, calls } = makeDeps({ failPlace: ['NET'] });
+    deps.findOrderByRef = async () => null;
+    const outcome = await executeQueue(MIXED_QUEUE, ctx({ runId: 'r1' }), deps);
+    expect(outcome.halted).toBe(true);
+    expect(outcome.haltReason).toBe('order submission failed (NET)');
+    expect(outcome.requeue.map(o => o.symbol)).not.toContain('NET');
+    expect(calls.filter(c => c === 'place:SELL:NET')).toHaveLength(1);
+    expect(outcome.anomalies).toEqual([expect.objectContaining({ kind: 'placement-unknown', symbol: 'NET' })]);
+  });
+
+  it('a lookup that throws is treated as not found', async () => {
+    const { deps } = makeDeps({ failPlace: ['NET'] });
+    deps.findOrderByRef = async () => { throw new Error('bezant down'); };
+    const outcome = await executeQueue([order('NET', 'SELL', 100)], ctx({ runId: 'r1' }), deps);
+    expect(outcome.halted).toBe(true);
+    expect(outcome.anomalies[0]?.kind).toBe('placement-unknown');
+  });
+
+  it('an explicit rejection is not looked up — it is definitely not live', async () => {
+    const { deps } = makeDeps();
+    let looked = false;
+    deps.findOrderByRef = async () => { looked = true; return null; };
+    deps.placeOrder = async (o) => { throw Object.assign(new Error(`order rejected for ${o.symbol}`), { rejected: true }); };
+    const outcome = await executeQueue([order('NET', 'SELL', 100)], ctx({ runId: 'r1' }), deps);
+    expect(looked).toBe(false);
+    expect(outcome.halted).toBe(true);
+    expect(outcome.requeue).toEqual([]);
+    expect(outcome.anomalies).toEqual([]);
+  });
+
+  it('an accepted answer with no order id is looked up too', async () => {
+    const { deps } = makeDeps({ zeroOrderId: ['BRK-B'] });
+    deps.findOrderByRef = async () => ({ orderId: 4242, status: 'Submitted' });
+    const outcome = await executeQueue(MIXED_QUEUE, ctx({ runId: 'r1' }), deps);
+    expect(outcome.halted).toBe(false);
+    expect(outcome.executed.map(o => o.symbol)).toContain('BRK-B');
+  });
+});
+
+describe('executeQueue — Inactive orders and cancels', () => {
+  it('a young Inactive order at IBKR blocks a duplicate; an old one does not', async () => {
+    const young = makeDeps();
+    young.deps.getLiveOrders = async () => [{ symbol: 'NET', action: 'SELL', status: 'Inactive', ageMs: 60_000 }];
+    await executeQueue([order('NET', 'SELL', 100)], ctx(), young.deps);
+    expect(young.calls).not.toContain('place:SELL:NET');
+
+    const old = makeDeps();
+    old.deps.getLiveOrders = async () => [{ symbol: 'NET', action: 'SELL', status: 'Inactive', ageMs: 7 * 3600_000 }];
+    await executeQueue([order('NET', 'SELL', 100)], ctx(), old.deps);
+    expect(old.calls).toContain('place:SELL:NET');
+  });
+
+  it('a partial fill found by the executions fallback cancels the remainder and records it pending', async () => {
+    const { deps, cancelled } = makeDeps({
+      failConfirm: ['NET'],
+      executions: [{ execId: 'e1', symbol: 'NET', action: 'SELL', qty: 10, price: 100, orderId: 100 }],
+    });
+    const recorded: unknown[] = [];
+    deps.recordCancelPending = (r) => recorded.push(r);
+    const outcome = await executeQueue([order('NET', 'SELL', 4300, 43)], ctx(), deps);
+    expect(outcome.halted).toBe(true);
+    expect(cancelled).toEqual([100]);
+    expect(outcome.cancelRequests).toEqual([expect.objectContaining({ orderId: 100, symbol: 'NET', requestOk: true })]);
+    expect(recorded).toHaveLength(1);
+  });
+
+  it('a terminal partial cancels the original before requeueing the remainder', async () => {
+    const { deps, cancelled } = makeDeps({
+      confirm: { NET: { status: 'partial', totalFilledQty: 20, remainingQty: 23, timedOut: false } },
+    });
+    const outcome = await executeQueue([order('NET', 'SELL', 4300, 43)], ctx(), deps);
+    expect(cancelled).toEqual([100]);
+    expect(outcome.requeue).toEqual([expect.objectContaining({ symbol: 'NET', qty: 23 })]);
+    expect(outcome.cancelRequests[0]?.reason).toMatch(/remainder requeued/);
+  });
+
+  it('a cancel that fails is still recorded, as not confirmed', async () => {
+    const { deps } = makeDeps({ failConfirm: ['NET'] });
+    deps.cancelOrder = async () => { throw new Error('503'); };
+    const outcome = await executeQueue([order('NET', 'SELL', 100)], ctx(), deps);
+    expect(outcome.cancelRequests).toEqual([expect.objectContaining({ orderId: 100, requestOk: false })]);
+  });
+});

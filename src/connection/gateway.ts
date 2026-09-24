@@ -40,6 +40,11 @@ export interface Position {
   marketValue: number;
   marketPrice: number;
   conid?: number;
+  /**
+   * Set when IBKR gave no usable quantity and `qty` is a stand-in 0. Callers
+   * that would act on a zero (orphan recovery reads it as "sold") must refuse.
+   */
+  qtyMissing?: true;
 }
 
 export interface AccountSummary {
@@ -75,14 +80,32 @@ export interface TradeResult {
   commission?: number;
   commissionCurrency?: string;
   executions?: ExecutionDetail[];
+  /** Confirmation prompts IBKR raised on the way to accepting the order. */
+  replies?: OrderReply[];
 }
 
 // ---------- Internal helpers ----------
 
-class GatewayError extends Error {
+export class GatewayError extends Error {
+  /** IBKR answered the order with an explicit rejection: it is not live. */
+  rejected?: true;
   constructor(message: string, readonly status?: number, readonly body?: string) {
     super(message);
     this.name = 'GatewayError';
+  }
+}
+
+/**
+ * The order provably never reached IBKR as a live order — a confirmation
+ * prompt was refused, so the order died unconfirmed. Safe to keep queued; a
+ * placement error WITHOUT this marker may have landed and must be treated as
+ * ambiguous.
+ */
+export class OrderNotPlacedError extends GatewayError {
+  readonly notPlaced = true as const;
+  constructor(message: string, readonly replies: OrderReply[]) {
+    super(message);
+    this.name = 'OrderNotPlacedError';
   }
 }
 
@@ -287,6 +310,7 @@ export async function getAccountSummary(): Promise<AccountSummary> {
     marketValue: p.mktValue ?? 0,
     marketPrice: p.mktPrice ?? 0,
     conid: p.conid,
+    ...(typeof p.position === 'number' && Number.isFinite(p.position) ? {} : { qtyMissing: true as const }),
   }));
 
   // PortfolioSummary's value rows expose `amount: number` (numeric data) and
@@ -396,6 +420,25 @@ export interface LiveOrder {
   /** Raw CPAPI status (e.g. Submitted, PreSubmitted, Filled, Cancelled). */
   status: string;
   remainingQty: number;
+  /** The cOID the order was placed with (CPAPI `order_ref`), when it has one. */
+  orderRef?: string;
+  /** ms since IBKR last touched the order (`lastExecutionTime_r`), when reported. */
+  ageMs?: number;
+}
+
+/** Pure parse of one CPAPI `/iserver/account/orders` row. Exported for tests. */
+export function parseLiveOrder(o: Record<string, unknown>, now: number = Date.now()): LiveOrder {
+  const touched = Number(o.lastExecutionTime_r);
+  const ref = o.order_ref ?? o.orderRef;
+  return {
+    orderId: Number(o.orderId ?? o.order_id ?? 0),
+    symbol: canonicalSymbol(String(o.ticker ?? o.symbol ?? o.description1 ?? '')),
+    action: String(o.side ?? '').toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
+    status: String(o.status ?? o.order_ccp_status ?? ''),
+    remainingQty: Number(o.remainingQuantity ?? o.remaining_quantity ?? 0),
+    ...(ref != null && String(ref) !== '' ? { orderRef: String(ref) } : {}),
+    ...(Number.isFinite(touched) && touched > 0 ? { ageMs: Math.max(0, now - touched) } : {}),
+  };
 }
 
 /**
@@ -411,13 +454,8 @@ export async function getLiveOrders(): Promise<LiveOrder[]> {
     `/accounts/${accountId}/orders`,
   );
   const orders = resp?.orders ?? [];
-  return orders.map((o) => ({
-    orderId: Number(o.orderId ?? o.order_id ?? 0),
-    symbol: canonicalSymbol(String(o.ticker ?? o.symbol ?? o.description1 ?? '')),
-    action: String(o.side ?? '').toUpperCase() === 'SELL' ? 'SELL' : 'BUY',
-    status: String(o.status ?? o.order_ccp_status ?? ''),
-    remainingQty: Number(o.remainingQuantity ?? o.remaining_quantity ?? 0),
-  }));
+  const now = Date.now();
+  return orders.map((o) => parseLiveOrder(o, now));
 }
 
 export interface Execution {
@@ -438,6 +476,8 @@ export interface Execution {
   commission?: number;
   /** Originating order id, when present. */
   orderId?: number;
+  /** The cOID the originating order was placed with (`order_ref`), when present. */
+  orderRef?: string;
 }
 
 /**
@@ -477,8 +517,10 @@ export function parseExecutions(rows: Array<Record<string, unknown>>): Execution
         price: Number(t.price ?? 0),
         time: parseTradeTime(t),
         commission: Number.isFinite(Number(t.commission)) && t.commission != null ? Number(t.commission) : undefined,
-        orderId: t.order_id != null ? Number(t.order_id)
-          : (t.order_ref != null ? Number(t.order_ref) : undefined),
+        // order_ref is our cOID — a string, never an order id. It used to be
+        // Number()ed as a fallback, which gave NaN for every cOID.
+        orderId: t.order_id != null && Number.isFinite(Number(t.order_id)) ? Number(t.order_id) : undefined,
+        ...(t.order_ref != null && String(t.order_ref) !== '' ? { orderRef: String(t.order_ref) } : {}),
       };
     })
     .filter((e) => e.execId && e.qty > 0);
@@ -592,12 +634,72 @@ interface SubmitOrderResponse {
   id?: string;
   /** Confirmation/warning text accompanying a reply. */
   message?: string[];
+  /** Stable ids of the prompts in `message` (e.g. `o163`). */
+  messageIds?: string[];
   /** Rejection reason. */
   error?: string;
 }
 
 /** Max chained confirmation replies to answer before giving up. */
 const MAX_ORDER_REPLIES = 10;
+
+/**
+ * Which order-confirmation prompts may be answered "yes" automatically.
+ *
+ * Every prompt used to be confirmed blind. Most are harmless ("this is a
+ * market order", "price exceeds the percentage constraint"), but the same
+ * mechanism carries the ones that mean stop: a trading-permission or
+ * account-restriction warning, a cash shortfall, a price far from the market.
+ * IBKR tags each with `messageIds` (e.g. `o163`), stable across the text.
+ *
+ * REPLY_POLICY=log (default) confirms as before and records what enforce
+ * would have done, so the real ids can be gathered before anything is
+ * refused. REPLY_POLICY=enforce confirms only allowlisted ids; a denied,
+ * unknown or missing id is not confirmed, which leaves the order unplaced.
+ * REPLY_ALLOW_IDS adds ids (comma-separated) — the Market Order Confirmation
+ * id once the log has shown it.
+ */
+export const REPLY_ALLOW_IDS = ['o10151', 'o10153'];
+export const REPLY_DENY_IDS = ['o354', 'o383', 'o451', 'o163', 'o403', 'o2137'];
+
+export type ReplyPolicy = 'log' | 'enforce';
+
+export function replyPolicy(env: NodeJS.ProcessEnv = process.env): ReplyPolicy {
+  return (env.REPLY_POLICY ?? '').trim().toLowerCase() === 'enforce' ? 'enforce' : 'log';
+}
+
+export interface OrderReply {
+  /** CPAPI reply id (the /iserver/reply/{id} path segment). */
+  id: string;
+  messageIds: string[];
+  /** Full prompt text, HTML stripped. */
+  text: string;
+  /** Would the allowlist confirm this? Null when it would; the reason when not. */
+  refusal: string | null;
+  /** What was actually done with it. */
+  decision: 'confirmed' | 'refused';
+  at: string;
+}
+
+/** Allowlist verdict for a prompt's message ids: null = confirm, else why not. Pure. */
+export function evaluateReply(messageIds: string[], env: NodeJS.ProcessEnv = process.env): string | null {
+  const extra = (env.REPLY_ALLOW_IDS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+  const allow = new Set([...REPLY_ALLOW_IDS, ...extra]);
+  const deny = new Set(REPLY_DENY_IDS);
+  if (messageIds.length === 0) return 'prompt carries no messageIds';
+  const denied = messageIds.filter(id => deny.has(id));
+  if (denied.length) return `denied prompt id(s) ${denied.join(', ')}`;
+  const unknown = messageIds.filter(id => !allow.has(id));
+  if (unknown.length) return `unknown prompt id(s) ${unknown.join(', ')}`;
+  return null;
+}
+
+const promptText = (r: SubmitOrderResponse): string =>
+  (Array.isArray(r.message) ? r.message : r.message ? [String(r.message)] : [])
+    .join(' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 
 async function submitOrder(
   conid: number,
@@ -632,13 +734,31 @@ async function submitOrder(
   // { confirmed: true } via /iserver/reply/{id}; the response is either the
   // next reply in the chain or the final order carrying an order_id. Without
   // this, the very first order of a session never gets an id.
-  let replies = 0;
+  const policy = replyPolicy();
+  const replies: OrderReply[] = [];
   while (first && first.id && first.order_id == null && first.orderId == null && !first.error) {
-    if (replies >= MAX_ORDER_REPLIES) {
+    if (replies.length >= MAX_ORDER_REPLIES) {
       throw new GatewayError(`order for ${symbol} stuck in confirmation replies (>${MAX_ORDER_REPLIES})`);
     }
-    replies += 1;
-    log(`Confirming order warning for ${symbol} (reply ${replies}): ${(first.message ?? []).join(' ').replace(/<[^>]+>/g, '').slice(0, 80)}…`);
+    const messageIds = Array.isArray(first.messageIds) ? first.messageIds.map(String) : [];
+    const text = promptText(first);
+    const refusal = evaluateReply(messageIds);
+    const refuse = refusal !== null && policy === 'enforce';
+    replies.push({
+      id: String(first.id), messageIds, text, refusal,
+      decision: refuse ? 'refused' : 'confirmed', at: new Date().toISOString(),
+    });
+    if (refuse) {
+      // Not answering is how an order is declined: it never goes live.
+      throw new OrderNotPlacedError(
+        `order for ${symbol} not placed — confirmation prompt refused (${refusal}): ${text.slice(0, 200)}`,
+        replies,
+      );
+    }
+    log(
+      `Confirming order prompt for ${symbol} (reply ${replies.length}, ids ${messageIds.join(',') || 'none'}): ` +
+        `${text.slice(0, 120)}${refusal ? ` — REPLY_POLICY=log; enforce would refuse: ${refusal}` : ''}`,
+    );
     responses = await bezantFetch<SubmitOrderResponse[]>(
       `/v1/api/iserver/reply/${first.id}`,
       { method: 'POST', body: JSON.stringify({ confirmed: true }) },
@@ -647,26 +767,51 @@ async function submitOrder(
   }
 
   if (!first) throw new GatewayError(`order submission returned no response for ${symbol}`);
-  if (first.error) throw new GatewayError(`order rejected for ${symbol}: ${first.error}`);
+  if (first.error) {
+    const rejected = new GatewayError(`order rejected for ${symbol}: ${first.error}`);
+    rejected.rejected = true;
+    throw rejected;
+  }
   const rawId = first.order_id ?? first.orderId;
-  const orderId = typeof rawId === 'string' ? parseInt(rawId, 10) : rawId ?? 0;
+  const orderId = typeof rawId === 'string' ? parseInt(rawId, 10) : rawId;
+  // Fail closed: an answer with no order id is not "Submitted order 0". The
+  // order may or may not be live; throwing sends it down the ambiguous path,
+  // which looks it up by its cOID rather than guessing.
+  if (typeof orderId !== 'number' || !Number.isFinite(orderId) || orderId <= 0) {
+    throw new GatewayError(`order for ${symbol} answered without an order id: ${JSON.stringify(first).slice(0, 200)}`);
+  }
   return {
-    orderId: Number.isNaN(orderId) ? 0 : orderId,
+    orderId,
     symbol,
     action,
     qty,
-    status: (first.order_status ?? first.status ?? 'Submitted') as string,
+    status: String(first.order_status ?? first.status ?? 'unknown'),
+    ...(replies.length ? { replies } : {}),
   };
 }
+
+/**
+ * Per-placement options. `cOID` is the client order id IBKR stores on the
+ * order (it comes back as `order_ref` on orders and trades) and refuses to
+ * accept twice, so an order whose placement timed out can be found again —
+ * and a blind retry of the same placement cannot go live twice.
+ */
+export interface PlaceOpts {
+  cOID?: string;
+}
+
+const withCoid = (body: Record<string, unknown>, opts?: PlaceOpts): Record<string, unknown> =>
+  opts?.cOID ? { ...body, cOID: opts.cOID } : body;
 
 export async function placeMarketOrder(
   symbol: string,
   action: 'BUY' | 'SELL',
   qty: number,
+  opts?: PlaceOpts,
 ): Promise<TradeResult> {
   const conid = await resolveConid(symbol);
-  log(`Placing market ${action} ${qty} ${symbol} (conid=${conid})`);
-  return submitOrder(conid, symbol, action, qty, { orderType: 'MKT' });
+  log(`Placing market ${action} ${qty} ${symbol} (conid=${conid}${opts?.cOID ? `, cOID=${opts.cOID}` : ''})`);
+  return submitOrder(conid, symbol, action, qty, withCoid({ orderType: 'MKT' }, opts));
 }
 
 export async function placeLimitOrder(
@@ -674,10 +819,11 @@ export async function placeLimitOrder(
   action: 'BUY' | 'SELL',
   qty: number,
   price: number,
+  opts?: PlaceOpts,
 ): Promise<TradeResult> {
   const conid = await resolveConid(symbol);
   log(`Placing limit ${action} ${qty} ${symbol} @ $${price.toFixed(2)} (conid=${conid})`);
-  return submitOrder(conid, symbol, action, qty, { orderType: 'LMT', price });
+  return submitOrder(conid, symbol, action, qty, withCoid({ orderType: 'LMT', price }, opts));
 }
 
 export type AdaptivePriority = 'Patient' | 'Normal' | 'Urgent';
@@ -697,14 +843,15 @@ export async function placeAdaptiveOrder(
   action: 'BUY' | 'SELL',
   qty: number,
   priority: AdaptivePriority = 'Normal',
+  opts?: PlaceOpts,
 ): Promise<TradeResult> {
   const conid = await resolveConid(symbol);
-  log(`Placing Adaptive(${priority}) ${action} ${qty} ${symbol} (conid=${conid})`);
-  return submitOrder(conid, symbol, action, qty, {
+  log(`Placing Adaptive(${priority}) ${action} ${qty} ${symbol} (conid=${conid}${opts?.cOID ? `, cOID=${opts.cOID}` : ''})`);
+  return submitOrder(conid, symbol, action, qty, withCoid({
     orderType: 'MKT',
     algoStrategy: 'Adaptive',
     algoParams: [{ tag: 'adaptivePriority', value: priority }],
-  });
+  }, opts));
 }
 
 /**
@@ -717,8 +864,65 @@ export async function placeMidpriceOrder(
   symbol: string,
   action: 'BUY' | 'SELL',
   qty: number,
+  opts?: PlaceOpts,
 ): Promise<TradeResult> {
   const conid = await resolveConid(symbol);
-  log(`Placing MIDPRICE ${action} ${qty} ${symbol} (conid=${conid})`);
-  return submitOrder(conid, symbol, action, qty, { orderType: 'MIDPRICE' });
+  log(`Placing MIDPRICE ${action} ${qty} ${symbol} (conid=${conid}${opts?.cOID ? `, cOID=${opts.cOID}` : ''})`);
+  return submitOrder(conid, symbol, action, qty, withCoid({ orderType: 'MIDPRICE' }, opts));
+}
+
+export interface FoundOrder {
+  orderId: number;
+  status: string;
+  /** Which feed found it. */
+  source: 'orders' | 'trades';
+}
+
+export interface FindOrderOpts {
+  /** Total time to keep looking. Default 30 s. */
+  timeoutMs?: number;
+  /** Between polls. Default 3 s. */
+  pollMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+/**
+ * Find an order by the cOID it was placed with, after a placement whose
+ * answer never arrived (timeout, 5xx, no order id). Polls the live orders and
+ * the trades for ~30 s, matching `order_ref`. Null means not found — which is
+ * NOT proof it was never placed (the order feed lags), so the caller must
+ * treat the state as unknown and never re-place.
+ *
+ * `force=true` only on the first poll: CPAPI documents it as "clear the cache
+ * and refetch", and the forced call itself answers with an empty list — every
+ * later poll reads the refreshed cache.
+ */
+export async function findOrderByRef(ref: string, opts: FindOrderOpts = {}): Promise<FoundOrder | null> {
+  const timeoutMs = opts.timeoutMs ?? 30_000;
+  const pollMs = opts.pollMs ?? 3_000;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = opts.now ?? Date.now;
+  const start = now();
+  for (let poll = 0; ; poll++) {
+    try {
+      const resp = await bezantFetch<{ orders?: Array<Record<string, unknown>> }>(
+        `/v1/api/iserver/account/orders${poll === 0 ? '?force=true' : ''}`,
+      );
+      const hit = (resp?.orders ?? []).map((o) => parseLiveOrder(o)).find((o) => o.orderRef === ref);
+      if (hit && hit.orderId > 0) return { orderId: hit.orderId, status: hit.status, source: 'orders' };
+    } catch (err) {
+      logError(`findOrderByRef(${ref}): orders poll failed`, err);
+    }
+    try {
+      const rows = await bezantFetch<Array<Record<string, unknown>>>(`/v1/api/iserver/account/trades`);
+      const hit = (Array.isArray(rows) ? rows : []).find((t) => String(t.order_ref ?? '') === ref);
+      const id = Number(hit?.order_id);
+      if (hit && Number.isFinite(id) && id > 0) return { orderId: id, status: 'executed', source: 'trades' };
+    } catch (err) {
+      logError(`findOrderByRef(${ref}): trades poll failed`, err);
+    }
+    if (now() - start + pollMs > timeoutMs) return null;
+    await sleep(pollMs);
+  }
 }

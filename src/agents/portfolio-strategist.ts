@@ -22,7 +22,8 @@ import { regimeExposure, type RegimeState } from '../quant/regime.js';
 import { drawdownExposureMultiplier, type DrawdownState } from '../risk/drawdown.js';
 import { navSanityViolation, priceSanityViolations, marketDataFreshness } from '../risk/data-sanity.js';
 import { isStrategistWindow, describeWindow, STRATEGIST_WINDOW } from '../strategy/market-hours.js';
-import { loadState, mergeState, loadTradeHistory } from '../state/store.js';
+import { loadState, mergeState, loadTradeHistory, updateStateKey } from '../state/store.js';
+import { isDirectedOrder, partitionExpired, stagedOrderTtlMs, type StagedOrder } from '../execution/staging.js';
 import { notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
@@ -317,7 +318,10 @@ async function run(): Promise<void> {
       ? (Date.now() - new Date(lastRebalance).getTime()) / (24 * 60 * 60 * 1000)
       : Infinity;
 
-    let pendingOrders: Array<{ symbol: string; action: 'BUY' | 'SELL'; qty: number; estimatedValue: number; reason: string }> = [];
+    let pendingOrders: StagedOrder[] = [];
+    // Did this run get as far as deciding what the book needs? Only then does
+    // "no orders" mean something about an old queue.
+    let decided = false;
 
     // Build avgCost map for tax-aware loss-first SELL ordering. Positions
     // come back from IBKR with avgCost already populated.
@@ -365,6 +369,7 @@ async function run(): Promise<void> {
         AGENT,
       );
     } else if (decision === 'urgent' || decision === 'regular') {
+      decided = true;
       const trigger = decision === 'urgent'
         ? `URGENT: drift ${maxDrift.toFixed(1)}% >= urgent threshold ${config.rebalance.urgentDriftThreshold}% (cooldown bypassed)`
         : `Rebalancing: drift ${maxDrift.toFixed(1)}% >= ${config.rebalance.driftThreshold}%`;
@@ -390,6 +395,7 @@ async function run(): Promise<void> {
         }
       }
     } else if (decision === 'within-threshold') {
+      decided = true;
       log('Portfolio within drift threshold — no rebalance needed', AGENT);
 
       // Cash-flow rebalancing for deposits (USD cash — buys are USD). The
@@ -488,7 +494,9 @@ async function run(): Promise<void> {
       lastNavUsd: navUsd, // baseline for the next cycle's NAV-move sanity check
     };
     if (pendingOrders.length > 0) {
-      updates.pendingOrders = pendingOrders;
+      // Stamped so the executor can tell a fresh order from a stale one.
+      const stagedAt = new Date().toISOString();
+      updates.pendingOrders = pendingOrders.map(o => ({ ...o, createdAt: stagedAt }));
       // Only a real rebalance restarts the frequencyDays cooldown. This used to
       // fire for ANY order, including cash_flow_rebalance — which is buy-only
       // (allocateCashFlow never sells). So a small cash deployment reset the
@@ -502,6 +510,28 @@ async function run(): Promise<void> {
       }
     }
     mergeState(updates);
+
+    // No orders this time, in-window, with a decision made: a queue left over
+    // from an earlier run is only still there because it never executed. Clear
+    // the part of it that has expired — read and written in one transaction,
+    // so an executor shrinking the queue concurrently is not undone. A queue
+    // holding a directed deposit is never touched: that is an instruction.
+    if (decided && pendingOrders.length === 0) {
+      const ttl = stagedOrderTtlMs();
+      let cleared: StagedOrder[] = [];
+      updateStateKey<StagedOrder[]>('pendingOrders', (cur) => {
+        const queue = (Array.isArray(cur) ? cur : []) as StagedOrder[];
+        if (queue.length === 0 || queue.some(isDirectedOrder)) return undefined;
+        const { live, expired } = partitionExpired(queue, new Date(), ttl);
+        if (expired.length === 0) return undefined;
+        cleared = expired;
+        return live;
+      });
+      if (cleared.length > 0) {
+        log(`Cleared ${cleared.length} stale queued order(s) — no rebalance wanted now: ` +
+          cleared.map(o => `${o.action} ${o.qty} ${o.symbol} (staged ${o.createdAt})`).join(', '), AGENT);
+      }
+    }
 
   } finally {
     disconnect();

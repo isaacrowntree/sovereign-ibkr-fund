@@ -363,6 +363,39 @@ export function loadState(): FundState {
   return out;
 }
 
+/**
+ * One key, parsed, without loading the rest of the state. For the checks that
+ * run before every order (the hub's execution toggle), where the whole state
+ * would be wasted work. Undefined when absent or unparseable.
+ */
+export function loadStateKey(key: string): unknown {
+  const row = db().prepare('SELECT value FROM state_kv WHERE key = ?').get(key) as { value?: string } | undefined;
+  if (row?.value === undefined) return undefined;
+  try { return JSON.parse(row.value) as unknown; } catch { return undefined; }
+}
+
+/**
+ * Read-modify-write one key inside a single transaction. `fn` gets the current
+ * value (undefined when absent) and returns the next one, or undefined to
+ * leave it as it is. For the writers that must not clobber a concurrent
+ * change — e.g. pruning the queue while the executor is shrinking it.
+ * Returns what was written, or undefined when nothing was.
+ */
+export function updateStateKey<T>(key: string, fn: (current: unknown) => T | undefined): T | undefined {
+  const d = db();
+  let out: T | undefined;
+  tx(d, () => {
+    const row = d.prepare('SELECT value FROM state_kv WHERE key = ?').get(key) as { value?: string } | undefined;
+    let current: unknown;
+    try { current = row?.value === undefined ? undefined : JSON.parse(row.value); } catch { current = undefined; }
+    const next = fn(current);
+    if (next === undefined) return;
+    writeKv(d, key, next);
+    out = next;
+  });
+  return out;
+}
+
 export function saveState(state: FundState): void {
   const d = db();
   tx(d, () => {
@@ -464,6 +497,128 @@ export function appendTrade(trade: TradeRecord): void {
     }
     d.prepare('INSERT INTO trades (ts, data) VALUES (?, ?)').run(trade.timestamp ?? null, JSON.stringify(trade));
   });
+}
+
+// ---------- Leases ----------
+
+/**
+ * A lease stored as a state_kv value. `holder` is a random token minted per
+ * run, never a pid: pids are reused across a container restart and invisible
+ * from outside the container, so "is pid N alive?" used to answer about some
+ * other process. A lease instead proves itself by being renewed — a holder
+ * that stops heartbeating loses it at `leaseUntil`, whatever became of it.
+ */
+export interface LeaseRecord {
+  holder: string;
+  /** ISO time the lease lapses unless renewed. */
+  leaseUntil: string;
+  [key: string]: unknown;
+}
+
+export interface LeaseAcquireResult {
+  acquired: boolean;
+  /**
+   * What was stored under the key before this call (a live lease when
+   * `acquired` is false; an abandoned one, or null, when it is true). An
+   * abandoned record is how the next run learns a previous one died.
+   */
+  previous: Record<string, unknown> | null;
+}
+
+const readKv = (d: DatabaseSync, key: string): Record<string, unknown> | null => {
+  const row = d.prepare('SELECT value FROM state_kv WHERE key = ?').get(key) as { value?: string } | undefined;
+  if (!row?.value) return null;
+  try {
+    const v = JSON.parse(row.value) as unknown;
+    return v && typeof v === 'object' ? (v as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+};
+
+const writeKv = (d: DatabaseSync, key: string, value: unknown): void => {
+  d.prepare(
+    'INSERT INTO state_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+  ).run(key, JSON.stringify(value));
+};
+
+/**
+ * Is a stored record a live lease at `now`? A record from before leases (no
+ * `leaseUntil`) is judged by its start time `at` against `legacyStaleMs`, the
+ * rule the old lock used, so a run started by the previous build is still
+ * respected across the deploy.
+ */
+function leaseLive(rec: Record<string, unknown> | null, now: number, legacyStaleMs: number): boolean {
+  if (!rec) return false;
+  const until = Date.parse(String(rec.leaseUntil ?? ''));
+  if (Number.isFinite(until)) return until > now;
+  const at = Date.parse(String(rec.at ?? ''));
+  return Number.isFinite(at) && now - at < legacyStaleMs;
+}
+
+/**
+ * Take the lease on `key` — compare-and-set inside one BEGIN IMMEDIATE, so two
+ * processes can never both see it free and both take it (the old lock read
+ * with loadState() and wrote with mergeState(), two transactions apart).
+ */
+export function acquireLease(
+  key: string,
+  holder: string,
+  leaseMs: number,
+  record: Record<string, unknown> = {},
+  opts: { now?: number; legacyStaleMs?: number } = {},
+): LeaseAcquireResult {
+  const d = db();
+  const now = opts.now ?? Date.now();
+  const legacyStaleMs = opts.legacyStaleMs ?? 0;
+  let result: LeaseAcquireResult = { acquired: false, previous: null };
+  tx(d, () => {
+    const prev = readKv(d, key);
+    if (leaseLive(prev, now, legacyStaleMs) && prev?.holder !== holder) {
+      result = { acquired: false, previous: prev };
+      return;
+    }
+    writeKv(d, key, { ...record, holder, leaseUntil: new Date(now + leaseMs).toISOString() });
+    result = { acquired: true, previous: prev };
+  });
+  return result;
+}
+
+/**
+ * Extend the lease and merge `patch` into its record — only if `holder` still
+ * holds it. Returns false when it does not (it lapsed and someone else took
+ * it, or it was released): the caller has lost the lock and must stop.
+ */
+export function renewLease(
+  key: string,
+  holder: string,
+  leaseMs: number,
+  patch: Record<string, unknown> = {},
+  opts: { now?: number } = {},
+): boolean {
+  const d = db();
+  const now = opts.now ?? Date.now();
+  let held = false;
+  tx(d, () => {
+    const prev = readKv(d, key);
+    if (!prev || prev.holder !== holder) return;
+    writeKv(d, key, { ...prev, ...patch, holder, leaseUntil: new Date(now + leaseMs).toISOString() });
+    held = true;
+  });
+  return held;
+}
+
+/** Release the lease (stores null, as the old lock did) — only if `holder` holds it. */
+export function releaseLease(key: string, holder: string): boolean {
+  const d = db();
+  let released = false;
+  tx(d, () => {
+    const prev = readKv(d, key);
+    if (!prev || prev.holder !== holder) return;
+    writeKv(d, key, null);
+    released = true;
+  });
+  return released;
 }
 
 export function loadTradeHistory(): TradeRecord[] {

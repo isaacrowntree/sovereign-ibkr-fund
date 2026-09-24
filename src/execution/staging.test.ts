@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { planExecution, gateBuysByCash, type StagedOrder } from './staging.js';
+import { planExecution, gateBuysByCash, isExpiredOrder, isDirectedOrder, partitionExpired, stagedOrderTtlMs, type StagedOrder } from './staging.js';
 
 const order = (
   symbol: string,
@@ -115,5 +115,52 @@ describe('gateBuysByCash', () => {
   it('preserves queue order (strategist greedy priority) among admitted buys', () => {
     const { execute } = gateBuysByCash(buys, totalBuys * 1.1, 2);
     expect(execute.map(o => o.symbol)).toEqual(['AVGO', 'GE', 'TLT', 'CAT', 'LLY', 'GLD']);
+  });
+});
+
+describe('staged order expiry (createdAt + trading-hours TTL)', () => {
+  const H = 3600_000;
+  // 2026-09-21 is a Monday; 10:00 ET = 14:00Z (EDT).
+  const monday10 = '2026-09-21T14:00:00.000Z';
+  const o = (over: Partial<StagedOrder> = {}): StagedOrder => ({
+    symbol: 'NET', action: 'SELL', qty: 1, estimatedValue: 100, reason: 'drift', createdAt: monday10, ...over,
+  });
+
+  it('ages only in trading time: 13 h TTL lasts two full sessions, not 13 wall-clock hours', () => {
+    expect(isExpiredOrder(o(), new Date('2026-09-22T14:00:00Z'), 13 * H)).toBe(false); // 6.5 h of trading
+    expect(isExpiredOrder(o(), new Date('2026-09-23T14:00:00Z'), 13 * H)).toBe(true);  // 13 h of trading
+  });
+
+  it('a weekend does not age an order', () => {
+    const fri = o({ createdAt: '2026-09-18T19:00:00.000Z' }); // Fri 15:00 ET
+    expect(isExpiredOrder(fri, new Date('2026-09-21T13:00:00Z'), 2 * H)).toBe(false); // Mon 09:00 ET: 1 h
+  });
+
+  it('directed deposits never expire, whichever path staged them', () => {
+    for (const reason of ['directed_deposit', 'directed deposit deployment (pre-reweight)']) {
+      expect(isDirectedOrder({ reason })).toBe(true);
+      expect(isExpiredOrder(o({ reason }), new Date('2027-01-01T15:00:00Z'), 13 * H)).toBe(false);
+    }
+    expect(isDirectedOrder({ reason: 'cash_flow_rebalance' })).toBe(false);
+  });
+
+  it('orders from before createdAt existed, or with a garbled one, never expire', () => {
+    expect(isExpiredOrder(o({ createdAt: undefined }), new Date('2027-01-01T15:00:00Z'), H)).toBe(false);
+    expect(isExpiredOrder(o({ createdAt: 'yesterday' }), new Date('2027-01-01T15:00:00Z'), H)).toBe(false);
+  });
+
+  it('TTL 0 turns expiry off; the default is 13 trading hours', () => {
+    expect(isExpiredOrder(o(), new Date('2027-01-01T15:00:00Z'), 0)).toBe(false);
+    expect(stagedOrderTtlMs({})).toBe(13 * H);
+    expect(stagedOrderTtlMs({ STAGED_ORDER_TTL_TRADING_HOURS: '0' })).toBe(0);
+    expect(stagedOrderTtlMs({ STAGED_ORDER_TTL_TRADING_HOURS: '6.5' })).toBe(6.5 * H);
+  });
+
+  it('partitionExpired splits a queue, keeping order', () => {
+    const now = new Date('2026-09-24T14:00:00Z');
+    const q = [o({ symbol: 'A' }), o({ symbol: 'B', createdAt: '2026-09-24T13:50:00.000Z' }), o({ symbol: 'C', reason: 'directed_deposit' })];
+    const r = partitionExpired(q, now, 13 * H);
+    expect(r.expired.map(x => x.symbol)).toEqual(['A']);
+    expect(r.live.map(x => x.symbol)).toEqual(['B', 'C']);
   });
 });

@@ -17,12 +17,66 @@
  *      price drift since the estimate. Deferred buys stay queued.
  */
 
+import { tradingMsBetween } from '../strategy/market-hours.js';
+
 export interface StagedOrder {
   symbol: string;
   action: 'BUY' | 'SELL';
   qty: number;
   estimatedValue: number;
   reason: string;
+  /**
+   * When the order was staged (ISO). Its quantity and value were sized
+   * against prices and positions at that moment, so an old order is a guess
+   * about a book that has since moved. Absent on orders staged before this
+   * field existed; those never expire.
+   */
+  createdAt?: string;
+}
+
+/**
+ * A directed-deposit order: staged on an explicit instruction (the deposit
+ * policy, or the operator's --confirm in the deposit scripts), not derived
+ * from drift. Never expired or cleared automatically — the instruction stands
+ * until a human withdraws it.
+ */
+export function isDirectedOrder(o: Pick<StagedOrder, 'reason'>): boolean {
+  return /^directed[ _]deposit/.test(o.reason ?? '');
+}
+
+/**
+ * STAGED_ORDER_TTL_TRADING_HOURS: how many NYSE trading hours a staged order
+ * lives. Default 13 — two full sessions. 0 turns expiry off.
+ */
+export function stagedOrderTtlMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.STAGED_ORDER_TTL_TRADING_HOURS;
+  if (raw === undefined || raw.trim() === '') return 13 * 60 * 60 * 1000;
+  const h = parseFloat(raw);
+  return Number.isFinite(h) && h > 0 ? h * 60 * 60 * 1000 : 0;
+}
+
+/**
+ * Has this order outlived its TTL, counted in trading time (a weekend or a
+ * holiday does not age it)? Directed orders, orders with no createdAt and a
+ * TTL of 0 never expire.
+ */
+export function isExpiredOrder(o: StagedOrder, now: Date, ttlMs: number): boolean {
+  if (ttlMs <= 0 || isDirectedOrder(o) || !o.createdAt) return false;
+  const at = new Date(o.createdAt);
+  if (Number.isNaN(at.getTime())) return false;
+  return tradingMsBetween(at, now) >= ttlMs;
+}
+
+/** Split a queue into orders still good and orders past their TTL. */
+export function partitionExpired(
+  queue: StagedOrder[],
+  now: Date,
+  ttlMs: number,
+): { live: StagedOrder[]; expired: StagedOrder[] } {
+  const live: StagedOrder[] = [];
+  const expired: StagedOrder[] = [];
+  for (const o of queue) (isExpiredOrder(o, now, ttlMs) ? expired : live).push(o);
+  return { live, expired };
 }
 
 export interface ExecutionPlan {
