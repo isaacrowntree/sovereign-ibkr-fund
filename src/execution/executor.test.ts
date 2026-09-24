@@ -1002,3 +1002,48 @@ describe('executeQueue — cOID per placement and lookup after an unanswered pla
     expect(outcome.executed.map(o => o.symbol)).toContain('BRK-B');
   });
 });
+
+describe('executeQueue — Inactive orders and cancels', () => {
+  it('a young Inactive order at IBKR blocks a duplicate; an old one does not', async () => {
+    const young = makeDeps();
+    young.deps.getLiveOrders = async () => [{ symbol: 'NET', action: 'SELL', status: 'Inactive', ageMs: 60_000 }];
+    await executeQueue([order('NET', 'SELL', 100)], ctx(), young.deps);
+    expect(young.calls).not.toContain('place:SELL:NET');
+
+    const old = makeDeps();
+    old.deps.getLiveOrders = async () => [{ symbol: 'NET', action: 'SELL', status: 'Inactive', ageMs: 7 * 3600_000 }];
+    await executeQueue([order('NET', 'SELL', 100)], ctx(), old.deps);
+    expect(old.calls).toContain('place:SELL:NET');
+  });
+
+  it('a partial fill found by the executions fallback cancels the remainder and records it pending', async () => {
+    const { deps, cancelled } = makeDeps({
+      failConfirm: ['NET'],
+      executions: [{ execId: 'e1', symbol: 'NET', action: 'SELL', qty: 10, price: 100, orderId: 100 }],
+    });
+    const recorded: unknown[] = [];
+    deps.recordCancelPending = (r) => recorded.push(r);
+    const outcome = await executeQueue([order('NET', 'SELL', 4300, 43)], ctx(), deps);
+    expect(outcome.halted).toBe(true);
+    expect(cancelled).toEqual([100]);
+    expect(outcome.cancelRequests).toEqual([expect.objectContaining({ orderId: 100, symbol: 'NET', requestOk: true })]);
+    expect(recorded).toHaveLength(1);
+  });
+
+  it('a terminal partial cancels the original before requeueing the remainder', async () => {
+    const { deps, cancelled } = makeDeps({
+      confirm: { NET: { status: 'partial', totalFilledQty: 20, remainingQty: 23, timedOut: false } },
+    });
+    const outcome = await executeQueue([order('NET', 'SELL', 4300, 43)], ctx(), deps);
+    expect(cancelled).toEqual([100]);
+    expect(outcome.requeue).toEqual([expect.objectContaining({ symbol: 'NET', qty: 23 })]);
+    expect(outcome.cancelRequests[0]?.reason).toMatch(/remainder requeued/);
+  });
+
+  it('a cancel that fails is still recorded, as not confirmed', async () => {
+    const { deps } = makeDeps({ failConfirm: ['NET'] });
+    deps.cancelOrder = async () => { throw new Error('503'); };
+    const outcome = await executeQueue([order('NET', 'SELL', 100)], ctx(), deps);
+    expect(outcome.cancelRequests).toEqual([expect.objectContaining({ orderId: 100, requestOk: false })]);
+  });
+});

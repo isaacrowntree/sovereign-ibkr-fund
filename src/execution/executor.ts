@@ -33,6 +33,7 @@ import { selectExecutionStrategy, selectUrgency, type AlgoPriority, type Executi
 import { planExecution, gateBuysByCash, type StagedOrder } from './staging.js';
 import { orderCapViolation, type NotionalCaps } from '../risk/data-sanity.js';
 import { RUN_BUDGET_MARGIN_MS } from './kill-switches.js';
+import { isWorkingOrder, DEFAULT_INACTIVE_WORKING_MS } from './order-status.js';
 
 export interface ExecutorContext {
   /** Has a live fill ever been confirmed? False → validation mode. */
@@ -65,6 +66,8 @@ export interface ExecutorContext {
    * placement timed out is found again. Omit → no cOIDs (tests).
    */
   runId?: string;
+  /** How long an `Inactive` order still counts as working (order-status.ts). Default 6 h. */
+  inactiveWorkingMs?: number;
 }
 
 export interface ExecutorDeps {
@@ -133,7 +136,12 @@ export interface ExecutorDeps {
    * placing a duplicate for a symbol+side that already has a live order — the
    * central guard against cross-run duplicates. Optional: absent → no guard.
    */
-  getLiveOrders?(): Promise<Array<{ symbol: string; action: 'BUY' | 'SELL'; status: string }>>;
+  getLiveOrders?(): Promise<Array<{ symbol: string; action: 'BUY' | 'SELL'; status: string; ageMs?: number }>>;
+  /**
+   * Persist a cancel the moment it is requested, so it is resolved next run
+   * even if this one dies. Optional (tests may omit).
+   */
+  recordCancelPending?(req: CancelRequest): void;
   /**
    * Persist the still-to-do queue after every terminal order outcome, so a
    * crash/kill/exception mid-run leaves only UNEXECUTED orders on disk instead
@@ -220,15 +228,24 @@ export interface ExecutionOutcome {
   washSales: WashSaleEntry[];
   /** Correctness events worth a human's attention. See ExecutionAnomaly. */
   anomalies: ExecutionAnomaly[];
+  /** Cancels requested this run, to be confirmed on a later one. */
+  cancelRequests: CancelRequest[];
 }
 
-/** CPAPI order statuses that mean the order is no longer working. */
-const TERMINAL_ORDER_STATUSES = new Set(['filled', 'cancelled', 'inactive', 'rejected']);
-
-/** Is a live order still working (could still fill) vs terminal? */
-function isWorkingOrder(status: string): boolean {
-  const s = status.toLowerCase().replace(/[^a-z]/g, '');
-  return !TERMINAL_ORDER_STATUSES.has(s);
+/**
+ * A cancel we asked IBKR for and have not yet seen take effect. Persisted
+ * (state `cancelPending`) the moment it is requested, and resolved on a later
+ * run against the live orders — see cancel-pending.ts. Until then the order
+ * is treated as possibly still working.
+ */
+export interface CancelRequest {
+  orderId: number;
+  symbol: string;
+  action: 'BUY' | 'SELL';
+  requestedAt: string;
+  reason: string;
+  /** Whether the DELETE itself went through (it can fail; the order still needs resolving). */
+  requestOk: boolean;
 }
 
 export async function executeQueue(
@@ -300,14 +317,25 @@ export async function executeQueue(
    * strategist from regenerating the same order and double-trading it. Never
    * throws — a failed cancel just leaves the pre-existing risk in place.
    */
-  const cancelUnknown = async (orderId: number, symbol: string): Promise<void> => {
+  const cancelRequests: CancelRequest[] = [];
+  const cancelUnknown = async (orderId: number, order: StagedOrder, reason: string): Promise<void> => {
     if (!deps.cancelOrder) return;
+    let requestOk = false;
     try {
       await deps.cancelOrder(orderId);
-      deps.log(`Cancel requested for unconfirmed orderId=${orderId} (${symbol})`);
+      requestOk = true;
+      deps.log(`Cancel requested for orderId=${orderId} (${order.symbol}): ${reason}`);
     } catch (err) {
-      deps.logError(`Best-effort cancel failed for orderId=${orderId} (${symbol})`, err);
+      deps.logError(`Best-effort cancel failed for orderId=${orderId} (${order.symbol})`, err);
     }
+    // A cancel is a request, not a result: record it either way, and let a
+    // later run see whether the order actually stopped.
+    const req: CancelRequest = {
+      orderId, symbol: order.symbol, action: order.action,
+      requestedAt: new Date().toISOString(), reason, requestOk,
+    };
+    cancelRequests.push(req);
+    try { deps.recordCancelPending?.(req); } catch (e) { deps.logError('Could not persist cancelPending', e); }
   };
 
   /**
@@ -445,8 +473,9 @@ export async function executeQueue(
   if (deps.getLiveOrders && plan.orders.length > 0) {
     try {
       const live = await deps.getLiveOrders();
+      const inactiveMax = ctx.inactiveWorkingMs ?? DEFAULT_INACTIVE_WORKING_MS;
       for (const lo of live) {
-        if (isWorkingOrder(lo.status)) working.add(`${lo.action}:${lo.symbol}`);
+        if (isWorkingOrder(lo.status, lo.ageMs, inactiveMax)) working.add(`${lo.action}:${lo.symbol}`);
       }
       if (working.size > 0) {
         deps.log(`Working orders already at IBKR (won't duplicate): ${[...working].join(', ')}`);
@@ -469,6 +498,7 @@ export async function executeQueue(
         shortfalls,
         washSales,
         anomalies,
+        cancelRequests,
       };
     }
   }
@@ -554,9 +584,12 @@ export async function executeQueue(
       return; // NOT halted — the order actually succeeded
     }
     if (filledQty === 0) {
-      await cancelUnknown(orderId, order.symbol);
+      await cancelUnknown(orderId, order, reason);
     } else {
-      deps.log(`${order.symbol}: partial ${filledQty}/${order.qty} per executions — remainder unknown, halting.`);
+      // The remainder may still be working. Cancel it: an order we have
+      // dropped from the queue must not go on filling unwatched.
+      deps.log(`${order.symbol}: partial ${filledQty}/${order.qty} per executions — cancelling the remainder, halting.`);
+      await cancelUnknown(orderId, order, `partial ${filledQty}/${order.qty} after '${reason}' — remainder cancelled`);
     }
     halt(`${reason} (${order.symbol})`);
   };
@@ -805,12 +838,16 @@ export async function executeQueue(
             );
             drop(order);
             recordExecuted(order, actualFilledQty, actualFillPrice, actualStatus, result, provenance);
-            await cancelUnknown(result.orderId, order.symbol);
+            await cancelUnknown(result.orderId, order, `partial ${conf.totalFilledQty}/${order.qty}, confirmation timed out`);
             halt(`partial fill timed out (${order.symbol})`);
             continue;
           }
           // Terminal partial: the remainder stays queued, estimatedValue
           // scaled to the remaining shares so the next run sizes it right.
+          // Cancel the original first — if its remainder is in fact still
+          // working, the requeued copy would double it. The cancel is resolved
+          // next run, and until then the working-order guard sees it.
+          await cancelUnknown(result.orderId, order, `partial ${conf.totalFilledQty}/${order.qty} — remainder requeued`);
           const perShare = order.estimatedValue / order.qty;
           remainder = {
             ...order,
@@ -892,5 +929,6 @@ export async function executeQueue(
     shortfalls,
     washSales,
     anomalies,
+    cancelRequests,
   };
 }

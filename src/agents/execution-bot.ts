@@ -25,7 +25,9 @@ import {
   type AdaptivePriority,
   type OrderReply,
 } from '../connection/gateway.js';
-import { executeQueue, type ExecutorDeps } from '../execution/executor.js';
+import { executeQueue, type ExecutorDeps, type CancelRequest } from '../execution/executor.js';
+import { resolveCancelPending } from '../execution/cancel-pending.js';
+import { inactiveWorkingMs } from '../execution/order-status.js';
 import { reconcileExecutions } from '../execution/reconcile.js';
 import { recoverOrphanedFills } from '../execution/orphan-recovery.js';
 import {
@@ -303,8 +305,10 @@ async function run(): Promise<void> {
 
   const state = loadState();
   const pendingOrders = (state.pendingOrders || []) as StagedOrder[];
+  const cancelPending = (Array.isArray(state.cancelPending) ? state.cancelPending : []) as CancelRequest[];
 
-  if (pendingOrders.length === 0) {
+  // A cancel from an earlier run still needs confirming even with nothing queued.
+  if (pendingOrders.length === 0 && cancelPending.length === 0) {
     log('No pending orders', AGENT);
     return;
   }
@@ -419,6 +423,38 @@ async function run(): Promise<void> {
     phase('connect');
     await connect();
     connected = true;
+
+    // Cancels earlier runs requested: did they take? Resolved before anything
+    // is placed, so the working-order guard below sees any that did not.
+    if (cancelPending.length > 0) {
+      phase('cancel-pending');
+      const r = await resolveCancelPending(cancelPending, {
+        getLiveOrders: () => getLiveOrders(),
+        cancelOrder: (id) => cancelOrder(id),
+        log: (m) => log(m, AGENT),
+        logError: (m, e) => logError(m, e, AGENT),
+      }, inactiveWorkingMs());
+      if (r.checked) mergeState({ cancelPending: r.pending });
+      if (r.stuck.length > 0) {
+        const detail = r.stuck.map(c => `${c.action} ${c.symbol} (order ${c.orderId}, asked ${c.requestedAt})`).join(', ');
+        await notify(
+          {
+            severity: 'warn',
+            title: `Cancel not taken — ${r.stuck.length} order${r.stuck.length === 1 ? '' : 's'} still working at IBKR`,
+            body:
+              `A cancel sent on an earlier run has not taken effect: ${detail}. The cancel was sent again. ` +
+              'Until it takes, the order can still fill, and no duplicate will be placed for it.',
+            agent: AGENT,
+            dedupe: { key: 'exec:cancel-stuck', fingerprint: r.stuck.map(c => c.orderId).sort().join(',') },
+          },
+          storeHooks,
+        );
+      }
+    }
+    if (pendingOrders.length === 0) {
+      log('No pending orders (cancel check only)', AGENT);
+      return;
+    }
 
     // Reconcile the ledger against IBKR's authoritative executions BEFORE
     // executing — captures any fill the WS stream missed on a prior run so
@@ -703,6 +739,11 @@ async function run(): Promise<void> {
       // Idempotency source: never place a duplicate for a symbol+side already
       // working at IBKR.
       getLiveOrders: () => getLiveOrders(),
+      // Every cancel is persisted as it is sent, and resolved next run.
+      recordCancelPending: (req) => {
+        const prior = loadStateKey('cancelPending');
+        mergeState({ cancelPending: [...(Array.isArray(prior) ? prior : []), req] });
+      },
       // After a placement with no usable answer: find it by its cOID (~30 s).
       findOrderByRef: (ref) => findOrderByRef(ref),
       // Authoritative executions — verifies a fill the WS stream missed so it's
@@ -749,6 +790,7 @@ async function run(): Promise<void> {
         ordersCursorFloor,
         // The lease holder token doubles as the run id: short, random, unique.
         runId: runLock?.holder,
+        inactiveWorkingMs: inactiveWorkingMs(),
         caps: {
           maxOrderNotionalUsd: config.execution.maxOrderNotionalUsd,
           maxOrderPctNav: config.execution.maxOrderPctNav,
