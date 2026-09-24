@@ -61,4 +61,11 @@ describe('deriveUsdBalances', () => {
     expect(b.usdCash).toBe(0);
     expect(b.usdNav).toBe(0);
   });
+
+  it('reports non-USD cash in base currency (an unconverted AUD deposit)', () => {
+    expect(deriveUsdBalances(LEDGER as any).nonUsdCashBase).toBeCloseTo(36.29, 6);
+    const withEur = { ...LEDGER, EUR: { currency: 'EUR', cashbalance: 100, netliquidationvalue: 100, exchangerate: 1.6 } };
+    expect(deriveUsdBalances(withEur as any).nonUsdCashBase).toBeCloseTo(36.29 + 160, 6);
+    expect(deriveUsdBalances({} as any).nonUsdCashBase).toBe(0);
+  });
 });

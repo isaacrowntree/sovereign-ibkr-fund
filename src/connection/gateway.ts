@@ -344,6 +344,12 @@ export interface UsdBalances {
    * compared with the USD figures above. null when the ledger carries none.
    */
   baseRatePerUsd: number | null;
+  /**
+   * Cash held in NON-USD buckets (the AUD bucket, here), in base currency.
+   * An AUD deposit sits here until converted and funds no USD buy; it is also
+   * the part of NAV an AUD/USD move does not revalue (F4 alert, F6 exposure).
+   */
+  nonUsdCashBase: number;
 }
 
 /**
@@ -366,6 +372,9 @@ export function deriveUsdBalances(ledger: Record<string, LedgerRow>): UsdBalance
   const usdNav = usdRate && usdRate > 0 ? baseNav / usdRate : (usd?.netliquidationvalue ?? 0);
 
   const usdCash = usd?.cashbalance ?? 0;
+  const nonUsdCashBase = rows
+    .filter(r => r.currency !== 'USD')
+    .reduce((sum, r) => sum + (r.cashbalance ?? 0) * (r.exchangerate ?? 0), 0);
   return {
     usdCash,
     // Clamped: a settled figure above the total is nonsense, and trusting it
@@ -373,6 +382,7 @@ export function deriveUsdBalances(ledger: Record<string, LedgerRow>): UsdBalance
     usdSettledCash: Math.min(usd?.settledcash ?? 0, usdCash),
     usdNav,
     baseRatePerUsd: usdRate && usdRate > 0 ? usdRate : null,
+    nonUsdCashBase,
   };
 }
 
