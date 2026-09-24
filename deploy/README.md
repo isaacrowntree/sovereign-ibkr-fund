@@ -6,7 +6,7 @@ your own host.
 
 | Unit | What it does | Cadence |
 |---|---|---|
-| `ibkr-fund-watchdog` | probes the bezant gateway **and the event feed**, restarts it if either is wedged | ~1 min |
+| `ibkr-fund-watchdog` | probes the bezant gateway **and the event feed**; restarts only a dead gateway, reconnects a silent feed (`WATCHDOG_RESTART=dry-run` by default) | ~1 min |
 | `ibkr-fund-relogin` | re-authenticates the IBKR session (Playwright) | ~5 min |
 | `ibkr-fund-observer` | polls the bezant event stream; the only writer of `state.observedEvents` | ~5 min |
 | `ibkr-fund-digest` | daily summary to the ops feed | Mon–Fri |
