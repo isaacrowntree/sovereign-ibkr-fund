@@ -40,6 +40,7 @@ import { readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path';
 import { createRequire } from 'node:module';
 import { globSync } from 'node:fs';
+import { summariseStderr } from './stderr.mjs';
 
 const DB = process.env.PAPERCLIP_DATABASE_URL;
 const STATE_DIR = process.env.AGENT_HEALTH_STATE_DIR || '/fund-state/state';
@@ -95,7 +96,7 @@ try {
   for (const a of agents) {
     if (a.hb_enabled === false) continue;
     const [last] = await sql`
-      select status, error_code, started_at,
+      select status, error_code, stderr_excerpt, started_at,
              extract(epoch from (now() - started_at)) as age_sec
         from heartbeat_runs
        where agent_id = ${a.id} and started_at is not null
@@ -111,6 +112,9 @@ try {
       intervalSec: a.interval_sec,
       lastStatus: last?.status ?? null,
       lastErr: last?.error_code ?? null,
+      // Only a failed run's stderr explains anything; a healthy run's can
+      // still carry warnings that would read as a cause.
+      lastMsg: last?.status === 'failed' ? summariseStderr(last.stderr_excerpt) : null,
       ageSec: last ? Number(last.age_sec) : null,
       failed: Number(recent?.failed ?? 0),
       ok: Number(recent?.ok ?? 0),
@@ -129,6 +133,7 @@ try {
     name: r.name,
     reason: why,
     lastErr: r.lastErr,
+    lastMsg: r.lastMsg,
     ago: hrs(r.ageSec),
     ok: r.ok,
     failed: r.failed,
@@ -182,7 +187,7 @@ try {
     feed({
       severity: 'critical',
       title: `${bad.length} of ${rows.length} agents unhealthy`,
-      detail: bad.map(r => `${r.name} — ${r.reason}${r.lastErr ? ` (${r.lastErr})` : ''}, ${r.ago}`).join('; '),
+      detail: bad.map(r => `${r.name} — ${r.reason}${r.lastErr ? ` (${r.lastErr})` : ''}${r.lastMsg ? `: ${r.lastMsg}` : ''}, ${r.ago}`).join('; '),
     });
   }
   console.log(`[agent-health] ${failing.length} failing, ${silent.length} silent — status written, event recorded`);
