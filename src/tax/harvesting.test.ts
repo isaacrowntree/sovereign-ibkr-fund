@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isHarvestable, isWashSaleRestricted, findHarvestCandidates, createWashSaleEntry, hifoSelect, taxCostOfSale, TaxLot, WashSaleEntry } from './harvesting';
+import { harvestingEnabled, washSaleBlockEnabled, isHarvestable, isWashSaleRestricted, findHarvestCandidates, createWashSaleEntry, hifoSelect, taxCostOfSale, TaxLot, WashSaleEntry } from './harvesting';
 
 const makeLot = (overrides: Partial<TaxLot> = {}): TaxLot => ({
   id: '1', symbol: 'VTI', qty: 100, costBasis: 200, acquiredAt: '2025-01-01', currentPrice: 190,
@@ -115,5 +115,18 @@ describe('taxCostOfSale', () => {
     expect(tax).toBeGreaterThan(0);
     // Long-term gain: (150-100)*100 * 0.20 = $1000
     expect(tax).toBeCloseTo(1000, 0);
+  });
+});
+
+describe('switches', () => {
+  it('WASH_SALE_BLOCK defaults ON until the tax work deploys; off/false/0 disable it', () => {
+    expect(washSaleBlockEnabled({})).toBe(true);
+    expect(washSaleBlockEnabled({ WASH_SALE_BLOCK: 'on' })).toBe(true);
+    for (const v of ['off', 'false', '0', 'OFF']) expect(washSaleBlockEnabled({ WASH_SALE_BLOCK: v })).toBe(false);
+  });
+
+  it('harvesting is off unless explicitly enabled', () => {
+    expect(harvestingEnabled({})).toBe(false);
+    expect(harvestingEnabled({ TAX_HARVESTING: 'on' })).toBe(true);
   });
 });

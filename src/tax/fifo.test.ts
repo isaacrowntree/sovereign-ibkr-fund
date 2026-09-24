@@ -58,17 +58,30 @@ describe('matchSellFifo', () => {
     expect(m.realisedPnlUsd).toBe(50 * 30);
   });
 
-  it('legacy matchedBuyTimestamp consumes the whole prior lot', () => {
+  it('a legacy sell consumes only the shares it sold, not the whole lot', () => {
+    // The old matcher took `matchedBuyTimestamp` to mean the WHOLE lot was
+    // gone, so selling 10 of 100 shares wiped the cost base of the other 90.
     const history: TradeRecord[] = [
       buy('2026-01-01', 100, 100),
       { timestamp: '2026-03-01', symbol: 'NET', action: 'SELL', qty: 10, estimatedValue: 0,
         orderId: 3, status: 'filled', reason: 'legacy', matchedBuyTimestamp: '2026-01-01' },
       buy('2026-04-01', 20, 300),
     ];
-    // The 2026-01-01 lot is fully consumed by the legacy sell; new sell hits the $300 lot.
     const m = matchSellFifo(history, 'NET', 5, 320, T2026);
-    expect(m.costBasisPrice).toBe(300);
-    expect(m.realisedPnlUsd).toBe(5 * 20);
+    expect(m.costBasisPrice).toBe(100);
+    expect(m.realisedPnlUsd).toBe(5 * 220);
+  });
+
+  it('includes brokerage: buy commission in the cost base, sell commission off the proceeds', () => {
+    const history = [{ ...buy('2026-01-01', 10, 100), commission: 1 }];
+    const m = matchSellFifo(history, 'NET', 10, 110, T2026, 2);
+    expect(m.costBasisPrice).toBeCloseTo(100.1, 9);
+    expect(m.realisedPnlUsd).toBeCloseTo(10 * 110 - 2 - 1001, 9);
+  });
+
+  it('never matches a sale against a buy made after it', () => {
+    const m = matchSellFifo([buy('2026-08-01', 10, 100)], 'NET', 10, 120, T2026);
+    expect(m.matchedQty).toBe(0);
   });
 
   it('long-term parcels: reports the >12-month quantity', () => {

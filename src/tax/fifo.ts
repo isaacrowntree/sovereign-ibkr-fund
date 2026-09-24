@@ -1,56 +1,49 @@
 /**
- * Quantity-aware FIFO lot matching for realised P&L and cost basis.
+ * FIFO match for a sale about to be recorded — a thin view over the lot engine.
  *
- * The prior implementation matched each SELL to exactly one earliest BUY
- * record and priced the WHOLE sale off that one lot, ignoring share counts.
- * That produced wrong P&L (and a sign flip that could suppress a wash-sale
- * entry) on multi-lot sells, and dropped cost basis entirely on a second
- * sell of a lot the first had "consumed".
+ * The executor annotates each SELL it records with the parcels it consumed,
+ * its weighted cost base and realised P&L. That used to be its own matcher
+ * (whole-lot consumption for legacy records, commission ignored, a `> 365.25
+ * days` long-term test); it is now the lot engine's open parcels, so the
+ * annotation and the tax report are the same computation.
  *
- * This module replays trade history to compute, per BUY lot, how many shares
- * remain unconsumed by earlier SELLs, then consumes the current sale across
- * those lots oldest-first — the correct FIFO treatment. It is pure and takes
- * the history as input so it is fully unit-testable.
+ * The annotation is informational: the tax report recomputes every sale from
+ * the fills and never reads it back.
  */
 import type { TradeRecord } from '../state/store.js';
+import { openLotsFor } from './lots.js';
+import { exchangeTradeDate, isDiscountEligible } from './au-dates.js';
 
 export interface MatchedLot {
   /** `timestamp` of the BUY record this parcel came from. */
   buyTimestamp: string;
   /** Shares matched from that lot. */
   qty: number;
-  /** Per-share cost basis of that lot. */
+  /** Per-share purchase price of that lot (excluding brokerage). */
   buyPrice: number;
-  /** Whether this parcel was held > 12 months at sale (AU CGT discount). */
+  /** Whether this parcel qualifies for the AU CGT 50% discount at this sale. */
   longTerm: boolean;
 }
 
 export interface FifoMatch {
-  /** Weighted-average cost basis across all matched parcels. */
+  /** Weighted-average cost base per share across matched parcels, brokerage included. */
   costBasisPrice: number;
-  /** Realised P&L in USD across all matched parcels. */
+  /** Realised P&L in USD across matched parcels, net of buy and sell brokerage. */
   realisedPnlUsd: number;
   /** Shares that found a matching lot (may be < sellQty if history is short). */
   matchedQty: number;
-  /** Quantity held > 12 months, eligible for the AU CGT discount. */
+  /** Quantity eligible for the AU CGT discount. */
   longTermQty: number;
   /** The parcels consumed, oldest first. */
   lots: MatchedLot[];
 }
 
-const YEAR_MS = 365.25 * 24 * 60 * 60 * 1000;
-
 /**
- * Compute FIFO cost basis / realised P&L for a SELL of `sellQty` shares of
- * `symbol` at `sellPrice`, against the BUY lots in `history` net of shares
- * already consumed by prior SELLs.
+ * FIFO cost base / realised P&L for a SELL of `sellQty` shares of `symbol` at
+ * `sellPrice`, against the parcels still open after replaying `history`.
  *
- * Consumption is derived from prior SELL records' `matchedLots` (new format).
- * A legacy SELL carrying only `matchedBuyTimestamp` is treated as having
- * consumed its whole matched lot, preserving old behaviour for existing
- * history.
- *
- * `sellTime` defaults to now; injectable for tests.
+ * `sellTime` defaults to now; injectable for tests. `sellCommission` (USD) is
+ * the sale's brokerage, when known.
  */
 export function matchSellFifo(
   history: TradeRecord[],
@@ -58,57 +51,34 @@ export function matchSellFifo(
   sellQty: number,
   sellPrice: number,
   sellTime: number = Date.now(),
+  sellCommission = 0,
 ): FifoMatch {
-  // Remaining shares per BUY lot (keyed by its timestamp), oldest first.
-  const buys = history
-    .filter(t => t.action === 'BUY' && t.symbol === symbol)
-    .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime());
+  const sellIso = new Date(sellTime).toISOString();
+  const sellDate = exchangeTradeDate(sellIso) ?? sellIso.slice(0, 10);
+  // Only what was bought at or before the sale can be sold.
+  const prior = history.filter((t) => t.symbol === symbol && Date.parse(t.timestamp) <= sellTime);
+  const lots = openLotsFor(prior, symbol);
 
-  const remaining = new Map<string, number>();
-  for (const b of buys) remaining.set(b.timestamp, (remaining.get(b.timestamp) ?? 0) + b.qty);
-
-  // Subtract shares consumed by earlier SELLs of this symbol.
-  for (const s of history) {
-    if (s.action !== 'SELL' || s.symbol !== symbol) continue;
-    if (s.matchedLots && s.matchedLots.length > 0) {
-      for (const lot of s.matchedLots) {
-        remaining.set(lot.buyTimestamp, (remaining.get(lot.buyTimestamp) ?? 0) - lot.qty);
-      }
-    } else if (s.matchedBuyTimestamp) {
-      // Legacy: whole-lot consumption.
-      remaining.set(s.matchedBuyTimestamp, 0);
-    }
-  }
-
-  const lots: MatchedLot[] = [];
+  const out: MatchedLot[] = [];
   let toFill = sellQty;
-  let costTimesQty = 0;
-  let realisedPnlUsd = 0;
+  let cost = 0;
   let longTermQty = 0;
-
-  for (const b of buys) {
+  for (const lot of lots) {
     if (toFill <= 0) break;
-    const avail = remaining.get(b.timestamp) ?? 0;
-    if (avail <= 0) continue;
-    const take = Math.min(avail, toFill);
-    const buyPrice = b.fillPrice ?? (b.qty > 0 ? b.estimatedValue / b.qty : 0);
-    const longTerm = sellTime - new Date(b.timestamp).getTime() > YEAR_MS;
-
-    lots.push({ buyTimestamp: b.timestamp, qty: take, buyPrice, longTerm });
-    costTimesQty += buyPrice * take;
-    realisedPnlUsd += take * (sellPrice - buyPrice);
+    const take = Math.min(lot.qty, toFill);
+    const longTerm = !!lot.buyDate && isDiscountEligible(lot.buyDate, sellDate);
+    out.push({ buyTimestamp: lot.buyTimestamp, qty: take, buyPrice: lot.priceUsd, longTerm });
+    cost += take * lot.costPerShareUsd;
     if (longTerm) longTermQty += take;
-
-    remaining.set(b.timestamp, avail - take);
     toFill -= take;
   }
-
   const matchedQty = sellQty - toFill;
+  const sellCommMatched = sellQty > 0 ? (Math.abs(sellCommission) * matchedQty) / sellQty : 0;
   return {
-    costBasisPrice: matchedQty > 0 ? costTimesQty / matchedQty : 0,
-    realisedPnlUsd,
+    costBasisPrice: matchedQty > 0 ? cost / matchedQty : 0,
+    realisedPnlUsd: matchedQty > 0 ? matchedQty * sellPrice - sellCommMatched - cost : 0,
     matchedQty,
     longTermQty,
-    lots,
+    lots: out,
   };
 }

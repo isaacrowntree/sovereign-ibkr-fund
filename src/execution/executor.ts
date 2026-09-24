@@ -372,7 +372,7 @@ export async function executeQueue(
     // For SELL trades: quantity-aware FIFO cost basis across BUY lots, on the
     // CONFIRMED filled quantity.
     if (order.action === 'SELL') {
-      const match = matchSellFifo(deps.loadTradeHistory(), order.symbol, filledQty, fillPrice);
+      const match = matchSellFifo(deps.loadTradeHistory(), order.symbol, filledQty, fillPrice, Date.now(), commission);
       if (match.matchedQty > 0) {
         tradeRecord.matchedLots = match.lots.map(l => ({
           buyTimestamp: l.buyTimestamp, qty: l.qty, buyPrice: l.buyPrice, longTerm: l.longTerm,

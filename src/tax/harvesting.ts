@@ -1,6 +1,32 @@
 /**
- * Tax-loss harvesting and lot selection algorithms
+ * Tax-loss harvesting and lot selection algorithms.
+ *
+ * DISABLED. This is US tax logic: a 31-day wash-sale window, US short/long
+ * rates, "substantially identical" ETF swaps. None of it is how Australia
+ * works. The ATO's wash-sale position (TR 2008/1) is a purpose test under
+ * Part IVA, not a day count: selling to crystallise a loss and buying back
+ * the same exposure can have the loss cancelled however many days apart.
+ * Nothing in the fund auto-harvests; the tax optimizer only reports, and
+ * with harvesting off it reports nothing. The code is kept, not rewritten,
+ * until an AU-specific policy is designed.
+ *
+ * The 31-day re-buy block the rebalancer applies to a loss sale is behind
+ * WASH_SALE_BLOCK (see washSaleBlockEnabled).
  */
+
+/** Harvesting is off unless TAX_HARVESTING=on. Nothing acts on candidates even then. */
+export function harvestingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(on|true|1)$/i.test(env.TAX_HARVESTING ?? '');
+}
+
+/**
+ * WASH_SALE_BLOCK: whether a recent loss sale blocks re-buying the symbol for
+ * 31 days. ON by default until the tax work is deployed (the plan flips the
+ * default to off then); "off" / "false" / "0" disables it.
+ */
+export function washSaleBlockEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return !/^(off|false|0)$/i.test((env.WASH_SALE_BLOCK ?? 'on').trim());
+}
 
 export interface TaxLot {
   id: string;

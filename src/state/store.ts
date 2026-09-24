@@ -137,6 +137,29 @@ export interface TradeRecord {
    * same fill being recorded twice.
    */
   execId?: string;
+  /**
+   * The exchange trade date (YYYY-MM-DD, US/Eastern) — the contract date and
+   * so the CGT event date. Derived from `timestamp` when absent; set
+   * explicitly where only a date is known (opening lots).
+   */
+  tradeDate?: string;
+  /**
+   * AUD per 1 USD for this trade, from IBKR's own per-trade `fxRate` (the
+   * figure on the broker statements). Absent until the ledger is annotated.
+   */
+  audPerUsd?: number;
+  /** Where `audPerUsd` came from: IBKR's trade feed, or the RBA F11 fallback. */
+  fxSource?: 'ibkr' | 'rba';
+  /** True when `commission` is an estimate, not a figure IBKR reported. */
+  commissionEstimated?: boolean;
+  /** True when `fillPrice` was inferred (e.g. from average cost), not observed. */
+  priceInferred?: boolean;
+  /** How the record entered the ledger, when not by a live fill. */
+  source?: 'opening' | 'recovered' | 'reconciled';
+  /** IBKR contract id, when known. */
+  conid?: number;
+  /** Idempotency key of an opening lot: conid:date:qty:price. */
+  openingKey?: string;
 }
 
 let _db: DatabaseSync | null = null;
@@ -228,6 +251,10 @@ function openDb(): DatabaseSync {
       'payload TEXT NOT NULL)',
   );
   d.exec('CREATE INDEX IF NOT EXISTS observed_events_topic_id_idx ON observed_events (topic, id)');
+  // Currency conversions (AUD.USD executions), for the Division 775 export.
+  // Kept out of `trades` on purpose: they are not share parcels, and every
+  // share-count check (drift, orphan recovery) sums that table.
+  d.exec('CREATE TABLE IF NOT EXISTS fx_conversions (exec_id TEXT PRIMARY KEY, time TEXT, data TEXT NOT NULL)');
   d.exec(
     'CREATE TABLE IF NOT EXISTS notify_dedupe (' +
       'key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, sent_at INTEGER NOT NULL, expires_at INTEGER)',
@@ -469,9 +496,24 @@ export function mergeState(updates: Partial<FundState>): MergeStateResult {
  * Append a trade — IDEMPOTENT. The same fill can be surfaced twice (once by
  * the WS confirmation path with no execId, once by the executions-reconcile
  * path with an execId), so the store itself guarantees a fill is recorded at
- * most once. Keyed by IBKR's `execId` when present, else by the natural fill
- * signature (orderId + action + symbol + qty). A duplicate is silently
- * dropped, so callers never need their own dedup.
+ * most once. A duplicate is silently dropped, so callers never need their own
+ * dedup.
+ *
+ * The rule depends on what the incoming record carries:
+ *
+ * - **With an execId** (one IBKR execution): a duplicate if that execId is
+ *   already recorded; otherwise compared by signature (orderId + action +
+ *   symbol + qty) ONLY against rows WITHOUT an execId, i.e. the executor's
+ *   per-order aggregate. It used to be compared against every row, so the
+ *   second of two equal partials (50 + 50, distinct execIds) matched the first
+ *   and was dropped: a real fill lost from the tax ledger.
+ * - **Without an execId** (an executor aggregate): a duplicate if any row has
+ *   the same signature, or if the executions already recorded for that order
+ *   add up to at least its quantity (executions landed first, aggregate second).
+ *
+ * The signature fallback is a guard for a caller that did no accounting of
+ * its own. Executions reconciled against the ledger go through
+ * `appendReconciledTrades`, which must not be second-guessed by it.
  */
 export function appendTrade(trade: TradeRecord): void {
   const d = db();
@@ -484,18 +526,7 @@ export function appendTrade(trade: TradeRecord): void {
   //
   // Callers must NOT already hold a transaction (nested BEGIN IMMEDIATE throws).
   tx(d, () => {
-    if (trade.execId) {
-      const dup = d.prepare("SELECT 1 FROM trades WHERE json_extract(data,'$.execId') = ? LIMIT 1").get(trade.execId);
-      if (dup) return;
-    }
-    if (trade.orderId) {
-      const dup = d.prepare(
-        "SELECT 1 FROM trades WHERE json_extract(data,'$.orderId') = ? AND json_extract(data,'$.action') = ? " +
-          "AND json_extract(data,'$.symbol') = ? AND json_extract(data,'$.qty') = ? LIMIT 1",
-      ).get(trade.orderId, trade.action, trade.symbol, trade.qty);
-      if (dup) return;
-    }
-    d.prepare('INSERT INTO trades (ts, data) VALUES (?, ?)').run(trade.timestamp ?? null, JSON.stringify(trade));
+    if (!isDuplicateTrade(d, trade, { signatureFallback: true })) insertTrade(d, trade);
   });
 }
 
@@ -621,11 +652,169 @@ export function releaseLease(key: string, holder: string): boolean {
   return released;
 }
 
-export function loadTradeHistory(): TradeRecord[] {
-  const rows = db().prepare('SELECT data FROM trades ORDER BY id').all() as Array<{ data: string }>;
+/**
+ * Append the output of a reconciliation atomically with the history it was
+ * computed from.
+ *
+ * `compute` runs INSIDE the write transaction and receives the ledger as it
+ * stands at that instant, so nothing can be recorded between reading the
+ * history and writing the backfill — a concurrent executor aggregate cannot
+ * slip in and be double-counted.
+ *
+ * Records with an execId are deduped on the execId alone. The signature
+ * fallback in appendTrade must not apply here: `reconcileExecutions` has
+ * already charged each execution against its order's aggregate, in time
+ * order, and what it returns is precisely the part the aggregate does NOT
+ * cover. Re-checking by signature would drop it a second time — an aggregate
+ * of 50 with executions 50 + 50 would lose the second 50 outright.
+ *
+ * Returns the records actually inserted.
+ */
+export function appendReconciledTrades(compute: (history: TradeRecord[]) => TradeRecord[]): TradeRecord[] {
+  const d = db();
+  let inserted: TradeRecord[] = [];
+  tx(d, () => {
+    inserted = [];
+    const history = readTrades(d);
+    for (const t of compute(history)) {
+      if (isDuplicateTrade(d, t, { signatureFallback: !t.execId })) continue;
+      insertTrade(d, t);
+      inserted.push(t);
+    }
+  });
+  return inserted;
+}
+
+function insertTrade(d: DatabaseSync, trade: TradeRecord): void {
+  d.prepare('INSERT INTO trades (ts, data) VALUES (?, ?)').run(trade.timestamp ?? null, JSON.stringify(trade));
+}
+
+function isDuplicateTrade(d: DatabaseSync, trade: TradeRecord, opts: { signatureFallback: boolean }): boolean {
+  if (trade.execId) {
+    const dup = d.prepare("SELECT 1 FROM trades WHERE json_extract(data,'$.execId') = ? LIMIT 1").get(trade.execId);
+    if (dup) return true;
+  }
+  if (!opts.signatureFallback || !trade.orderId) return false;
+
+  const sameOrder =
+    "json_extract(data,'$.orderId') = ? AND json_extract(data,'$.action') = ? AND json_extract(data,'$.symbol') = ?";
+  if (trade.execId) {
+    // Only against aggregates: another execution of the same order with the
+    // same size is a different fill, not this one.
+    return !!d.prepare(
+      `SELECT 1 FROM trades WHERE ${sameOrder} AND json_extract(data,'$.qty') = ? ` +
+        "AND json_extract(data,'$.execId') IS NULL LIMIT 1",
+    ).get(trade.orderId, trade.action, trade.symbol, trade.qty);
+  }
+  if (d.prepare(`SELECT 1 FROM trades WHERE ${sameOrder} AND json_extract(data,'$.qty') = ? LIMIT 1`)
+    .get(trade.orderId, trade.action, trade.symbol, trade.qty)) {
+    return true;
+  }
+  const row = d.prepare(
+    `SELECT COALESCE(SUM(json_extract(data,'$.qty')), 0) AS q FROM trades WHERE ${sameOrder} ` +
+      "AND json_extract(data,'$.execId') IS NOT NULL",
+  ).get(trade.orderId, trade.action, trade.symbol) as { q: number };
+  return row.q > 0 && row.q >= trade.qty;
+}
+
+function readTrades(d: DatabaseSync): TradeRecord[] {
+  const rows = d.prepare('SELECT data FROM trades ORDER BY id').all() as Array<{ data: string }>;
   const out: TradeRecord[] = [];
   for (const r of rows) {
     try { out.push(JSON.parse(r.data) as TradeRecord); } catch { /* skip */ }
+  }
+  return out;
+}
+
+export function loadTradeHistory(): TradeRecord[] {
+  return readTrades(db());
+}
+
+// ---------- One-way ledger migration ----------
+
+/** Trades with their row ids, in insertion order. */
+export function loadTradeRows(): Array<{ id: number; trade: TradeRecord }> {
+  const rows = db().prepare('SELECT id, data FROM trades ORDER BY id').all() as Array<{ id: number; data: string }>;
+  const out: Array<{ id: number; trade: TradeRecord }> = [];
+  for (const r of rows) {
+    try { out.push({ id: r.id, trade: JSON.parse(r.data) as TradeRecord }); } catch { /* skip */ }
+  }
+  return out;
+}
+
+export interface LedgerMigration {
+  /** The ledger the plan was computed from: row count and highest id. */
+  expect: { count: number; maxId: number };
+  insert: TradeRecord[];
+  patches: Array<{ id: number; set: Partial<TradeRecord>; unset?: Array<keyof TradeRecord> }>;
+  /** State keys written in the same transaction (e.g. the drift baseline). */
+  state: Record<string, unknown>;
+}
+
+/**
+ * Apply a planned migration in ONE transaction: new rows, field patches to
+ * existing rows, and state keys. Either all of it lands or none of it does —
+ * a zeroed drift baseline without its opening lots (or the reverse) would
+ * make orphan recovery misread every pre-ledger share.
+ *
+ * Refuses (throws, nothing written) if the ledger changed since the plan was
+ * made: the plan was verified against positions for THAT ledger.
+ */
+export function applyLedgerMigration(m: LedgerMigration): void {
+  const d = db();
+  tx(d, () => {
+    const now = d.prepare('SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS maxId FROM trades').get() as { n: number; maxId: number };
+    if (now.n !== m.expect.count || now.maxId !== m.expect.maxId) {
+      throw new Error(
+        `ledger changed since the plan was made (rows ${m.expect.count}->${now.n}, max id ${m.expect.maxId}->${now.maxId}) — re-run`,
+      );
+    }
+    const get = d.prepare('SELECT data FROM trades WHERE id = ?');
+    const upd = d.prepare('UPDATE trades SET data = ? WHERE id = ?');
+    for (const p of m.patches) {
+      const row = get.get(p.id) as { data: string } | undefined;
+      if (!row) throw new Error(`patch for missing trade row ${p.id}`);
+      const t = { ...(JSON.parse(row.data) as TradeRecord), ...p.set } as unknown as Record<string, unknown>;
+      for (const k of p.unset ?? []) delete t[k];
+      upd.run(JSON.stringify(t), p.id);
+    }
+    for (const t of m.insert) insertTrade(d, t);
+    const put = d.prepare(
+      'INSERT INTO state_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    );
+    for (const [k, v] of Object.entries(m.state)) put.run(k, JSON.stringify(v));
+  });
+}
+
+// ---------- FX conversions (Division 775 record) ----------
+
+/** Structurally an `FxConversion` from connection/ibkr-history; kept loose to avoid a store → gateway import. */
+export interface FxConversionRecord {
+  execId: string;
+  time: string;
+}
+
+/** Record conversions, idempotent on execId. Returns how many were new. */
+export function appendFxConversions<T extends FxConversionRecord>(rows: T[]): number {
+  if (rows.length === 0) return 0;
+  const d = db();
+  let added = 0;
+  tx(d, () => {
+    added = 0;
+    const ins = d.prepare('INSERT OR IGNORE INTO fx_conversions (exec_id, time, data) VALUES (?, ?, ?)');
+    for (const r of rows) {
+      if (!r.execId) continue;
+      added += Number(ins.run(r.execId, r.time ?? null, JSON.stringify(r)).changes);
+    }
+  });
+  return added;
+}
+
+export function loadFxConversions<T extends FxConversionRecord = FxConversionRecord>(): T[] {
+  const rows = db().prepare('SELECT data FROM fx_conversions ORDER BY time, exec_id').all() as Array<{ data: string }>;
+  const out: T[] = [];
+  for (const r of rows) {
+    try { out.push(JSON.parse(r.data) as T); } catch { /* skip */ }
   }
   return out;
 }

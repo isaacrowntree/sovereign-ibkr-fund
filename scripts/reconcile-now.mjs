@@ -1,66 +1,54 @@
 #!/usr/bin/env node
 /**
- * One-off / manual ledger reconciliation: record any IBKR execution that the
- * bot's trade-history is missing (e.g. a fill the WS stream missed). Runs in
- * the container against the deployed dist. Idempotent by execId.
+ * Manual ledger reconciliation: record any IBKR execution the ledger is
+ * missing (e.g. a fill the WS stream missed). Runs in the container against
+ * the deployed dist. Safe to re-run.
  *
- * Cost basis for SELLs: the bot's ledger has no opening lots (the account's
- * pre-existing positions were never recorded), so FIFO finds nothing. We fall
- * back to the IBKR position's avgCost for the symbol — correct for realised
- * P&L (avg cost per share is unchanged by a sale). Long-term (AU CGT) status
- * is left unset because the lot acquisition date isn't available here.
+ * This used to carry its own matching loop, keyed on execId alone. That was a
+ * second, weaker copy of `reconcileExecutions()`: it could not see the
+ * executor's per-ORDER aggregate records (which carry no execId), so every
+ * partial fill of an order the executor had already recorded was appended on
+ * top of it — 100 real shares became 200. It also stamped each backfill with
+ * the time the script ran rather than when the fill happened, which moves the
+ * trade into the wrong day (and, near 30 June, the wrong financial year).
+ *
+ * Now it is only I/O around the same pure function execution-bot uses, so the
+ * two can never disagree about what is already recorded. Timestamps are IBKR's
+ * own execution time (`e.time`), which reconcileExecutions() stamps.
+ *
+ * Cost basis is not written here. The tax report derives every sale's basis
+ * from the ledger's lots at report time; a figure frozen onto the sell record
+ * (the old avgCost fallback) was only ever an estimate, and a wrong one when a
+ * position had several lots.
  */
-import { getExecutions, getAccountSummary, connect, disconnect } from '../dist/connection/gateway.js';
-import { loadTradeHistory, appendTrade, loadState, mergeState, closeDb } from '../dist/state/store.js';
+import { getExecutions, connect, disconnect } from '../dist/connection/gateway.js';
+import { reconcileExecutions } from '../dist/execution/reconcile.js';
+import { loadTradeHistory, appendReconciledTrades, appendFxConversions, loadState, mergeState, closeDb } from '../dist/state/store.js';
+import { getFxConversions } from '../dist/connection/ibkr-history.js';
 
 await connect();
 const execs = await getExecutions();
-const acc = await getAccountSummary();
-const avgCostBySymbol = new Map(acc.positions.map(p => [p.symbol, p.avgCost]));
 
-const history = loadTradeHistory();
-const seenExecIds = new Set(history.map(t => t.execId).filter(Boolean));
+// Computed inside the write transaction against the ledger as it stands, so a
+// concurrent execution-bot run cannot record the same fill in between.
+const backfill = appendReconciledTrades((history) => reconcileExecutions(history, execs));
+const after = loadTradeHistory().length;
 
-const added = [];
-for (const e of execs) {
-  if (e.execId && seenExecIds.has(e.execId)) continue;
-  const rec = {
-    timestamp: new Date().toISOString(),
-    symbol: e.symbol,
-    action: e.action,
-    qty: e.qty,
-    estimatedValue: e.qty * e.price,
-    fillPrice: e.price,
-    orderId: e.orderId ?? 0,
-    status: 'filled',
-    reason: 'reconciled_from_ibkr',
-    execId: e.execId,
-  };
-  if (e.action === 'SELL') {
-    const basis = avgCostBySymbol.get(e.symbol);
-    if (basis != null) {
-      rec.costBasisPrice = basis;
-      rec.realisedPnlUsd = e.qty * (e.price - basis);
-      // longTermHolding intentionally left unset — acquisition date unknown.
-    }
-  }
-  appendTrade(rec);
-  seenExecIds.add(e.execId);
-  added.push(rec);
-}
-
-console.log(`Reconciled ${added.length} execution(s) into the ledger:`);
-for (const r of added) {
-  const pnl = r.realisedPnlUsd != null ? ` | cost $${r.costBasisPrice} P&L $${r.realisedPnlUsd.toFixed(2)}` : '';
-  console.log(`  ${r.action} ${r.qty} ${r.symbol} @ $${r.fillPrice}${pnl} | execId ${r.execId}`);
+console.log(`Reconciled ${backfill.length} execution(s) into the ledger:`);
+for (const r of backfill) {
+  console.log(`  ${r.timestamp} ${r.action} ${r.qty} ${r.symbol} @ $${r.fillPrice} | execId ${r.execId}`);
 }
 
 // A live fill occurred, so validation is genuinely proven.
-if (added.length > 0 && !loadState().liveExecutionValidatedAt) {
+if (backfill.length > 0 && !loadState().liveExecutionValidatedAt) {
   mergeState({ liveExecutionValidatedAt: new Date().toISOString(), lastValidationFailure: null });
   console.log('Set liveExecutionValidatedAt (a live fill was confirmed against IBKR).');
 }
 
-console.log(`trade-history now has ${loadTradeHistory().length} record(s).`);
+// AUD<->USD conversions, for the Division 775 export (idempotent by execId).
+const fx = appendFxConversions(await getFxConversions());
+if (fx > 0) console.log(`Recorded ${fx} FX conversion(s).`);
+
+console.log(`trade-history now has ${after} record(s).`);
 closeDb();
 disconnect();

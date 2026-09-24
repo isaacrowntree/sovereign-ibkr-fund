@@ -42,7 +42,7 @@
  *
  *   scripts/run-agent.sh execution-bot
  */
-import { DatabaseSync } from 'node:sqlite';
+import { openStateDb, readStateKey, stageQueueIfEmpty } from './lib/state-db.mjs';
 import { readFileSync } from 'node:fs';
 // The planning logic is src/portfolio/deposit-plan.ts, unit-tested there. This
 // script is only state I/O and a CLI around it — the Pi runs prebuilt dist/, so
@@ -93,11 +93,8 @@ for (let i = 0; i < args.length; i++) {
 /** Held back for commission + slippage so the last BUY can't tip into no-buying-power. */
 const RESERVE_USD = parseFloat(flag('--reserve-usd') ?? '150');
 
-const db = new DatabaseSync(DB, { readOnly: !CONFIRM });
-const get = (k) => {
-  const r = db.prepare('select value from state_kv where key = ?').get(k);
-  return r ? JSON.parse(r.value) : null;
-};
+const db = openStateDb(DB, { write: CONFIRM });
+const get = (k) => readStateKey(db, k);
 
 const snap = get('lastSnapshot');
 if (!snap) { console.error('no lastSnapshot in state — run the managing-partner agent first'); process.exit(1); }
@@ -183,12 +180,10 @@ if (!CONFIRM) {
   process.exit(0);
 }
 
-const existing = get('pendingOrders') || [];
-if (existing.length) {
-  console.error(`\nREFUSING: ${existing.length} order(s) already queued. Clear or execute them first.`);
+const put = stageQueueIfEmpty(db, orders);
+if (!put.staged) {
+  console.error(`\nREFUSING: ${put.existing} order(s) already queued. Clear or execute them first.`);
   process.exit(1);
 }
-db.prepare('insert into state_kv (key, value) values (?, ?) on conflict(key) do update set value = excluded.value')
-  .run('pendingOrders', JSON.stringify(orders));
 console.log(`\nStaged ${orders.length} order(s) to pendingOrders.`);
 console.log('Execute NOW (see RACE above): scripts/run-agent.sh execution-bot');

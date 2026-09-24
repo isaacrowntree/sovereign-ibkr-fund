@@ -133,6 +133,10 @@ export function reconcileExecutions(
       status: 'filled',
       reason: 'reconciled_from_ibkr',
       execId: e.execId,
+      // IBKR reports it per execution; dropping it here left every backfilled
+      // fill with no brokerage, which understates the cost base of a buy and
+      // overstates the proceeds of a sale.
+      ...(e.commission != null && Number.isFinite(e.commission) ? { commission: Math.abs(e.commission) } : {}),
     });
     if (e.execId) seenExecIds.add(e.execId);
   }
