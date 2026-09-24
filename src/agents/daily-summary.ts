@@ -69,12 +69,45 @@ function topDrift(holdings: Holding[], n: number): Holding[] {
     .slice(0, n);
 }
 
+/**
+ * Hours past which the snapshot this digest reads is too old to report as
+ * today's. 26 = the digest's daily cadence plus slack. 0 turns the check off.
+ */
+export function staleHours(): number {
+  const n = Number(process.env.DIGEST_STALE_HOURS ?? '26');
+  return Number.isFinite(n) && n >= 0 ? n : 26;
+}
+
+/**
+ * Age of the NAV / holdings snapshot, in hours. `lastCheckAt` is written in the
+ * same mergeState as lastNav, lastCash and lastSnapshot (managing-partner), so
+ * it dates all three. Null when it is missing or unreadable — which is itself
+ * stale: a digest cannot vouch for numbers it cannot date.
+ */
+export function snapshotAgeHours(state: Record<string, unknown>, now: Date): number | null {
+  const at = Date.parse(String(state.lastCheckAt ?? ''));
+  if (!Number.isFinite(at)) return null;
+  return Math.max(0, (now.getTime() - at) / 3_600_000);
+}
+
+export function isSnapshotStale(state: Record<string, unknown>, now: Date): boolean {
+  const limit = staleHours();
+  if (limit === 0) return false;
+  const age = snapshotAgeHours(state, now);
+  return age === null || age > limit;
+}
+
 export function buildDigest(
   state: Record<string, unknown>,
   history: TradeRecord[],
   date: string,
-): { title: string; body: string; fields: NotifyField[] } {
+  now: Date = new Date(),
+): { title: string; body: string; fields: NotifyField[]; stale: boolean } {
   const fills = tradesOn(history, date);
+  // A digest that reads a dead snapshot used to look exactly like a quiet day:
+  // same NAV, no fills, same drift. Say so on its face.
+  const stale = isSnapshotStale(state, now);
+  const age = snapshotAgeHours(state, now);
   const nav = state.lastNav as number | undefined;
   const cash = state.lastCash as number | undefined;
   const level = (state.drawdownLevel as string | undefined) ?? 'unknown';
@@ -84,6 +117,9 @@ export function buildDigest(
   const ddPct = peak && nav && peak > 0 ? ((peak - nav) / peak) * 100 : undefined;
 
   const fields: NotifyField[] = [];
+  if (stale) {
+    fields.push({ label: 'Snapshot', value: age === null ? 'undated (STALE)' : `${age.toFixed(0)}h old (STALE)` });
+  }
   if (nav !== undefined) fields.push({ label: 'NAV', value: usd(nav) });
   if (cash !== undefined) fields.push({ label: 'Cash', value: usd(cash) });
   fields.push({
@@ -185,9 +221,10 @@ export function buildDigest(
   if (dashboard) body.push(`<${dashboard}|Live dashboard>`);
 
   return {
-    title: `Daily summary ${date} — ${nav !== undefined ? usd(nav) : 'NAV unknown'}${pnlSuffix}`,
+    title: `${stale ? 'STALE — ' : ''}Daily summary ${date} — ${nav !== undefined ? usd(nav) : 'NAV unknown'}${pnlSuffix}`,
     body: body.join('\n\n'),
     fields,
+    stale,
   };
 }
 
@@ -195,8 +232,9 @@ export async function run(): Promise<void> {
   log('Building daily summary', AGENT);
 
   const state = loadState() as Record<string, unknown>;
-  const date = tradingDate(new Date());
-  const digest = buildDigest(state, loadTradeHistory(), date);
+  const now = new Date();
+  const date = tradingDate(now);
+  const digest = buildDigest(state, loadTradeHistory(), date, now);
 
   await notify(
     {
@@ -220,7 +258,27 @@ export async function run(): Promise<void> {
     storeHooks,
   );
 
-  log(`Daily summary recorded for ${date}`, AGENT);
+  if (digest.stale) {
+    // The digest itself goes to the page, which nobody is prompted to open —
+    // so a stale one would be stale in silence. This is the push.
+    const age = snapshotAgeHours(state, now);
+    await notify(
+      {
+        severity: 'warn',
+        title: `Fund snapshot is ${age === null ? 'undated' : `${age.toFixed(0)}h old`} — today's digest is stale`,
+        body:
+          'The NAV, cash and holdings the digest reports have not been refreshed. Managing Partner writes ' +
+          'them each cycle — check that it is running, and that the gateway is logged in.',
+        fields: [{ label: 'Last refreshed', value: String(state.lastCheckAt ?? 'never') }],
+        agent: AGENT,
+        // Once per trading day, like the digest it is about.
+        dedupe: { key: `digest-stale:${date}`, ttlMs: Infinity },
+      },
+      storeHooks,
+    );
+  }
+
+  log(`Daily summary recorded for ${date}${digest.stale ? ' (STALE snapshot)' : ''}`, AGENT);
 }
 
 if (process.argv.includes('--once')) {
