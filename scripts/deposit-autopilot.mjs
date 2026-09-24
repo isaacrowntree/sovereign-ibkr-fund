@@ -23,7 +23,7 @@
  *     node scripts/deposit-autopilot.mjs --targets <f.json> [--directed A,B]
  *          [--min-deploy-usd N] [--refresh] [--confirm]
  */
-import { DatabaseSync } from 'node:sqlite';
+import { openStateDb, readStateKey, stageQueueIfEmpty } from './lib/state-db.mjs';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { planDepositBuy } from '../dist/portfolio/deposit-plan.js';
@@ -50,11 +50,8 @@ const sh = (label, cmd, argv) => {
   if (r.status !== 0) { console.error(`\nFAILED: ${label} exited ${r.status}. Stopping.`); process.exit(1); }
 };
 
-const openDb = (write) => new DatabaseSync(DB, { readOnly: !write });
-const readState = (db, k) => {
-  const r = db.prepare('select value from state_kv where key = ?').get(k);
-  return r ? JSON.parse(r.value) : null;
-};
+const openDb = (write) => openStateDb(DB, { write });
+const readState = readStateKey;
 
 async function gather() {
   const db = openDb(false);
@@ -178,13 +175,12 @@ const staged = f.plan.orders.map(o => ({
 }));
 
 const wdb = openDb(true);
-if ((readState(wdb, 'pendingOrders') || []).length > 0) {
+const put = stageQueueIfEmpty(wdb, staged);
+wdb.close?.();
+if (!put.staged) {
   console.error('REFUSING: a queue appeared since the check. Re-run.');
   process.exit(1);
 }
-wdb.prepare('insert into state_kv (key, value) values (?, ?) on conflict(key) do update set value = excluded.value')
-  .run('pendingOrders', JSON.stringify(staged));
-wdb.close?.();
 console.log(`\nStaged ${staged.length} order(s).`);
 
 sh('execute', 'node', ['dist/agents/execution-bot.js', '--once']);
