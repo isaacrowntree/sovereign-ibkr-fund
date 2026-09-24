@@ -355,6 +355,17 @@ export function loadState(): FundState {
   return out;
 }
 
+/**
+ * One key, parsed, without loading the rest of the state. For the checks that
+ * run before every order (the hub's execution toggle), where the whole state
+ * would be wasted work. Undefined when absent or unparseable.
+ */
+export function loadStateKey(key: string): unknown {
+  const row = db().prepare('SELECT value FROM state_kv WHERE key = ?').get(key) as { value?: string } | undefined;
+  if (row?.value === undefined) return undefined;
+  try { return JSON.parse(row.value) as unknown; } catch { return undefined; }
+}
+
 export function saveState(state: FundState): void {
   const d = db();
   tx(d, () => {

@@ -865,3 +865,49 @@ describe('executeQueue — placementBlocker', () => {
     expect(outcome.requeue.map(o => o.symbol)).toEqual(['NET', 'AVGO', 'GLD']);
   });
 });
+
+describe('executeQueue — run budget', () => {
+  it('places while the fill wait fits, then stops cleanly with the rest queued (not a halt)', async () => {
+    const { deps, calls } = makeDeps();
+    // Each placement burns 60s of budget in this fake.
+    let left = 400_000;
+    deps.timeRemainingMs = () => left;
+    const place = deps.placeOrder;
+    deps.placeOrder = async (...a) => { left -= 60_000; return place(...a); };
+    const outcome = await executeQueue(MIXED_QUEUE, ctx(), deps);
+    // A Patient order needs its 180s wait + 15s margin = 195s: 400, 340, 280
+    // and 220 all cover it, so the whole queue goes.
+    expect(calls.filter(c => c.startsWith('place:'))).toEqual([
+      'place:SELL:BRK-B', 'place:SELL:NET', 'place:BUY:AVGO', 'place:BUY:GLD',
+    ]);
+    expect(outcome.halted).toBe(false);
+
+    const second = makeDeps();
+    let left2 = 250_000;
+    second.deps.timeRemainingMs = () => left2;
+    const place2 = second.deps.placeOrder;
+    second.deps.placeOrder = async (...a) => { left2 -= 60_000; return place2(...a); };
+    const out2 = await executeQueue(MIXED_QUEUE, ctx(), second.deps);
+    expect(second.calls.filter(c => c.startsWith('place:'))).toEqual(['place:SELL:BRK-B']);
+    expect(out2.halted).toBe(false);
+    expect(out2.stoppedReason).toMatch(/run budget/);
+    expect(out2.requeue.map(o => o.symbol)).toEqual(['NET', 'AVGO', 'GLD']);
+    // Buys never reached the cash gate — the run stopped in the sells.
+    expect(second.calls).not.toContain('cash');
+  });
+
+  it('a Normal-urgency order (crisis → Urgent) needs only its 60s wait', async () => {
+    const { deps, calls } = makeDeps();
+    deps.timeRemainingMs = () => 100_000;
+    await executeQueue([order('NET', 'SELL', 100)], ctx({ regime: 'crisis' }), deps);
+    expect(calls).toContain('place:SELL:NET');
+  });
+
+  it('stopping before the validation probe is not a failed validation', async () => {
+    const { deps } = makeDeps();
+    deps.timeRemainingMs = () => 10_000;
+    const outcome = await executeQueue(MIXED_QUEUE, ctx({ validated: false }), deps);
+    expect(outcome.validationFailed).toBe(false);
+    expect(outcome.stoppedReason).toBeDefined();
+  });
+});

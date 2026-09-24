@@ -33,9 +33,10 @@ import {
 import { createRunLock, runLeaseMs, type RunLock } from '../execution/run-lock.js';
 import type { StagedOrder } from '../execution/staging.js';
 import type { AlgoPriority, ExecutionPlan as AlgoPlan } from '../execution/algo-orders.js';
-import { isExecutionWindow, describeWindow, EXECUTION_WINDOW } from '../strategy/market-hours.js';
+import { isExecutionWindow, describeWindow, EXECUTION_WINDOW, calendarCoverage, calendarFailOpen } from '../strategy/market-hours.js';
+import { executionDisabledReason, runBudgetMs } from '../execution/kill-switches.js';
 import { confirmFill } from '../observability/fill-confirmer.js';
-import { loadState, mergeState, appendTrade, loadTradeHistory } from '../state/store.js';
+import { loadState, loadStateKey, mergeState, appendTrade, loadTradeHistory } from '../state/store.js';
 import type { WashSaleEntry } from '../tax/harvesting.js';
 import { alert, notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
@@ -103,6 +104,7 @@ async function reportRun(outcome: ExecutionOutcome, runAt: string): Promise<void
     { label: 'Notional', value: usd(notional) },
     ...(avgBps !== null ? [{ label: 'Avg shortfall', value: `${avgBps.toFixed(1)} bps` }] : []),
     ...(outcome.requeue.length ? [{ label: 'Still queued', value: String(outcome.requeue.length) }] : []),
+    ...(outcome.stoppedReason ? [{ label: 'Stopped', value: outcome.stoppedReason }] : []),
   ];
 
   if (outcome.validationFailed) {
@@ -254,8 +256,22 @@ async function placeOrder(
   }
 }
 
+/** A position's quantity, or a throw when the broker did not give a usable one. */
+function requireQty(p: { symbol: string; qty: unknown; qtyMissing?: true }): number {
+  if (p.qtyMissing || typeof p.qty !== 'number' || !Number.isFinite(p.qty)) {
+    throw new Error(`position ${p.symbol} has no usable quantity from IBKR`);
+  }
+  return p.qty;
+}
+
+/** Regime labels quant-analyst writes and selectUrgency understands. */
+const KNOWN_REGIMES = new Set(['risk_on', 'neutral', 'risk_off', 'crisis']);
+
 async function run(): Promise<void> {
   log('Execution check starting', AGENT);
+  // The run budget counts from here: connect, reconcile and recovery all spend it.
+  const runStartedAt = Date.now();
+  const budgetMs = runBudgetMs();
 
   const state = loadState();
   const pendingOrders = (state.pendingOrders || []) as StagedOrder[];
@@ -263,6 +279,35 @@ async function run(): Promise<void> {
   if (pendingOrders.length === 0) {
     log('No pending orders', AGENT);
     return;
+  }
+
+  // Global kill switch — env or the hub's toggle. Checked again before every
+  // order (placementBlocker below), so flipping it mid-run stops the next one.
+  const disabled = executionDisabledReason(process.env, state.executionEnabled);
+  if (disabled) {
+    log(`${pendingOrders.length} pending order(s) but ${disabled} — queue untouched`, AGENT);
+    return;
+  }
+
+  // The holiday table is finite. Past its end the window is a plain weekday
+  // check again (or closed, with CALENDAR_FAIL_OPEN=0) — say so, once a day.
+  const coverage = calendarCoverage(new Date());
+  if (!coverage.covered) {
+    log(`NYSE calendar ends ${coverage.validThrough} — holidays are no longer known`, AGENT);
+    await notify(
+      {
+        severity: 'warn',
+        title: 'NYSE holiday calendar has run out',
+        body:
+          `src/strategy/nyse-calendar.json covers dates up to ${coverage.validThrough}. Until it is extended ` +
+          (calendarFailOpen()
+            ? 'execution treats every weekday as a regular session, holidays included.'
+            : 'execution is closed on every day the table does not cover (CALENDAR_FAIL_OPEN=0).'),
+        agent: AGENT,
+        dedupe: { key: 'exec:calendar-expired', fingerprint: coverage.validThrough },
+      },
+      storeHooks,
+    );
   }
 
   // Trading window: skip the first 30 min after open (high volatility, wide
@@ -402,7 +447,10 @@ async function run(): Promise<void> {
         pending: queue,
         history: loadTradeHistory(),
         positions: summary.positions.map(p => ({
-          symbol: p.symbol, qty: p.qty ?? 0, avgCost: p.avgCost,
+          // Fail closed: a position without a quantity is not a position of
+          // zero, and reading it as one would "recover" fills that never
+          // happened. Throwing lands in the catch below — session skipped.
+          symbol: p.symbol, qty: requireQty(p), avgCost: p.avgCost,
         })),
         baselineSignature: state.ledgerDriftBaseline as string | undefined,
         now: new Date(),
@@ -582,6 +630,32 @@ async function run(): Promise<void> {
     phase('usd-balances');
     const startBalances = await getUsdBalances();
 
+    // Fail closed on NAV. It sizes the %-of-NAV order cap and the execution
+    // strategy; the old `|| 100000` fallback meant a missing ledger read
+    // silently sized every check against a made-up fund.
+    if (!(Number.isFinite(startBalances.usdNav) && startBalances.usdNav > 0)) {
+      log(`BLOCKED: USD NAV unreadable (${startBalances.usdNav}) — refusing to size orders against a guess`, AGENT);
+      await notify(
+        {
+          severity: 'warn',
+          title: 'Execution skipped — USD NAV unreadable',
+          body: 'The ledger returned no usable USD NAV, which the order caps are sized against. Nothing was placed; the queue is untouched.',
+          fields: [{ label: 'Queued', value: String(queue.length) }],
+          agent: AGENT,
+          dedupe: { key: 'exec:nav-unreadable', fingerprint: 'nav' },
+        },
+        storeHooks,
+      );
+      return;
+    }
+
+    // Regime only picks the algo urgency (crisis → Urgent, else Patient). An
+    // unknown or missing one gets the patient default, which is the cautious
+    // choice — but say so rather than silently calling it 'neutral'.
+    const rawRegime = (state.regime as { composite?: unknown } | null | undefined)?.composite;
+    const regime = typeof rawRegime === 'string' && KNOWN_REGIMES.has(rawRegime) ? rawRegime : 'unknown';
+    if (regime === 'unknown') log(`Regime unknown (${String(rawRegime)}) — using Patient urgency`, AGENT);
+
     const deps: ExecutorDeps = {
       placeOrder,
       confirmFill: (orderId, opts) => confirmFill(orderId, opts),
@@ -602,7 +676,17 @@ async function run(): Promise<void> {
       loadTradeHistory,
       appendTrade,
       isWindowOpen: isExecutionWindow,
-      placementBlocker: () => (runLock?.held() ? null : 'run lock lost (another run took it over)'),
+      placementBlocker: () => {
+        if (!runLock?.held()) return 'run lock lost (another run took it over)';
+        let flag: unknown;
+        try { flag = loadStateKey('executionEnabled'); } catch (e) {
+          // Can't read the toggle → can't know it is still on. Stop.
+          logError('Could not read executionEnabled', e, AGENT);
+          return 'execution toggle unreadable';
+        }
+        return executionDisabledReason(process.env, flag);
+      },
+      timeRemainingMs: budgetMs > 0 ? () => budgetMs - (Date.now() - runStartedAt) : undefined,
       log: (msg) => log(msg, AGENT),
       logError: (msg, err) => logError(msg, err, AGENT),
       // The window between placing an order and confirming its fill is where
@@ -615,8 +699,8 @@ async function run(): Promise<void> {
       queue,
       {
         validated,
-        nav: startBalances.usdNav || 100000,
-        regime: (state.regime as { composite: string } | null)?.composite || 'neutral',
+        nav: startBalances.usdNav,
+        regime,
         // Fill confirmation via the WS event stream is the default — the
         // synchronous response only proves acceptance, not fills. Set
         // FILL_CONFIRMATION_ENABLED=0 to trust acceptance (never during

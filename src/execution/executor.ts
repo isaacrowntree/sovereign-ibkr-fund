@@ -30,6 +30,7 @@ import { computeShortfall, type ShortfallResult } from './shortfall.js';
 import { selectExecutionStrategy, selectUrgency, type AlgoPriority, type ExecutionPlan as AlgoPlan } from './algo-orders.js';
 import { planExecution, gateBuysByCash, type StagedOrder } from './staging.js';
 import { orderCapViolation, type NotionalCaps } from '../risk/data-sanity.js';
+import { RUN_BUDGET_MARGIN_MS } from './kill-switches.js';
 
 export interface ExecutorContext {
   /** Has a live fill ever been confirmed? False → validation mode. */
@@ -138,6 +139,12 @@ export interface ExecutorDeps {
    * lost its lease must not keep placing). Optional.
    */
   placementBlocker?(): string | null;
+  /**
+   * Milliseconds left in this run's budget (RUN_BUDGET_SEC). An order is only
+   * placed when its fill wait plus a margin still fits; otherwise the run
+   * stops cleanly and the rest stays queued. Optional: absent → no budget.
+   */
+  timeRemainingMs?(): number;
   log(message: string): void;
   logError(message: string, err: unknown): void;
 }
@@ -183,6 +190,12 @@ export interface ExecutionOutcome {
   executed: StagedOrder[];
   halted: boolean;
   haltReason: string;
+  /**
+   * Set when the run stopped placing for an ordinary reason — its time budget
+   * ran out — rather than a fault. Not a halt: nothing went wrong, the rest of
+   * the queue simply waits for the next run.
+   */
+  stoppedReason?: string;
   /** At least one fill was confirmed (or acceptance-trusted on opt-out). */
   confirmedFill: boolean;
   /** True when a validation run ended without a confirmed fill. */
@@ -230,6 +243,7 @@ export async function executeQueue(
   let confirmedFill = false;
   let halted = false;
   let haltReason = '';
+  let stoppedReason: string | undefined;
   let runNotional = 0; // cumulative USD notional placed this run (for the per-run cap)
   let avgCosts = new Map<string, number>(); // per-symbol avg cost, fetched at run start
 
@@ -531,9 +545,12 @@ export async function executeQueue(
     halt(`${reason} (${order.symbol})`);
   };
 
+  /** Longest this run may wait for one order's fill (Patient 180s, else 60s). */
+  const fillWaitMs = (urgency: AlgoPriority): number => (urgency === 'Patient' ? 180_000 : 60_000);
+
   const executeBatch = async (batch: StagedOrder[]): Promise<void> => {
     for (const order of batch) {
-      if (halted) return;
+      if (halted || stoppedReason) return;
 
       // Re-check the trading window before every placement: a full queue of
       // Patient orders can take longer than the window is open, and we must
@@ -576,6 +593,20 @@ export async function executeQueue(
 
       const strategy = selectExecutionStrategy(order.estimatedValue, ctx.nav);
       const urgency = selectUrgency(false, true, ctx.regime);
+
+      // Run budget: never place an order whose confirmation might still be
+      // waiting when the orchestrator kills the run — that leaves a live order
+      // with nothing recorded. Stop instead; it places next run.
+      if (deps.timeRemainingMs) {
+        const left = deps.timeRemainingMs();
+        const need = (useFillConfirmer ? fillWaitMs(urgency) : 0) + RUN_BUDGET_MARGIN_MS;
+        if (left < need) {
+          stoppedReason = `run budget: ${Math.max(0, Math.round(left / 1000))}s left, ${order.symbol} needs up to ${need / 1000}s`;
+          deps.log(`Stopping before ${order.symbol} — ${stoppedReason}; ${remaining.length} order(s) stay queued for the next run`);
+          return;
+        }
+      }
+
       const decisionPrice = order.estimatedValue / order.qty;
       deps.log(`${order.action} ${order.qty} ${order.symbol} via ${strategy} (${urgency}) — ${order.reason}`);
 
@@ -621,7 +652,7 @@ export async function executeQueue(
       let provenance: FillProvenance = {};
 
       if (useFillConfirmer) {
-        const timeoutMs = urgency === 'Patient' ? 180_000 : 60_000;
+        const timeoutMs = fillWaitMs(urgency);
         let conf: FillConfirmation;
         try {
           deps.onPhase?.(`confirming:${order.symbol}`);
@@ -724,7 +755,7 @@ export async function executeQueue(
 
   // Buys stay in `remaining` until executed/deferred, so a halt before this
   // point leaves them queued automatically.
-  if (buys.length > 0 && !halted) {
+  if (buys.length > 0 && !halted && !stoppedReason) {
     // Cash gate: fetch USD cash after the sells so their proceeds count.
     let cash: number | undefined;
     try {
@@ -771,8 +802,9 @@ export async function executeQueue(
     executed,
     halted,
     haltReason,
+    stoppedReason,
     confirmedFill,
-    validationFailed: plan.mode === 'validate' && !confirmedFill,
+    validationFailed: plan.mode === 'validate' && !confirmedFill && !stoppedReason,
     shortfalls,
     washSales,
     anomalies,

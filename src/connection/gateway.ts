@@ -40,6 +40,11 @@ export interface Position {
   marketValue: number;
   marketPrice: number;
   conid?: number;
+  /**
+   * Set when IBKR gave no usable quantity and `qty` is a stand-in 0. Callers
+   * that would act on a zero (orphan recovery reads it as "sold") must refuse.
+   */
+  qtyMissing?: true;
 }
 
 export interface AccountSummary {
@@ -287,6 +292,7 @@ export async function getAccountSummary(): Promise<AccountSummary> {
     marketValue: p.mktValue ?? 0,
     marketPrice: p.mktPrice ?? 0,
     conid: p.conid,
+    ...(typeof p.position === 'number' && Number.isFinite(p.position) ? {} : { qtyMissing: true as const }),
   }));
 
   // PortfolioSummary's value rows expose `amount: number` (numeric data) and

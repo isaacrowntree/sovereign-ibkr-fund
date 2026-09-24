@@ -571,3 +571,22 @@ describe('getAccountSummary: position symbol normalization', () => {
     expect(brkb.marketValue).toBe(4692.20);
   });
 });
+
+describe('getAccountSummary: a position without a quantity', () => {
+  it('flags qtyMissing rather than passing the stand-in 0 off as a real position', async () => {
+    globalThis.fetch = makeFetch((url) => {
+      if (url.endsWith('/accounts')) return { body: [{ accountId: 'U0000000' }] };
+      if (url.includes('/summary')) return { body: {} };
+      if (url.includes('/positions')) {
+        return { body: [
+          { ticker: 'AAPL', conid: 1, position: 10, avgCost: 1 },
+          { ticker: 'MSFT', conid: 2, avgCost: 1 },
+        ] };
+      }
+      throw new Error(`unexpected URL: ${url}`);
+    });
+    const { positions } = await getAccountSummary();
+    expect(positions[0].qtyMissing).toBeUndefined();
+    expect(positions[1]).toMatchObject({ symbol: 'MSFT', qty: 0, qtyMissing: true });
+  });
+});
