@@ -38,6 +38,7 @@ import os from 'node:os';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { feed } from '../lib/ops-feed.js';
+import { postWebhook } from '../lib/webhook.mjs';
 
 const execAsync = promisify(exec);
 
@@ -286,16 +287,10 @@ function log(msg: string): void {
  */
 async function alert(text: string): Promise<void> {
   if (!ALERT_WEBHOOK) return;
-  try {
-    await fetch(ALERT_WEBHOOK, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: `:rotating_light: [ibkr-fund-watchdog] ${text}` }),
-      signal: AbortSignal.timeout(8_000),
-    });
-  } catch (err) {
-    log(`alert webhook failed: ${(err as Error).message}`);
-  }
+  // Retries a 5xx / 429 / dropped connection twice. It used to be one POST
+  // whose status was never even read, so a Slack blip lost the one page that
+  // says "the auto-restart FAILED".
+  await postWebhook(ALERT_WEBHOOK, { text: `:rotating_light: [ibkr-fund-watchdog] ${text}` }, { log });
 }
 
 // ---------- main ----------
