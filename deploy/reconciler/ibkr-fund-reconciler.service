@@ -1,0 +1,24 @@
+[Unit]
+Description=IBKR fund — reconcile the book against IBKR (conformance + ledger drift)
+After=docker.service
+Wants=docker.service
+
+[Service]
+Type=oneshot
+# Needs the webhook: this agent EXISTS to alert. Without it, getNotifier() falls
+# back to noop and a book that has drifted from the model reports nothing —
+# which is the exact failure it was written to catch. Shares the observer's
+# .env (the webhook and TRADING_MODE), which is all it needs.
+EnvironmentFile=%h/sovereign-ibkr-fund/deploy/observer/.env
+ExecStart=/usr/bin/docker exec -u node \
+  -e IBKR_FUND_ALERT_WEBHOOK \
+  -e TRADING_MODE \
+  -e STATE_DIR=/fund-state/state \
+  -w /paperclip/instances/default/projects/COMPANY_ID/PROJECT_ID/sovereign-ibkr-fund \
+  paperclip bash scripts/run-agent.sh reconciler
+# A logged-out gateway is waited out for up to 30 minutes (1+2+4+8+15, see
+# RECONCILE_AUTH_RETRY_MIN), then the run is DEFERRED: a push, and exit 0. This
+# bounds the wait plus the run itself, so a hung call cannot hold the unit open
+# into the next slot. Unversioned and unbounded until 2026-09-24, when a logout
+# at 07:15 left it `failed` and nothing said so.
+TimeoutStartSec=45min
