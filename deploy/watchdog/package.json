@@ -2,7 +2,7 @@
   "name": "ibkr-fund-watchdog",
   "version": "0.1.0",
   "private": true,
-  "description": "Pi-side liveness watchdog. Restarts the bezant container when /health goes 5xx for too long, or when bezant-relogin self-disables after 3 consecutive auth failures.",
+  "description": "Pi-side liveness watchdog for the bezant container: restarts only a dead gateway, reconnects a silent event stream, never restarts in quiet hours unless dead.",
   "type": "module",
   "main": "index.ts",
   "scripts": {

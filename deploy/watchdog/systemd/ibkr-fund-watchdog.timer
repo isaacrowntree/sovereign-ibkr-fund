@@ -7,8 +7,11 @@ Documentation=https://github.com/isaacrowntree/sovereign-ibkr-fund/tree/main/dep
 # initial tick), then every 60s thereafter.
 OnBootSec=90
 OnUnitActiveSec=60
-# Catch up on missed ticks if the Pi was off.
-Persistent=true
+# Thresholds are elapsed seconds since a condition was first seen, so the
+# probes should land when asked: the default AccuracySec (1min) let a 60s
+# timer drift to ~2min. (Persistent= is gone: it only applies to OnCalendar=,
+# and a watchdog that "catches up" on missed probes would be measuring nothing.)
+AccuracySec=1s
 Unit=ibkr-fund-watchdog.service
 
 [Install]

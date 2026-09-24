@@ -122,6 +122,23 @@ plainly. `assisted-login.ts` therefore evaluates **source strings**, which the
 compiler cannot rewrite. Playwright's own locator API is unaffected and is fine
 to use.
 
+## The session lock, and quiet hours
+
+Every program that can act on the gateway's login shares one lock:
+`~/.local/state/ibkr-session/holder.json` (`../lib/session-lock.ts`; override
+with `IBKR_SESSION_LOCK_DIR`). `index.ts` takes it once it has decided the
+session needs work — before the silent ladder, whose `ssodh/init` is a
+`compete` call — and `assisted-login.ts` takes it for its whole run. Anyone
+else holding it (the hub's login or reset, the watchdog's restart, preflight)
+makes `index.ts` exit **75** without recording an attempt; the unit lists 75 in
+`SuccessExitStatus=`. Preflight hands its own lock down through
+`IBKR_SESSION_LOCK_TOKEN`.
+
+The wedged-gateway restart follows the watchdog's quiet-hours rule (D5): not
+23:00–07:00 (`QUIET_HOURS_TZ`, `QUIET_HOURS`). At night a wedged login is
+recorded as a failure and parks, instead of restarting the container and
+sending a push nobody is awake to tap.
+
 ## Architecture
 
 ```

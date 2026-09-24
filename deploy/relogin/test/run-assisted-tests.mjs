@@ -86,7 +86,7 @@ async function freePort() {
 
 async function scenario({ mode = 'challenge', crossOrigin = false, respondWith = null,
                           pushInShell = false, approveAfterMs = null, rotateAfterMs = null,
-                          budgetMs = 45_000, name }) {
+                          budgetMs = 45_000, lockedBy = null, name }) {
   SKIPPING = Boolean(ONLY) && !name.includes(ONLY);
   if (SKIPPING) {
     console.log(`\n${name}\n  skip (ONLY=${ONLY})`);
@@ -106,6 +106,17 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
     path.join(stateDir, 'state.json'),
     JSON.stringify({ consecutiveFailures: 4, lastSuccessAt: '2026-08-30T21:09:47.375Z' }),
   );
+
+  const lockDir = path.join(work, 'session-lock');
+  if (lockedBy) {
+    // Another program mid-login: a live holder (this process's pid) with a lease.
+    await fs.mkdir(lockDir, { recursive: true });
+    await fs.writeFile(path.join(lockDir, 'holder.json'), JSON.stringify({
+      owner: lockedBy, pid: process.pid, host: os.hostname(), token: 'held-by-test',
+      acquiredAt: new Date().toISOString(), expiresAt: '',
+      expiresAtEpoch: Math.floor(Date.now() / 1000) + 600,
+    }));
+  }
 
   const server = spawn('node', [
     path.join(HERE, 'fake-ibkr.mjs'),
@@ -133,6 +144,7 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
       IBKR_PASSWORD: 'pa$$word',
       IBKR_FUND_ALERT_WEBHOOK: '',
       BEZANT_RELOGIN_STATE_DIR: stateDir,
+      IBKR_SESSION_LOCK_DIR: lockDir,
       ASSISTED_IO_DIR: ioDir,
       ASSISTED_DEBUG_DIR: path.join(work, 'shots'),
       ASSISTED_BUDGET_MS: String(budgetMs),
@@ -180,13 +192,15 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
     .then((t) => JSON.parse(t)).catch(() => null);
   const stateJson = JSON.parse(await fs.readFile(path.join(stateDir, 'state.json'), 'utf8'));
   const sentinel = await fs.access(path.join(stateDir, 'disabled')).then(() => 'present', () => 'gone');
+  const lockLeft = await fs.readFile(path.join(lockDir, 'holder.json'), 'utf8')
+    .then((t) => JSON.parse(t).owner).catch(() => null);
   server.kill('SIGKILL');
   console.log(`\n${name}`);
   // VERBOSE=1 prints the script's own log for each scenario. Without it a
   // failing assertion says only "expected X, got Y", and the reason is in a
   // temp dir the harness has already stopped naming.
   if (process.env.VERBOSE) console.log(out.split('\n').map((l) => `     | ${l}`).join('\n'));
-  return { out, exit, serverState, stateJson, sentinel, status };
+  return { out, exit, serverState, stateJson, sentinel, status, lockLeft };
 }
 
 // ── 1. the challenge path, cross-origin iframe (what production actually is) ──
@@ -440,6 +454,25 @@ async function scenario({ mode = 'challenge', crossOrigin = false, respondWith =
   wantNotIncludes('  ...never a rejection', r.out, 'IBKR rejected the submitted code');
   want('  ...and the login completes', r.serverState.authenticated, true);
   want('  ...exit code 0', r.exit, 0);
+}
+
+// ── session lock ────────────────────────────────────────────────────────────
+// Two logins against one gateway race for one IB Key push. Whoever holds the
+// shared session lock (relogin, preflight, a hub reset) keeps it.
+{
+  const r = await scenario({ name: 'refuses to start while another login holds the session lock',
+                             lockedBy: 'relogin', mode: 'push-only' });
+  wantIncludes('says who holds it', r.out, 'session lock held by relogin');
+  want('  ...never opens the login page', r.serverState.submissions.length, 0);
+  want('  ...never authenticates', r.serverState.authenticated, false);
+  want('  ...tells the page why', r.status?.status, 'failed');
+  want('  ...and leaves the holder\'s lock alone', r.lockLeft, 'relogin');
+}
+{
+  const r = await scenario({ name: 'releases the session lock when it finishes',
+                             mode: 'push-only' });
+  want('logs in', r.exit, 0);
+  want('  ...and leaves no holder behind', r.lockLeft, null);
 }
 
 console.log(`\n${PASS} passed, ${FAIL} failed`);

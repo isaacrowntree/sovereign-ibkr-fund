@@ -17,6 +17,13 @@
  *  - Wedged gateway (login stuck on /sso/Login, no 2FA push sent): auto
  *    `docker restart bezant` to clear it, then retry the login once. Sends no
  *    extra push. This is the exact manual fix for a ~2-week silent outage.
+ *    Not in quiet hours (23:00-07:00, D5): the retry is a push nobody taps,
+ *    and the gateway is not dead, so the same rule as the watchdog applies.
+ *  - Session lock: everything past the health check runs under the shared
+ *    IBKR session lock (../lib/session-lock.ts), including the silent ladder's
+ *    `ssodh/init` compete call. Someone else holding it (an assisted login,
+ *    a hub reset, the watchdog's restart) → exit 75 without counting a
+ *    failure. Run by preflight, it inherits preflight's lock.
  *  - Genuine missed tap (push sent, not approved): after 1 failure, writes a
  *    `disabled` sentinel, fires an alert (IBKR_FUND_ALERT_WEBHOOK if set), and
  *    exits silently on later ticks (one push per expiry — see note below).
@@ -48,6 +55,8 @@ import { promisify } from 'node:util';
 import { chromium, type Browser } from 'playwright';
 import { planRecovery } from './recovery-plan.js';
 import { feed } from '../lib/ops-feed.js';
+import { acquire, describeHolder } from '../lib/session-lock.js';
+import { isQuietHours } from '../lib/quiet-hours.js';
 import {
   trySilentRecovery,
   SSODH_INIT_PATH,
@@ -104,6 +113,15 @@ const SILENT_POLL_INTERVAL_MS = 2_500;
 // ibkr-fund-relogin.service'` triggers a fresh push at a time of the user's
 // choosing.
 const MAX_CONSECUTIVE_FAILURES = 1;
+
+/**
+ * Exit status for "someone else holds the session lock". Not a failure — the
+ * unit lists it in SuccessExitStatus= — but distinct from 0 so preflight can
+ * tell "skipped" from "refreshed".
+ */
+const EXIT_LOCK_BUSY = 75;
+/** Lease on the session lock: the unit's TimeoutStartSec. */
+const LOCK_TTL_S = 420;
 
 // Container name for the bezant gateway (restarted to clear a wedged session).
 const BEZANT_CONTAINER = process.env.BEZANT_CONTAINER ?? 'bezant';
@@ -610,6 +628,19 @@ async function main(): Promise<void> {
     log(`Session unhealthy (authenticated=${health.authenticated} connected=${health.connected})`);
   }
 
+  // Everything from here on acts on the session, so it happens under the lock.
+  const lock = acquire('relogin', LOCK_TTL_S);
+  if (!lock.ok) {
+    log(
+      `session lock held by ${lock.holder ? describeHolder(lock.holder) : 'another process'} — ` +
+        'leaving the session to it; not an attempt, nothing recorded',
+    );
+    process.exit(EXIT_LOCK_BUSY);
+  }
+  if (lock.inherited) log('running under the caller\'s session lock');
+  // 'exit' handlers must be synchronous; release() is.
+  process.on('exit', () => lock.release());
+
   const state = await loadState();
   state.lastAttemptAt = new Date().toISOString();
   activeState = state;
@@ -653,7 +684,13 @@ async function main(): Promise<void> {
     // manual fix for the failure mode that silently took the fund down for ~2
     // weeks — and it sends no extra push (the wedge produced none). A genuine
     // missed tap (push_timeout) is NOT retried here, to avoid push spam.
-    if (outcome === 'wedged') {
+    // Same rule as the watchdog (D5): the gateway is not dead, so no restart
+    // 23:00-07:00 — the retry after it is a push nobody is awake to tap. The
+    // run is recorded as a failure and parks; preflight or the operator picks
+    // it up in waking hours.
+    if (outcome === 'wedged' && isQuietHours(new Date())) {
+      log('Wedged gateway detected (no 2FA push sent), but it is quiet hours — no restart until 07:00 (D5).');
+    } else if (outcome === 'wedged') {
       log('Wedged gateway detected (no 2FA push sent) — restarting bezant and retrying once.');
       if (await restartBezant()) {
         const h = await probeHealth();

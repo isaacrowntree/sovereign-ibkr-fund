@@ -1,290 +1,69 @@
 /**
  * ibkr-fund-watchdog
  *
- * Pi-side liveness watchdog for the bezant Docker container. Runs once per
- * minute via systemd timer. Restarts the container on either of two failures:
+ * Pi-side liveness watchdog for the bezant Docker container, run once a minute
+ * by a systemd timer. The decisions live in watchdog.ts (tested against a fake
+ * bezant); this file only wires them to the real world.
  *
- *   1. `/health` 5xx or unreachable for 5 consecutive probes.
- *   2. The event feed is wedged for 10 consecutive probes WHILE `/health`
- *      still reports `authenticated` (see STREAM_URL below).
+ * History that shaped it:
+ *   - 2026-08-08: the upstream websocket died for four days while /health said
+ *     `authenticated`. Stream liveness has been watched ever since — but a
+ *     silent stream now gets a reconnect and a reauthenticate, never a restart,
+ *     because a restart always costs the session (learned 2026-08-12).
+ *   - 2026-09-03: ssodh/init returned 500 for hours while logged out, so no
+ *     login could complete. Still restarted, by day.
+ *   - 2026-09-24 review (WS-B): quiet hours 23:00–07:00 (D5), thresholds in
+ *     elapsed seconds, the session lock, `upstream_failing`, and a dry-run
+ *     mode to watch the new policy before it acts.
  *
- * (2) exists because (1) was not enough. `/health` describes the GATEWAY, not
- * the feed. On 2026-08-08 the upstream websocket died and stayed dead for four
- * days: /health answered `authenticated` the whole time, this watchdog logged
- * "(healthy)" every minute, and nothing restarted anything. The outage was
- * found by hand. Fill confirmation and intraday drawdown both derive from that
- * feed, so "authenticated but silent" is an outage, not a curiosity.
+ * Relogin's park (the `disabled` sentinel) is the operator's "I'm not around to
+ * tap a push" signal. It is cleared only after a dead-gateway restart, and
+ * never in quiet hours.
  *
- * IMPORTANT: this watchdog does NOT restart on `ibkr-fund-relogin` having
- * disabled itself. The disabled sentinel is the user's "I'm not around to
- * tap a phone push right now" signal; auto-restarting and re-enabling
- * relogin in that case just spams the phone with IB Key pushes during
- * gym/sleep/meeting hours. If the disabled flag is present, the watchdog
- * leaves it alone and the user re-enables manually when they're ready.
+ * Config (env, or .env in this directory):
+ *   WATCHDOG_RESTART        on | dry-run (default dry-run)
+ *   BEZANT_HEALTH_URL       default http://localhost:8080/health
+ *   BEZANT_DEBUG_TOKEN      bezant's debug token, for POST /events/_reconnect.
+ *                           Unset → the reconnect rung 401s and is skipped.
+ *   BEZANT_CONTAINER        default bezant
+ *   BEZANT_RESTART_CMD      default `docker restart $BEZANT_CONTAINER`
+ *   IBKR_SESSION_LOCK_DIR   default ~/.local/state/ibkr-session
+ *   IBKR_FUND_ALERT_WEBHOOK optional Slack/Discord/ntfy {"text"} webhook.
+ *     SILENCING THIS FOR A TEST: set it EMPTY, never unset — dotenv refills an
+ *     absent variable from .env, and a self-test once paged for real that way.
  *
- * After a 5xx-triggered restart we DO clear the disabled sentinel — the
- * working assumption is the disable was caused by the same wedged state
- * the restart just fixed, so we want relogin to retry.
- *
- * 2-hour cooldown between restarts prevents loops on persistent issues.
- *
- * Logs go to stdout → systemd journal. Tail with:
- *   journalctl --user -u ibkr-fund-watchdog -f
+ * Logs: journalctl --user -u ibkr-fund-watchdog -f
  */
 import 'dotenv/config';
-import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { feed } from '../lib/ops-feed.js';
 import { postWebhook } from '../lib/webhook.mjs';
+import { defaultLockDir } from '../lib/session-lock.js';
+import { tick, DEFAULT_THRESHOLDS, type WatchdogConfig, type RestartMode } from './watchdog.js';
 
 const execAsync = promisify(exec);
 
-// ---------- config ----------
-
 const HEALTH_URL = process.env.BEZANT_HEALTH_URL ?? 'http://localhost:8080/health';
-const CONTAINER_NAME = process.env.BEZANT_CONTAINER ?? 'bezant';
-const RELOGIN_DISABLED_FILE =
-  process.env.BEZANT_RELOGIN_DISABLED_FILE ??
-  path.join(os.homedir(), '.local', 'state', 'bezant-relogin', 'disabled');
-const RELOGIN_STATE_FILE =
-  process.env.BEZANT_RELOGIN_STATE_FILE ??
-  path.join(os.homedir(), '.local', 'state', 'bezant-relogin', 'state.json');
-const STATE_DIR =
-  process.env.BEZANT_WATCHDOG_STATE_DIR ??
-  path.join(os.homedir(), '.local', 'state', 'bezant-watchdog');
-const STATE_FILE = path.join(STATE_DIR, 'state.json');
-
-const HEALTH_TIMEOUT_MS = 5_000;
-const SERVER_ERROR_THRESHOLD = 5; // consecutive 5xx/unreachable probes before restart
-const RESTART_COOLDOWN_MS = 2 * 60 * 60 * 1000; // 2 hours minimum between restarts
-const POST_RESTART_HEALTH_PROBES = 12; // wait up to 60s for /health to come back
-const POST_RESTART_PROBE_INTERVAL_MS = 5_000;
-// Silent-outage backstop: if the fund stays logged out this long AND relogin
-// has disabled itself, alert (the condition that caused a ~2-week outage).
-// Stream liveness. /health only reports whether the GATEWAY is authenticated,
-// which is not the same thing as the event feed working: on 2026-08-08 the
-// upstream websocket died and stayed dead for four days while /health kept
-// answering `authenticated` and this watchdog kept logging "(healthy)". The
-// feed is what execution-bot's fill confirmation and risk-manager's intraday
-// drawdown are built on, so a wedged stream is a real outage, not a warning.
-const STREAM_URL = process.env.BEZANT_STREAM_URL ?? 'http://localhost:8080/events/_status';
-// Wedged = not connected, OR connected but silent. Both are needed: during the
-// August outage the connector flapped — it would reconnect for ~90s before a
-// heartbeat timeout killed it — so `connected` alone kept resetting the counter
-// while `last_message_at` stayed pinned to the day it actually broke.
-const STREAM_STALE_MS = 15 * 60 * 1000; // observed cadence is ~60s, so 15min of silence is anomalous
-const STREAM_WEDGED_THRESHOLD = 10; // ≈10 consecutive probes (≈10 min) before bouncing
-const NOT_AUTH_ALERT_THRESHOLD = 30; // ≈30 consecutive not_authenticated probes (≈30 min)
-/**
- * Consecutive 5xx from the SSO bridge before the gateway counts as wedged.
- *
- * This is the blind spot that cost an operator an evening on 2026-09-03.
- * `/health` answered perfectly the whole time — `not_authenticated`, exactly
- * what a logged-out fund looks like — so nothing here fired. Underneath,
- * `iserver/auth/ssodh/init` had been returning 500 for hours, which means NO
- * login could ever complete: three correct response codes and several IB Key
- * taps were spent against a gateway that could not finish a handshake. A
- * container restart cleared it instantly, and afterwards the same endpoint
- * answered 401 like it should.
- *
- * 5 probes ≈ 5 minutes, which is comfortably longer than any restart or
- * transient blip, and far shorter than an evening.
- */
-const SSO_WEDGED_THRESHOLD = 5;
-const DOWN_ALERT_INTERVAL_MS = 6 * 60 * 60 * 1000; // re-alert at most every 6h while down
-// Optional Slack/Discord/ntfy {"text"} webhook.
-//
-// SILENCING THIS FOR A TEST: set it EMPTY (`IBKR_FUND_ALERT_WEBHOOK= npx tsx
-// index.ts`), never unset. `import 'dotenv/config'` above reads .env from the
-// working directory and fills in any variable that is ABSENT — so `env -u`
-// removes it and dotenv immediately puts it back, while an empty value is
-// "present" and survives. Getting this backwards fires a real
-// "manual intervention needed" page from a self-test, which is exactly what
-// happened on 2026-08-12.
+const CONTAINER = process.env.BEZANT_CONTAINER ?? 'bezant';
+const RESTART_CMD = process.env.BEZANT_RESTART_CMD ?? `docker restart ${CONTAINER}`;
 const ALERT_WEBHOOK = process.env.IBKR_FUND_ALERT_WEBHOOK;
+const STATE_DIR =
+  process.env.BEZANT_WATCHDOG_STATE_DIR ?? path.join(os.homedir(), '.local', 'state', 'bezant-watchdog');
 
-// ---------- types ----------
-
-type HealthState = 'authenticated' | 'not_authenticated' | 'server_error' | 'unreachable';
-
-interface WatchdogState {
-  lastHealthState: HealthState | null;
-  consecutiveServerErrors: number;
-  consecutiveNotAuthenticated: number;
-  consecutiveStreamWedged: number;
-  consecutiveSsoFaults: number;
-  lastRestartAt: string | null;
-  lastRestartReason: string | null;
-  totalRestarts: number;
-  lastDownAlertAt: string | null;
+function restartMode(): RestartMode {
+  const v = (process.env.WATCHDOG_RESTART ?? '').trim().toLowerCase();
+  if (v === 'on') return 'on';
+  if (v && v !== 'dry-run') log(`WATCHDOG_RESTART=${v} is not on|dry-run — using dry-run`);
+  return 'dry-run';
 }
-
-const DEFAULT_STATE: WatchdogState = {
-  lastHealthState: null,
-  consecutiveServerErrors: 0,
-  consecutiveNotAuthenticated: 0,
-  consecutiveStreamWedged: 0,
-  consecutiveSsoFaults: 0,
-  lastRestartAt: null,
-  lastRestartReason: null,
-  totalRestarts: 0,
-  lastDownAlertAt: null,
-};
-
-// ---------- state persistence ----------
-
-async function loadState(): Promise<WatchdogState> {
-  try {
-    const raw = await fs.readFile(STATE_FILE, 'utf8');
-    return { ...DEFAULT_STATE, ...JSON.parse(raw) };
-  } catch {
-    return { ...DEFAULT_STATE };
-  }
-}
-
-async function saveState(state: WatchdogState): Promise<void> {
-  await fs.mkdir(STATE_DIR, { recursive: true });
-  const tmp = STATE_FILE + '.tmp';
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2));
-  await fs.rename(tmp, STATE_FILE);
-}
-
-// ---------- probes ----------
-
-/** The SSO bridge path. Same endpoint assisted-login pokes during a login. */
-const SSODH_INIT_PATH = '/v1/api/iserver/auth/ssodh/init';
-
-/**
- * Ask the SSO bridge whether it can work at all. Returns the HTTP status, or
- * null when the request itself failed (which `/health` already covers).
- *
- * 401 = healthy and waiting for a login. 5xx = the Client Portal Gateway
- * inside the container is wedged; bezant relays upstream status verbatim, so
- * the 500 is the GATEWAY's, and it does not clear on its own.
- */
-async function probeSsoBridge(): Promise<number | null> {
-  try {
-    const res = await fetch(`${HEALTH_URL.replace(/\/health$/, '')}${SSODH_INIT_PATH}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ publish: true, compete: true }),
-      signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS),
-    });
-    return res.status;
-  } catch {
-    return null;
-  }
-}
-
-async function probeHealth(): Promise<HealthState> {
-  try {
-    const res = await fetch(HEALTH_URL, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
-    if (res.status === 200) {
-      const body = (await res.json()) as { authenticated?: boolean };
-      return body.authenticated ? 'authenticated' : 'not_authenticated';
-    }
-    if (res.status === 401) return 'not_authenticated';
-    return 'server_error';
-  } catch {
-    return 'unreachable';
-  }
-}
-
-/**
- * Is the event feed actually delivering?
- *
- * Returns null when we cannot tell (endpoint unreachable or malformed) — the
- * caller treats "unknown" as not-wedged on purpose. A restart is a blunt act on
- * a live book, so it should require positive evidence of a wedge, never the
- * mere absence of evidence of health.
- */
-async function probeStream(): Promise<{ wedged: boolean; detail: string } | null> {
-  try {
-    const res = await fetch(STREAM_URL, { signal: AbortSignal.timeout(HEALTH_TIMEOUT_MS) });
-    if (!res.ok) return null;
-    const body = (await res.json()) as { connected?: unknown; last_message_at?: unknown };
-    if (typeof body.connected !== 'boolean') return null;
-
-    const lastAt = typeof body.last_message_at === 'string' ? Date.parse(body.last_message_at) : NaN;
-    // A never-connected-since-boot feed reports null; that is genuinely silent,
-    // so treat an unparseable timestamp as stale rather than as unknown.
-    const silentMs = Number.isNaN(lastAt) ? Infinity : Date.now() - lastAt;
-    const stale = silentMs > STREAM_STALE_MS;
-
-    const age = silentMs === Infinity ? 'never' : `${Math.floor(silentMs / 60_000)}min`;
-    return {
-      wedged: !body.connected || stale,
-      detail: `connected=${body.connected} last_message=${age}`,
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function pathExists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function getReloginFailureCount(): Promise<number> {
-  try {
-    const raw = await fs.readFile(RELOGIN_STATE_FILE, 'utf8');
-    const s = JSON.parse(raw) as { consecutiveFailures?: unknown };
-    return typeof s.consecutiveFailures === 'number' ? s.consecutiveFailures : 0;
-  } catch {
-    return 0;
-  }
-}
-
-// ---------- actions ----------
-
-async function restartContainer(reason: string): Promise<boolean> {
-  log(`RESTARTING ${CONTAINER_NAME}: ${reason}`);
-  try {
-    await execAsync(`docker restart ${CONTAINER_NAME}`, { timeout: 60_000 });
-    log(`docker restart returned successfully — waiting for /health to respond`);
-  } catch (err) {
-    log(`docker restart FAILED: ${(err as Error).message}`);
-    return false;
-  }
-  for (let i = 0; i < POST_RESTART_HEALTH_PROBES; i++) {
-    await new Promise((r) => setTimeout(r, POST_RESTART_PROBE_INTERVAL_MS));
-    const h = await probeHealth();
-    if (h !== 'unreachable') {
-      log(`Post-restart /health responsive: ${h}`);
-      return true;
-    }
-  }
-  log(`Post-restart /health still unreachable after 60s`);
-  return false;
-}
-
-async function clearReloginDisabled(): Promise<void> {
-  try {
-    await fs.unlink(RELOGIN_DISABLED_FILE);
-    log('Cleared bezant-relogin disabled sentinel — next 5-min relogin tick will retry');
-  } catch {
-    /* not present, no-op */
-  }
-}
-
-// ---------- logging ----------
 
 function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] [watchdog] ${msg}`);
 }
 
-/**
- * Best-effort alert to an optional webhook (Slack/Discord/ntfy `{"text"}`).
- * No-op when IBKR_FUND_ALERT_WEBHOOK is unset.
- */
 async function alert(text: string): Promise<void> {
   if (!ALERT_WEBHOOK) return;
   // Retries a 5xx / 429 / dropped connection twice. It used to be one POST
@@ -293,158 +72,40 @@ async function alert(text: string): Promise<void> {
   await postWebhook(ALERT_WEBHOOK, { text: `:rotating_light: [ibkr-fund-watchdog] ${text}` }, { log });
 }
 
-// ---------- main ----------
+const cfg: WatchdogConfig = {
+  baseUrl: HEALTH_URL.replace(/\/health\/?$/, ''),
+  debugToken: process.env.BEZANT_DEBUG_TOKEN || undefined,
+  restartMode: restartMode(),
+  stateFile: path.join(STATE_DIR, 'state.json'),
+  reloginDisabledFile:
+    process.env.BEZANT_RELOGIN_DISABLED_FILE ??
+    path.join(os.homedir(), '.local', 'state', 'bezant-relogin', 'disabled'),
+  reloginStateFile:
+    process.env.BEZANT_RELOGIN_STATE_FILE ??
+    path.join(os.homedir(), '.local', 'state', 'bezant-relogin', 'state.json'),
+  lockDir: defaultLockDir(),
+  probeTimeoutMs: 5_000,
+  postRestartProbes: 12,
+  postRestartIntervalMs: 5_000,
+  thresholds: DEFAULT_THRESHOLDS,
+};
 
-async function main(): Promise<void> {
-  const state = await loadState();
-  const now = new Date();
-
-  const currentHealth = await probeHealth();
-  if (state.lastHealthState !== currentHealth) {
-    log(`/health transition: ${state.lastHealthState ?? '<first>'} → ${currentHealth}`);
-    state.lastHealthState = currentHealth;
-  }
-
-  if (currentHealth === 'server_error' || currentHealth === 'unreachable') {
-    state.consecutiveServerErrors += 1;
-  } else {
-    state.consecutiveServerErrors = 0;
-  }
-
-  if (currentHealth === 'not_authenticated') {
-    state.consecutiveNotAuthenticated += 1;
-  } else {
-    state.consecutiveNotAuthenticated = 0;
-  }
-
-  // Stream wedge is only OUR problem when the gateway is otherwise fine. If the
-  // gateway is unauthenticated the feed cannot work by definition, and that is
-  // relogin's job — restarting would be both useless and actively harmful. We
-  // learned this the hard way on 2026-08-12: bouncing the container dropped the
-  // gateway to `not authenticated`, and only a relogin brought the feed back.
-  const stream = currentHealth === 'authenticated' ? await probeStream() : null;
-  if (stream?.wedged) {
-    state.consecutiveStreamWedged += 1;
-  } else {
-    state.consecutiveStreamWedged = 0;
-  }
-
-  // Probe the SSO bridge ONLY while logged out. Authenticated, the bridge is
-  // already established and poking it is pointless; logged out, its answer is
-  // the difference between "waiting for a human" (401, healthy) and "cannot
-  // complete any login" (5xx, wedged) — two states /health renders identically.
-  const sso = currentHealth === 'not_authenticated' ? await probeSsoBridge() : null;
-  if (sso !== null && sso >= 500) {
-    state.consecutiveSsoFaults += 1;
-  } else if (sso !== null || currentHealth === 'authenticated') {
-    state.consecutiveSsoFaults = 0;
-  }
-
-  const sinceLastRestart = state.lastRestartAt
-    ? now.getTime() - new Date(state.lastRestartAt).getTime()
-    : Infinity;
-  const cooldownActive = sinceLastRestart < RESTART_COOLDOWN_MS;
-
-  const reloginDisabled = await pathExists(RELOGIN_DISABLED_FILE);
-  const reloginFailures = await getReloginFailureCount();
-
-  let restartReason: string | null = null;
-
-  if (cooldownActive) {
-    const cdMin = Math.floor((RESTART_COOLDOWN_MS - sinceLastRestart) / 60_000);
-    log(
-      `status: health=${currentHealth} relogin_failures=${reloginFailures} relogin_disabled=${reloginDisabled} (cooldown ${cdMin}min remaining)`,
-    );
-  } else if (state.consecutiveServerErrors >= SERVER_ERROR_THRESHOLD) {
-    restartReason = `${state.consecutiveServerErrors} consecutive server_error/unreachable probes`;
-  } else if (state.consecutiveStreamWedged >= STREAM_WEDGED_THRESHOLD) {
-    restartReason =
-      `event stream wedged for ${state.consecutiveStreamWedged} consecutive probes ` +
-      `(${stream?.detail ?? 'no detail'}) while /health reported authenticated`;
-  } else if (state.consecutiveSsoFaults >= SSO_WEDGED_THRESHOLD) {
-    // Safe to bounce precisely because we are already logged out: there is no
-    // working session to destroy, and without a restart no login can succeed.
-    restartReason =
-      `SSO bridge wedged — ${SSODH_INIT_PATH} returned 5xx on ` +
-      `${state.consecutiveSsoFaults} consecutive probes while logged out, ` +
-      `so no login could complete`;
-  } else {
-    log(
-      `status: health=${currentHealth} stream=${stream ? stream.detail : 'n/a'} ` +
-        `stream_wedged=${state.consecutiveStreamWedged} sso=${sso ?? 'n/a'} ` +
-        `sso_faults=${state.consecutiveSsoFaults} relogin_failures=${reloginFailures} ` +
-        `relogin_disabled=${reloginDisabled} (healthy)`,
-    );
-  }
-
-  if (restartReason) {
-    const ok = await restartContainer(restartReason);
-    state.lastRestartAt = now.toISOString();
-    state.lastRestartReason = restartReason;
-    state.consecutiveServerErrors = 0;
-    state.totalRestarts += 1;
-    if (ok) {
-      await clearReloginDisabled();
-      // bezant was hard-down (not just logged out) and we bounced it — surface
-      // it so a recurring crash loop is visible, not silent. On the feed rather
-      // than Slack: a restart that WORKED is a thing to notice, not a thing to
-      // wake up for, and /ops shows the running total so a crash loop reads as
-      // a climbing number instead of a stack of identical messages.
-      feed({
-        source: 'watchdog',
-        severity: 'warn',
-        title: `bezant was down (${restartReason}) — auto-restarted`,
-        detail: `Restart #${state.totalRestarts}. The gateway usually comes back logged out; the 5-minute re-login picks it up.`,
-      });
-    } else {
-      // Restart itself failed — bezant is down AND self-heal didn't work. This
-      // one is genuinely stuck until a human touches the Pi, so it stays a
-      // notification. It is also rare enough to have never fired.
-      await alert(`🚨 IBKR fund: bezant down (${restartReason}) and the auto-restart FAILED — manual intervention needed on the Pi.`);
-      feed({
-        source: 'watchdog',
-        severity: 'critical',
-        title: `bezant is down (${restartReason}) and the auto-restart FAILED`,
-        detail: 'Self-heal did not work — the container needs a look on the Pi.',
-      });
+tick(cfg, {
+  now: () => new Date(),
+  restart: async () => {
+    try {
+      await execAsync(RESTART_CMD, { timeout: 60_000 });
+      return true;
+    } catch (err) {
+      log(`${RESTART_CMD} failed: ${(err as Error).message}`);
+      return false;
     }
-    state.lastHealthState = await probeHealth();
-    state.consecutiveNotAuthenticated = 0;
-    // The restart itself usually drops the gateway to `not authenticated`; the
-    // 5-minute relogin tick re-establishes it, and only then can the feed come
-    // back. So do not re-probe the stream here and do not expect it healthy yet
-    // — just clear the counter so we re-measure from the new baseline rather
-    // than immediately re-triggering once the cooldown lapses.
-    state.consecutiveStreamWedged = 0;
-  }
-
-  // Silent-outage backstop: fund logged out for a sustained period AND relogin
-  // has given up (disabled). relogin alerts when it disables; this also covers
-  // disables predating alerting, or a missed webhook. Re-alerts ≤ every 6h.
-  if (state.consecutiveNotAuthenticated >= NOT_AUTH_ALERT_THRESHOLD && reloginDisabled) {
-    const sinceAlert = state.lastDownAlertAt
-      ? now.getTime() - new Date(state.lastDownAlertAt).getTime()
-      : Infinity;
-    if (sinceAlert >= DOWN_ALERT_INTERVAL_MS) {
-      // Was a Slack message on a 6h re-nag whose timing drifted with the
-      // outage, so it landed at 03:30 as often as it landed somewhere useful —
-      // and its instruction was an ssh command that pi.lan/ibkr now performs
-      // with a button. The condition still matters; the interruption did not.
-      feed({
-        source: 'watchdog',
-        severity: 'critical',
-        title: `Logged out ~${state.consecutiveNotAuthenticated}+ min and auto-relogin is parked`,
-        detail: 'Start a login from pi.lan/ibkr when you can tap an IB Key push. The nightly pre-market re-key will also unpark and try once.',
-      });
-      state.lastDownAlertAt = now.toISOString();
-      log(`down-event recorded (not_authenticated ×${state.consecutiveNotAuthenticated}, relogin disabled)`);
-    }
-  }
-
-  await saveState(state);
-}
-
-main().catch((err) => {
+  },
+  feed,
+  alert,
+  log,
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+}).catch((err) => {
   log(`Fatal: ${(err as Error).stack ?? err}`);
   process.exit(1);
 });

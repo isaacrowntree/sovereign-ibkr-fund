@@ -14,6 +14,11 @@ StandardError=journal
 # Don't restart automatically — the timer handles cadence and the script
 # self-disables after MAX_CONSECUTIVE_FAILURES.
 Restart=no
+# 75 = another program holds the IBKR session lock (a login from the hub, a
+# gateway reset, the watchdog's restart); relogin stood aside. Not a failure.
+SuccessExitStatus=75
+# The session lock directory; tmpfiles.d creates it at boot, this is the fallback.
+ExecStartPre=/bin/mkdir -p %h/.local/state/ibkr-session
 # Bound the worst-case run. Budget it against the LONGEST path through
 # index.ts, which is the wedged-gateway retry — it performs a second full
 # credential login after bouncing bezant:
