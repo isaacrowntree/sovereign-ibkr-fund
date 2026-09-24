@@ -57,6 +57,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { feed } from '../lib/ops-feed.js';
+import { acquire, describeHolder } from '../lib/session-lock.js';
 
 const HEALTH_URL = process.env.BEZANT_HEALTH_URL ?? 'http://localhost:8080/health';
 const LOGIN_URL = process.env.BEZANT_LOGIN_URL ?? 'https://localhost:5000';
@@ -835,6 +836,21 @@ async function main(): Promise<void> {
     log(`FATAL: ${HEALTH_URL} did not answer — fix the gateway before spending a login`);
     process.exit(1);
   }
+
+  // One login at a time, across every program that can start one (see
+  // ../lib/session-lock.ts). The lease covers the whole budget plus teardown;
+  // if the hub SIGKILLs this run, the hub also clears the lock.
+  const lock = acquire('assisted-login', Math.ceil(TOTAL_BUDGET_MS / 1000) + 120);
+  if (!lock.ok) {
+    const who = lock.holder ? describeHolder(lock.holder) : 'another process';
+    log(`session lock held by ${who} — not starting a second login against the same gateway`);
+    await publishStatus({
+      status: 'failed',
+      note: `Another login or gateway restart is in progress (${lock.holder?.owner ?? 'unknown'}). Try again in a few minutes.`,
+    });
+    process.exit(1);
+  }
+  process.on('exit', () => lock.release());
 
   // A challenge left over from an earlier run is worse than none: the operator
   // would type digits IBKR has already forgotten, and the stale response file
