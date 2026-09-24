@@ -141,3 +141,18 @@ describe('lot engine — discount and financial year per parcel', () => {
     expect(r.disposals[0].discountEligible).toBe(true);
   });
 });
+
+describe('lot engine — an explicit trade date outranks a late recording timestamp', () => {
+  it('a recovered fill recorded days later is still ordered by its IBKR trade date', () => {
+    const r = runLotEngine([
+      t({ action: 'BUY', qty: 1, timestamp: '2026-01-02T15:00:00Z', fillPrice: 100 }),
+      // Sold on 5 Jan (IBKR), but only recorded on 9 Jan by orphan recovery…
+      t({ action: 'SELL', qty: 1, timestamp: '2026-01-09T01:00:00Z', tradeDate: '2026-01-05', fillPrice: 110 }),
+      // …after a buy on 7 Jan, which must stay open.
+      t({ action: 'BUY', qty: 1, timestamp: '2026-01-07T15:00:00Z', fillPrice: 200 }),
+    ]);
+    expect(r.disposals[0].buyDate).toBe('2026-01-02');
+    expect(r.disposals[0].sellDate).toBe('2026-01-05');
+    expect(r.openLots.get('AAA')![0].priceUsd).toBe(200);
+  });
+});

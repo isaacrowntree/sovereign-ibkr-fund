@@ -163,9 +163,15 @@ export function runLotEngine(trades: TradeRecord[], opts: LotEngineOptions = {})
       }
       return true;
     })
-    // Time order; on a tie a BUY comes first (a same-instant buy is available
-    // to the sale), then ledger order.
-    .sort((a, b) => a.ms - b.ms || (a.t.action === b.t.action ? 0 : a.t.action === 'BUY' ? -1 : 1) || a.i - b.i);
+    // Trade date first — an explicit tradeDate (IBKR's, set by the ledger
+    // annotation) outranks a timestamp that may be when a fill was RECORDED —
+    // then time within the day; on a tie a BUY comes first (a same-instant buy
+    // is available to the sale), then ledger order. Undated rows sort last.
+    .sort((a, b) =>
+      (a.date ?? '~').localeCompare(b.date ?? '~') ||
+      a.ms - b.ms ||
+      (a.t.action === b.t.action ? 0 : a.t.action === 'BUY' ? -1 : 1) ||
+      a.i - b.i);
 
   const open = new Map<string, Lot[]>();
   const disposals: Disposal[] = [];
