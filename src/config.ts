@@ -27,12 +27,6 @@ export const config = {
     cfAccessClientId: process.env.BEZANT_CF_ACCESS_CLIENT_ID || undefined,
     cfAccessClientSecret: process.env.BEZANT_CF_ACCESS_CLIENT_SECRET || undefined,
   },
-  /** Legacy TWS settings — still consumed by tooling we haven't migrated yet. */
-  ib: {
-    host: process.env.IB_HOST || '127.0.0.1',
-    port: parseInt(process.env.IB_PORT || '4002', 10),
-    clientId: parseInt(process.env.IB_CLIENT_ID || String(Math.floor(Math.random() * 900) + 100), 10),
-  },
   tradingMode: (process.env.TRADING_MODE || 'paper') as 'paper' | 'live',
   rebalance: {
     driftThreshold: parseFloat(process.env.REBALANCE_DRIFT_THRESHOLD || '10'),
@@ -182,22 +176,25 @@ export const config = {
      * It is the honest way to say "hold the deliberate allocation" — previously
      * that could only be expressed by setting HRP_MIN_DAYS absurdly high to jam
      * the gate shut, which read as a broken optimizer rather than a choice.
+     *
+     * It is also the default, because it is the SAFE one. The default was
+     * 'hrp', so a .env that lost its OPTIMIZER line would have moved a live
+     * book onto an optimizer silently; a live strategist now refuses to start
+     * without the key at all (startup.ts, assertLiveStrategyConfig).
+     *
+     * (Vol targeting was a config flag here too, and nothing ever read it —
+     * the live sizing is targetWeights × regimeExposure × drawdownMultiplier,
+     * deliberately. Removed rather than kept as a control that only existed
+     * in the config's imagination.)
      */
-    optimizer: (process.env.OPTIMIZER || 'hrp') as 'hrp' | 'black_litterman' | 'equal_weight' | 'static',
-    lookbackDays: parseInt(process.env.LOOKBACK_DAYS || '180', 10),
-    enableRegimeOverlay: process.env.ENABLE_REGIME !== 'false',
+    optimizer: (process.env.OPTIMIZER || 'static') as 'hrp' | 'black_litterman' | 'equal_weight' | 'static',
     /**
-     * Vol targeting is NOT applied by the live strategist — its sizing is
-     * targetWeights × regimeExposure × drawdownMultiplier, deliberately.
-     * `volTargetLeverage` in riskMetrics is telemetry, and the volMult path
-     * in computeExposure() is a backtest-engine research lever (the engine
-     * defaults it off to mirror production). This flag defaulted to `true`
-     * for months while nothing read it — a risk control that existed only
-     * in the config's imagination (2026-08-29 audit). Default now matches
-     * reality; flip to 'true' only alongside actually wiring the strategist.
+     * Opt-IN. It was opt-out (anything but 'false' enabled it), so a missing
+     * key turned on regime de-risking — every de-risk sell a short-term taxable
+     * disposal. The overlay is being retired (fix plan F2); it runs only when
+     * asked for by name.
      */
-    enableVolTargeting: process.env.ENABLE_VOL_TARGET === 'true',
+    enableRegimeOverlay: process.env.ENABLE_REGIME === 'true',
   },
   port: parseInt(process.env.PORT || '3001', 10),
-  logLevel: process.env.LOG_LEVEL || 'info',
 };
