@@ -40,6 +40,9 @@ beforeEach(() => {
   delete process.env.IBKR_FUND_ALERT_WEBHOOK;
   delete process.env.NOTIFIER;
   delete process.env.TRADING_MODE;
+  delete process.env.NOTIFY_OUTBOX;
+  // alert()'s retry backoff, zeroed so a retried 5xx does not cost seconds.
+  process.env.ALERT_RETRY_DELAYS_MS = '0,0';
 
   responses = [];
   fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => {
@@ -132,10 +135,25 @@ describe('alert() posts exactly {text}, exactly once', () => {
   // The regression guard that matters: alert() must NOT inherit notify()'s
   // 400 fallback. Asserting the body shape alone cannot catch it — both POSTs
   // would carry {text} — so assert the CALL COUNT.
-  it.each([400, 403, 404, 410, 429, 500, 503])('does not retry on %i — exactly one POST', async (s) => {
+  it.each([400, 403, 404, 410])('does not retry on %i — exactly one POST', async (s) => {
     respond(status(s, 'err'));
     await alert('x');
     expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // A transient failure is retried twice, in-process: alert() has no dedupe
+  // key and so no outbox to fall back on, and before this one Slack 5xx lost it.
+  it.each([429, 500, 503])('retries a transient %i twice, then gives up', async (s) => {
+    respond(status(s), status(s), status(s), ok());
+    await alert('x');
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it('retries a dropped connection and stops at the first success', async () => {
+    respond(new Error('ECONNRESET'), ok(), ok());
+    await alert('x');
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(bodies()).toEqual([{ text: 'x' }, { text: 'x' }]);
   });
 });
 
@@ -359,5 +377,82 @@ describe('notify() claim lifecycle', () => {
     await notify({ severity: 'warn', title: 'b', dedupe: { key: 'k2' } }, hooks);
     expect(claimed[0][1]).toBe('stopped');
     expect(claimed[1][1]).toBe('');
+  });
+});
+
+describe('notify() with the outbox (NOTIFY_OUTBOX)', () => {
+  beforeEach(() => { process.env.IBKR_FUND_ALERT_WEBHOOK = HOOK; });
+
+  function outboxHooks(opts: { enqueueThrows?: boolean } = {}) {
+    const released: string[] = [];
+    const queued: Array<[string, NotifyEvent]> = [];
+    const settled: string[] = [];
+    const hooks: DedupeHooks = {
+      claim: () => true,
+      release: (k) => { released.push(k); },
+      enqueue: (k, e) => { if (opts.enqueueThrows) throw new Error('disk full'); queued.push([k, e]); },
+      settle: (k) => { settled.push(k); },
+    };
+    return { hooks, released, queued, settled };
+  }
+
+  it('is off by default — a failed send still releases, nothing is queued', async () => {
+    const { hooks, released, queued } = outboxHooks();
+    respond(status(503));
+    await notify({ severity: 'critical', title: 'x', dedupe: { key: 'k' } }, hooks);
+    expect(released).toEqual(['k']);
+    expect(queued).toEqual([]);
+  });
+
+  it('on: a failed send is queued under its key and the claim is KEPT', async () => {
+    process.env.NOTIFY_OUTBOX = '1';
+    const { hooks, released, queued } = outboxHooks();
+    respond(status(503));
+    await notify({ severity: 'critical', title: 'HARD STOP', dedupe: { key: 'k' } }, hooks);
+    expect(released).toEqual([]);
+    expect(queued.map(([k, e]) => [k, e.title])).toEqual([['k', 'HARD STOP']]);
+  });
+
+  it('on: an event with no dedupe key is still queued, under a generated key', async () => {
+    process.env.NOTIFY_OUTBOX = '1';
+    const { hooks, queued } = outboxHooks();
+    respond(new Error('down'));
+    await notify({ severity: 'warn', title: 'x' }, hooks);
+    expect(queued).toHaveLength(1);
+    expect(queued[0][0]).toMatch(/^nokey:/);
+  });
+
+  it('on: a delivered event settles any older queued copy of its key', async () => {
+    process.env.NOTIFY_OUTBOX = '1';
+    const { hooks, settled, queued } = outboxHooks();
+    respond(ok());
+    await notify({ severity: 'warn', title: 'x', dedupe: { key: 'k' } }, hooks);
+    expect(settled).toEqual(['k']);
+    expect(queued).toEqual([]);
+  });
+
+  it('on: an outbox that cannot be written falls back to releasing the claim (fail open)', async () => {
+    process.env.NOTIFY_OUTBOX = '1';
+    const { hooks, released } = outboxHooks({ enqueueThrows: true });
+    respond(status(500));
+    await expect(notify({ severity: 'critical', title: 'x', dedupe: { key: 'k' } }, hooks)).resolves.toBeUndefined();
+    expect(released).toEqual(['k']);
+  });
+
+  it("on: channel:'ops' events never touch the outbox", async () => {
+    process.env.NOTIFY_OUTBOX = '1';
+    const { hooks, queued } = outboxHooks();
+    await notify({ severity: 'info', title: 'digest', channel: 'ops', dedupe: { key: 'k' } }, hooks);
+    expect(queued).toEqual([]);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('on: hooks without enqueue keep the old release behaviour', async () => {
+    process.env.NOTIFY_OUTBOX = '1';
+    const released: string[] = [];
+    respond(status(503));
+    await notify({ severity: 'warn', title: 'x', dedupe: { key: 'k' } },
+      { claim: () => true, release: (k) => { released.push(k); } });
+    expect(released).toEqual(['k']);
   });
 });

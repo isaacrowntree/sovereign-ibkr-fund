@@ -7,6 +7,7 @@ import { TARGET_PORTFOLIO } from '../config.js';
 import { findHarvestCandidates, createWashSaleEntry, WashSaleEntry, TaxLot } from '../tax/harvesting.js';
 import { loadState, mergeState, loadTradeHistory } from '../state/store.js';
 import { log, logError } from '../log.js';
+import { agentStartup } from '../startup.js';
 
 const AGENT = 'TaxOptimizer';
 
@@ -78,5 +79,9 @@ async function run(): Promise<void> {
 }
 
 if (process.argv.includes('--once')) {
-  run().then(() => process.exit(0)).catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
+  Promise.resolve()
+    .then(() => agentStartup(AGENT))
+    .then(() => run())
+    .then(() => process.exit(0))
+    .catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
 }

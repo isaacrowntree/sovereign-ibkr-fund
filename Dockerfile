@@ -23,8 +23,6 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./
 
 ENV NODE_ENV=production \
-  IB_HOST=127.0.0.1 \
-  IB_PORT=4002 \
   TRADING_MODE=paper \
   PORT=3001
 

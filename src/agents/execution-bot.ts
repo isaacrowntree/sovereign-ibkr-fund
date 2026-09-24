@@ -42,6 +42,7 @@ import type { ExecutionOutcome } from '../execution/executor.js';
 import { evaluateRiskGate } from '../execution/risk-gate.js';
 import { config } from '../config.js';
 import { log, logError } from '../log.js';
+import { agentStartup } from '../startup.js';
 
 const AGENT = 'ExecutionBot';
 
@@ -679,5 +680,9 @@ async function run(): Promise<void> {
 }
 
 if (process.argv.includes('--once')) {
-  run().then(() => process.exit(0)).catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
+  Promise.resolve()
+    .then(() => agentStartup(AGENT, { config }))
+    .then(() => run())
+    .then(() => process.exit(0))
+    .catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
 }

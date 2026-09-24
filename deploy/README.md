@@ -1,6 +1,6 @@
 # Pi-side deployment
 
-Five systemd **user** units and the push-based deploy script. Everything here is
+The fund's systemd **user** units and the push-based deploy script. Everything here is
 a template — the `.service` files contain placeholders you must substitute for
 your own host.
 
@@ -11,7 +11,8 @@ your own host.
 | `ibkr-fund-observer` | polls the bezant event stream; the only writer of `state.observedEvents` | ~5 min |
 | `ibkr-fund-digest` | daily summary to the ops feed | Mon–Fri |
 | `ibkr-fund-backup` | uploads the SQLite ledger to Slack | daily |
-| `ibkr-fund-agent-health` | reports failing **or silent** agents to the ops feed | hourly |
+| `ibkr-fund-agent-health` | reports failing **or silent** agents to the ops feed; pushes when the fund isn't trading | hourly |
+| `ibkr-fund-reconciler` | checks IBKR's positions against the model and the ledger | 07:15 / 19:15 |
 | `ibkr-fund-db-retention` | redacts old run blobs in paperclip's DB | weekly |
 
 ## Substitute the placeholders
@@ -32,6 +33,10 @@ systemctl --user daemon-reload
 
 Each unit reads its own `.env` (see the `.env.example` beside it). All are
 `0600` and gitignored.
+
+`scripts/diff-units.sh <host> <remote-path>` shows how the installed units differ
+from these (rendered with your ids); `deploy-to-pi.sh` runs it at the end of
+every deploy. It only reports — installing stays a deliberate step.
 
 ## STATE_DIR is not optional
 

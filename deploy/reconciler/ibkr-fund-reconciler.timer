@@ -1,0 +1,14 @@
+[Unit]
+Description=Reconcile the fund against IBKR twice a day
+
+[Timer]
+# 07:15 and 19:15 host time (AEST). The morning run lands after the US close and
+# before the daily digest at 07:30, so a drift shows up in the same batch a human
+# reads. The observer pushes if lastReconcileAt is older than 14h, i.e. if both
+# a slot and its 2h of slack have passed without a completed run.
+OnCalendar=*-*-* 07:15:00
+OnCalendar=*-*-* 19:15:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

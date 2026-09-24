@@ -26,6 +26,7 @@ import { loadState, mergeState, loadTradeHistory } from '../state/store.js';
 import { notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
+import { agentStartup } from '../startup.js';
 
 const AGENT = 'PortfolioStrategist';
 
@@ -509,5 +510,9 @@ async function run(): Promise<void> {
 }
 
 if (process.argv.includes('--once')) {
-  run().then(() => process.exit(0)).catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
+  Promise.resolve()
+    .then(() => agentStartup(AGENT, { config, requireExplicitOptimizer: true }))
+    .then(() => run())
+    .then(() => process.exit(0))
+    .catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
 }

@@ -218,7 +218,10 @@ function getActiveSymbols(symbols: string[], symbolDateMap: Map<string, Map<stri
 
 export const DEFAULT_CONFIG: BacktestConfig = {
   name: 'Default HRP + Regime + Vol Target',
-  optimizerMethod: appConfig.strategy.optimizer,
+  // Pinned rather than read from the live config: the live defaults moved to
+  // static / no regime (safe for a real book), and this config's name and every
+  // study built on it describe HRP + regime. Research defaults belong here.
+  optimizerMethod: 'hrp',
   rebalanceDriftPct: appConfig.rebalance.driftThreshold,
   rebalanceFreqDays: appConfig.rebalance.frequencyDays,
   drawdownLimits: {
@@ -228,7 +231,7 @@ export const DEFAULT_CONFIG: BacktestConfig = {
   },
   targetVol: appConfig.risk.targetVol,
   maxLeverage: appConfig.risk.maxLeverage,
-  enableRegimeOverlay: appConfig.strategy.enableRegimeOverlay,
+  enableRegimeOverlay: true,
   // OFF for production parity (2026-08-29 gate audit): risk-manager computes
   // volTargetLeverage and writes it to state, but portfolio-strategist never
   // reads it — no live order path applies a vol multiplier. Simulating one
@@ -236,7 +239,7 @@ export const DEFAULT_CONFIG: BacktestConfig = {
   // recomputes from the trailing 60d daily it swings targets (and therefore
   // drift, urgent triggers, and cash-flow churn) that production never sees.
   enableVolTargeting: false,
-  lookbackDays: appConfig.strategy.lookbackDays,
+  lookbackDays: 180,
   commissionPerTrade: 1.0,
   slippagePctPerSide: 0.0005, // 5 bps/side; see BacktestConfig
   regimeLookbackDays: 200,    // production quant-analyst's history requirement

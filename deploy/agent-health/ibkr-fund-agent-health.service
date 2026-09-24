@@ -5,9 +5,8 @@ Wants=docker.service
 
 [Service]
 Type=oneshot
-# No credentials are needed at all now that this reports to a file instead of
-# to Slack, but the EnvironmentFile stays: it is where AGENT_HEALTH_SILENT_FACTOR
-# and a DRY_RUN toggle would go, and a missing one (without the `-` prefix)
+# The EnvironmentFile carries the alert webhook (for the "fund isn't trading"
+# push) and the AGENT_HEALTH_* knobs; a missing one (without the `-` prefix)
 # would fail the unit.
 #
 # The DB credential deliberately does NOT live here. It used to, as a second
@@ -25,7 +24,13 @@ EnvironmentFile=%h/sovereign-ibkr-fund/deploy/agent-health/.env
 # $$DATABASE_URL is an escaped literal $ — systemd passes it through unexpanded,
 # so the value read is the container's own DATABASE_URL. One source of truth:
 # this check now cannot address a different database than paperclip does.
+# -e VAR with no value forwards the host's (from the EnvironmentFile): the
+# webhook is for the one push this check makes — the fund not trading on a
+# trading day — and the AGENT_HEALTH_* knobs are documented in check.mjs.
 ExecStart=/usr/bin/docker exec -u node \
   -e AGENT_HEALTH_STATE_DIR=/fund-state/state \
+  -e IBKR_FUND_ALERT_WEBHOOK \
+  -e AGENT_HEALTH_TRADING_PUSH \
+  -e AGENT_HEALTH_FUND_COMPANY \
   -w /paperclip/instances/default/projects/COMPANY_ID/PROJECT_ID/sovereign-ibkr-fund \
   paperclip sh -c 'PAPERCLIP_DATABASE_URL="$$DATABASE_URL" exec node deploy/agent-health/check.mjs'

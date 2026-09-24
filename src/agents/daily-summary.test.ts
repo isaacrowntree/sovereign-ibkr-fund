@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildDigest, tradingDate, tradesOn } from './daily-summary.js';
+import { buildDigest, isSnapshotStale, snapshotAgeHours, tradingDate, tradesOn } from './daily-summary.js';
 import type { TradeRecord } from '../state/store.js';
 
 const trade = (over: Partial<TradeRecord> = {}): TradeRecord => ({
@@ -147,11 +147,48 @@ describe('buildDigest', () => {
     // overwrite, so that key holds the LAST RUN's fills, not the day's. The
     // digest must not read it.
     const d = buildDigest(
-      { ...state, shortfallMetrics: [{ symbol: 'STALE', totalShortfallBps: 999, totalShortfallUsd: 999 }] },
+      { ...state, shortfallMetrics: [{ symbol: 'LASTRUN', totalShortfallBps: 999, totalShortfallUsd: 999 }] },
       [trade({ estimatedValue: 3000 }), trade({ estimatedValue: 2000 })],
       '2026-07-16',
     );
     expect(d.fields.find(f => f.label === 'Traded')!.value).toBe('$5,000');
-    expect(JSON.stringify(d)).not.toContain('STALE');
+    expect(JSON.stringify(d)).not.toContain('LASTRUN');
+  });
+});
+
+describe('a stale snapshot is said out loud', () => {
+  const now = new Date('2026-07-17T00:00:00Z');
+  const fresh = { lastNav: 100_000, lastCheckAt: '2026-07-16T20:00:00Z' };      // 4h
+  const old = { lastNav: 100_000, lastCheckAt: '2026-07-15T20:00:00Z' };        // 28h
+
+  it('a fresh snapshot is not marked', () => {
+    const d = buildDigest(fresh, [], '2026-07-16', now);
+    expect(d.stale).toBe(false);
+    expect(d.title.startsWith('STALE')).toBe(false);
+    expect(d.fields.find((f) => f.label === 'Snapshot')).toBeUndefined();
+  });
+
+  it('older than 26h → STALE in the title and a Snapshot field with its age', () => {
+    const d = buildDigest(old, [], '2026-07-16', now);
+    expect(d.stale).toBe(true);
+    expect(d.title).toMatch(/^STALE — Daily summary/);
+    expect(d.fields.find((f) => f.label === 'Snapshot')!.value).toBe('28h old (STALE)');
+  });
+
+  it('an undated snapshot is stale — the digest cannot vouch for it', () => {
+    expect(buildDigest({ lastNav: 1 }, [], '2026-07-16', now).stale).toBe(true);
+    expect(snapshotAgeHours({ lastCheckAt: 'garbage' }, now)).toBeNull();
+  });
+
+  it('DIGEST_STALE_HOURS moves the line, and 0 switches the check off', () => {
+    const saved = process.env.DIGEST_STALE_HOURS;
+    try {
+      process.env.DIGEST_STALE_HOURS = '48';
+      expect(isSnapshotStale(old, now)).toBe(false);
+      process.env.DIGEST_STALE_HOURS = '0';
+      expect(isSnapshotStale({}, now)).toBe(false);
+    } finally {
+      if (saved === undefined) delete process.env.DIGEST_STALE_HOURS; else process.env.DIGEST_STALE_HOURS = saved;
+    }
   });
 });

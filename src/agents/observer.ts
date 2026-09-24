@@ -23,8 +23,10 @@ import {
 import type { EventsStatus, GapEvent, ObservedEvent } from '../observability/event-types.js';
 import { loadState, mergeState, appendObservedEvents, type ObservedEventState } from '../state/store.js';
 import { notify } from '../notify/slack.js';
-import { storeHooks } from '../notify/store-hooks.js';
+import { storeHooks, outboxStore } from '../notify/store-hooks.js';
+import { drainOutbox } from '../notify/outbox.js';
 import { log, logError } from '../log.js';
+import { agentStartup } from '../startup.js';
 
 const AGENT = 'Observer';
 
@@ -51,7 +53,10 @@ interface RunResult {
 
 async function run(): Promise<RunResult> {
   if (!OBSERVER_ENABLED) {
-    log('OBSERVER_ENABLED=0 — skipping', AGENT);
+    log('OBSERVER_ENABLED=0 — skipping the poll', AGENT);
+    // Still the outbox's drainer: switching the poll off must not also
+    // strand every queued alert.
+    await drainAlerts();
     return { topicsPolled: 0, totalEvents: 0, gaps: 0, errors: 0 };
   }
 
@@ -102,13 +107,100 @@ async function run(): Promise<RunResult> {
     lastObserverAt: new Date().toISOString(),
   });
 
-  await reportStreamHealth(gaps);
+  await reportStreamHealth(gaps, state);
+  await reportReconcileFreshness(state);
+  // Last, after every write of this run has committed: the drainer must never
+  // sit inside a transaction, and it runs here — the one 5-minute process —
+  // so there is exactly one of it.
+  await drainAlerts();
 
   log(
     `Observer poll complete — topics=${STATIC_TOPICS.length} events=${totalEvents} gaps=${gaps} errors=${errors}`,
     AGENT,
   );
   return { topicsPolled: STATIC_TOPICS.length, totalEvents, gaps, errors };
+}
+
+/** Retry alerts that failed to reach Slack (notify/outbox.ts). Never throws. */
+async function drainAlerts(): Promise<void> {
+  const r = await drainOutbox(outboxStore);
+  if (r.delivered || r.retried || r.dropped) {
+    log(`outbox: delivered=${r.delivered} retried=${r.retried} dropped=${r.dropped}`, AGENT);
+  }
+}
+
+/**
+ * An outage of the event stream as the observer has seen it so far. Persisted
+ * across 5-minute runs, because "how long has this lasted" and "was there
+ * another one today" are both questions about more than one poll.
+ */
+export interface StreamOutage {
+  since: string;
+  reason: string;
+  paged: boolean;
+}
+
+export interface StreamMemory {
+  streamOutage?: StreamOutage;
+  lastStreamOutageEndedAt?: string;
+}
+
+export type StreamAction =
+  | { kind: 'page' | 'record'; reason: string }
+  | { kind: 'recover-page' | 'recover-record'; minutes: number }
+  | null;
+
+/**
+ * Minutes an outage must last before it pages. 0 pages at once (the old
+ * behaviour). IBKR drops the socket a few times a day and bezant is back in
+ * seconds; paging for each of those taught the phone to be ignored.
+ */
+export function blipMinutes(): number {
+  const n = Number(process.env.OBSERVER_BLIP_MINUTES ?? '10');
+  return Number.isFinite(n) && n >= 0 ? n : 10;
+}
+
+/**
+ * Decide what one poll says about the stream, given what earlier polls saw.
+ *
+ * Pure, so the rules are pinned in tests:
+ *   - an outage shorter than the blip threshold is recorded on the ops feed,
+ *     never paged;
+ *   - an outage that outlasts it pages, once;
+ *   - a SECOND outage within 24h of the last one pages immediately — flapping
+ *     is worth a look even when each drop is short;
+ *   - the end of an outage sends a recovery through the same channel the
+ *     outage used.
+ * Gaps stay what they were: a record, handled by judgeStream's 'ops' verdict.
+ */
+export function planStreamAlert(
+  mem: StreamMemory,
+  verdict: ReturnType<typeof judgeStream>,
+  now: Date,
+  blipMs: number = blipMinutes() * 60_000,
+): { action: StreamAction; next: StreamMemory } {
+  const down = verdict !== null && verdict.channel === 'slack';
+  const cur = mem.streamOutage;
+
+  if (!down) {
+    if (!cur) return { action: null, next: mem };
+    const minutes = Math.max(0, Math.round((now.getTime() - Date.parse(cur.since)) / 60_000));
+    return {
+      action: { kind: cur.paged ? 'recover-page' : 'recover-record', minutes },
+      next: { streamOutage: undefined, lastStreamOutageEndedAt: now.toISOString() },
+    };
+  }
+
+  const outage: StreamOutage = cur ?? { since: now.toISOString(), reason: verdict.reason, paged: false };
+  if (outage.paged) return { action: null, next: { ...mem, streamOutage: outage } }; // dedupe re-nags
+  const lasted = now.getTime() - Date.parse(outage.since);
+  const lastEnd = mem.lastStreamOutageEndedAt ? Date.parse(mem.lastStreamOutageEndedAt) : NaN;
+  const repeat = Number.isFinite(lastEnd) && now.getTime() - lastEnd < 24 * 3_600_000;
+  if (lasted >= blipMs || repeat) {
+    return { action: { kind: 'page', reason: verdict.reason }, next: { ...mem, streamOutage: { ...outage, paged: true } } };
+  }
+  // Recorded once per outage — the first poll that sees it.
+  return { action: cur ? null : { kind: 'record', reason: verdict.reason }, next: { ...mem, streamOutage: outage } };
 }
 
 /**
@@ -123,7 +215,7 @@ async function run(): Promise<RunResult> {
  * Best-effort. getEventsStatus THROWS on a non-200 (event-poller.ts), and an
  * observability check must never be the reason a poll run fails.
  */
-async function reportStreamHealth(gaps: number): Promise<void> {
+async function reportStreamHealth(gaps: number, state: Record<string, unknown>): Promise<void> {
   let status;
   try {
     status = await getEventsStatus();
@@ -133,27 +225,115 @@ async function reportStreamHealth(gaps: number): Promise<void> {
   }
 
   const verdict = judgeStream(status, gaps);
-  if (!verdict) return;
+  const now = new Date();
+  const mem: StreamMemory = {
+    streamOutage: state.streamOutage as StreamOutage | undefined,
+    lastStreamOutageEndedAt: state.lastStreamOutageEndedAt as string | undefined,
+  };
+  const { action, next } = planStreamAlert(mem, verdict, now);
+  if (next.streamOutage !== mem.streamOutage || next.lastStreamOutageEndedAt !== mem.lastStreamOutageEndedAt) {
+    mergeState({ streamOutage: next.streamOutage, lastStreamOutageEndedAt: next.lastStreamOutageEndedAt });
+  }
 
+  const fields = [
+    { label: 'Connected', value: String(status.connected) },
+    { label: 'Orders subscription', value: status.subscriptions?.orders ?? 'unknown (old bezant)' },
+    { label: 'Last message', value: status.lastMessageAt ?? 'never' },
+    { label: 'Reconnects', value: String(status.reconnectCount) },
+    ...(status.subscribeRefusals ? [{ label: 'Refusals', value: String(status.subscribeRefusals) }] : []),
+    ...(gaps ? [{ label: 'Gaps this run', value: String(gaps) }] : []),
+  ];
+
+  // Gaps are a record on their own terms (see judgeStream), outage or not.
+  if (verdict && verdict.channel === 'ops') {
+    await notify(
+      { severity: 'warn', channel: 'ops', title: verdict.title, body: verdict.body, fields, agent: AGENT,
+        dedupe: { key: 'observer:stream-health', fingerprint: verdict.reason } },
+      storeHooks,
+    );
+  }
+  if (!action) return;
+
+  if (action.kind === 'page' && verdict) {
+    await notify(
+      {
+        severity: 'warn',
+        title: verdict.title,
+        body: verdict.body,
+        fields: [
+          ...fields,
+          { label: 'Down since', value: next.streamOutage?.since ?? now.toISOString() },
+        ],
+        agent: AGENT,
+        // Coarse: reconnectCount and uptime change constantly, so fingerprinting
+        // on them would alert every poll. This is one condition — "the stream is
+        // unhealthy" — that re-nags on its ttl until it clears.
+        dedupe: { key: 'observer:stream-health', fingerprint: verdict.reason },
+      },
+      storeHooks,
+    );
+  } else if (action.kind === 'record' && verdict) {
+    await notify(
+      {
+        severity: 'warn',
+        channel: 'ops',
+        title: `${verdict.title} (watching — pages after ${blipMinutes()} min)`,
+        body: verdict.body,
+        fields,
+        agent: AGENT,
+        dedupe: { key: 'observer:stream-blip', fingerprint: next.streamOutage?.since ?? '' },
+      },
+      storeHooks,
+    );
+  } else if (action.kind === 'recover-page' || action.kind === 'recover-record') {
+    await notify(
+      {
+        severity: 'recovery',
+        ...(action.kind === 'recover-record' ? { channel: 'ops' as const } : {}),
+        title: `Event stream healthy again after ${action.minutes} min`,
+        agent: AGENT,
+        dedupe: action.kind === 'recover-page'
+          ? { key: 'observer:stream-health', fingerprint: 'recovered' }
+          : { key: 'observer:stream-blip', fingerprint: `recovered:${now.toISOString()}` },
+      },
+      storeHooks,
+    );
+  }
+}
+
+/**
+ * The reconciler runs at 07:15 and 19:15; if neither slot has completed in
+ * 14h (RECONCILE_STALE_HOURS, 0 = off), push. It cannot report its own
+ * absence — a unit that never starts writes nothing — so the observer, which
+ * runs every 5 minutes, does. A deferred run (gateway logged out) does not
+ * stamp lastReconcileAt either, so two deferrals in a row land here too.
+ */
+export function reconcileStaleness(lastReconcileAt: string | undefined, now: Date): number | null {
+  const limit = Number(process.env.RECONCILE_STALE_HOURS ?? '14');
+  if (!Number.isFinite(limit) || limit <= 0 || !lastReconcileAt) return null;
+  const at = Date.parse(lastReconcileAt);
+  if (!Number.isFinite(at)) return null;
+  const hours = (now.getTime() - at) / 3_600_000;
+  return hours > limit ? hours : null;
+}
+
+async function reportReconcileFreshness(state: Record<string, unknown>): Promise<void> {
+  const last = state.lastReconcileAt as string | undefined;
+  const hours = reconcileStaleness(last, new Date());
+  if (hours === null) return;
   await notify(
     {
       severity: 'warn',
-      channel: verdict.channel,
-      title: verdict.title,
-      body: verdict.body,
-      fields: [
-        { label: 'Connected', value: String(status.connected) },
-        { label: 'Orders subscription', value: status.subscriptions?.orders ?? 'unknown (old bezant)' },
-        { label: 'Last message', value: status.lastMessageAt ?? 'never' },
-        { label: 'Reconnects', value: String(status.reconnectCount) },
-        ...(status.subscribeRefusals ? [{ label: 'Refusals', value: String(status.subscribeRefusals) }] : []),
-        ...(gaps ? [{ label: 'Gaps this run', value: String(gaps) }] : []),
-      ],
+      title: `No reconcile against IBKR for ${hours.toFixed(0)}h`,
+      body:
+        'The reconciler checks the ledger and the book against the broker twice a day. Neither slot has ' +
+        'completed — the gateway may be logged out, or the unit is failing (`systemctl --user status ' +
+        'ibkr-fund-reconciler`).',
+      fields: [{ label: 'Last reconcile', value: last ?? 'never' }],
       agent: AGENT,
-      // Coarse: reconnectCount and uptime change constantly, so fingerprinting
-      // on them would alert every poll. This is one condition — "the stream is
-      // unhealthy" — that re-nags on its ttl until it clears.
-      dedupe: { key: 'observer:stream-health', fingerprint: verdict.reason },
+      // Keyed on the stale timestamp: one push per stall, re-nagging on the
+      // warn ttl, and a fresh reconcile that goes stale again is a new event.
+      dedupe: { key: 'observer:reconcile-stale', fingerprint: last ?? 'never' },
     },
     storeHooks,
   );
@@ -275,7 +455,9 @@ export function formatEvent<T>(evt: ObservedEvent<T>): string {
 }
 
 if (process.argv.includes('--once')) {
-  run()
+  Promise.resolve()
+    .then(() => agentStartup(AGENT))
+    .then(() => run())
     .then((r) => {
       log(`done: ${JSON.stringify(r)}`, AGENT);
       process.exit(r.errors > 0 ? 1 : 0);

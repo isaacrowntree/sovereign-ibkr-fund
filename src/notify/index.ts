@@ -26,6 +26,13 @@ export type { NotifyEvent, NotifyField, RenderMeta, Severity } from './blocks.js
 const AGENT = 'Alert';
 const TIMEOUT_MS = 10_000;
 
+/** Backoff between alert() retries. Read per call, like everything here, so tests can zero it. */
+function alertRetryDelays(): number[] {
+  return (process.env.ALERT_RETRY_DELAYS_MS ?? '1000,3000')
+    .split(',').filter(Boolean).map(Number).filter((n) => Number.isFinite(n) && n >= 0);
+}
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 export interface Notifier {
   /**
    * Send a pre-formatted string. Posts plain `{ text }` — byte-identical to the
@@ -95,9 +102,20 @@ export const webhookNotifier: Notifier = {
       log(`(alert suppressed — IBKR_FUND_ALERT_WEBHOOK unset): ${text}`, AGENT);
       return;
     }
-    const res = await post(webhook, { text });
-    if (res && res.status >= 400) {
-      logError(`alert webhook returned ${res.status}`, res.body, AGENT);
+    // alert() has no dedupe key and so no outbox to fall back on: a single
+    // transient failure used to be the end of it. A short in-process retry
+    // covers the common case (a Slack 5xx or a dropped connection) without
+    // holding a caller for long — two retries, ~4s of waiting in total.
+    const delays = alertRetryDelays();
+    for (let attempt = 0; ; attempt++) {
+      const res = await post(webhook, { text });
+      if (res && res.status < 400) return;
+      const transient = !res || res.status === 429 || res.status >= 500;
+      if (!transient || attempt >= delays.length) {
+        if (res) logError(`alert webhook returned ${res.status}`, res.body, AGENT);
+        return;
+      }
+      await sleep(delays[attempt]);
     }
   },
 
@@ -177,6 +195,23 @@ export function alert(text: string): Promise<void> {
 export interface DedupeHooks {
   claim(key: string, fingerprint: string, ttlMs: number): boolean;
   release(key: string): void;
+  /**
+   * Persist an undelivered event for the observer to retry (notify/outbox.ts).
+   * Optional: without it — or with NOTIFY_OUTBOX off — a failed send releases
+   * its claim instead, which is the older behaviour.
+   */
+  enqueue?(key: string, event: NotifyEvent): void;
+  /** A newer event under this key was delivered — drop any older queued one. */
+  settle?(key: string): void;
+}
+
+/**
+ * NOTIFY_OUTBOX — the kill switch for the persisted outbox. Off by default, so
+ * a deploy changes nothing until it is switched on; set it to 0 to go back to
+ * release-and-retry without a redeploy.
+ */
+export function outboxEnabled(): boolean {
+  return ['1', 'true', 'on'].includes((process.env.NOTIFY_OUTBOX || '').toLowerCase());
 }
 
 /**
@@ -205,6 +240,11 @@ const DEFAULT_TTL_MS: Record<string, number> = {
  * costing one duplicate; for a fund that trade is obvious — a duplicate is
  * noise, a missing fill is a divergence between what you think you hold and
  * what you hold.
+ *
+ * With NOTIFY_OUTBOX on (and hooks that can enqueue), a failed send is handed
+ * to the persisted outbox instead of released: the claim is kept, so the feed
+ * gets one line per condition rather than one per retry, and the observer
+ * retries delivery every five minutes whether or not this agent runs again.
  */
 export async function notify(event: NotifyEvent, hooks?: DedupeHooks): Promise<void> {
   let claimed: string | null = null;
@@ -235,7 +275,27 @@ export async function notify(event: NotifyEvent, hooks?: DedupeHooks): Promise<v
     if (event.channel === 'ops') return;
 
     const delivered = await getNotifier().notify(event);
-    if (!delivered && claimed && hooks) {
+    const outbox = outboxEnabled() && hooks?.enqueue ? hooks : null;
+    if (delivered) {
+      // A delivered newer state supersedes an older one still queued.
+      if (outbox && claimed && outbox.settle) {
+        try { outbox.settle(claimed); } catch (err) { logError('outbox settle failed', err, AGENT); }
+      }
+      return;
+    }
+    if (outbox) {
+      // The outbox takes over delivery, so the claim STAYS: the next run of
+      // this agent sees the condition already claimed, writes no second feed
+      // line and posts nothing, and the observer retries the queued copy.
+      try {
+        outbox.enqueue!(claimed ?? `nokey:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`, event);
+        return;
+      } catch (err) {
+        // Fail open onto the old path: give the claim back so the next run re-sends.
+        logError('outbox enqueue failed — releasing the claim instead', err, AGENT);
+      }
+    }
+    if (claimed && hooks) {
       try {
         hooks.release(claimed);
       } catch (err) {

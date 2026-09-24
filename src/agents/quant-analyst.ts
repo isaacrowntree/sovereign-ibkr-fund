@@ -11,6 +11,7 @@ import { olsRegression } from '../quant/regression.js';
 import { loadState, mergeState } from '../state/store.js';
 import { recordDailySample, marketDate } from '../quant/price-history.js';
 import { log, logError } from '../log.js';
+import { agentStartup } from '../startup.js';
 
 const AGENT = 'QuantAnalyst';
 
@@ -183,5 +184,9 @@ async function run(): Promise<void> {
 }
 
 if (process.argv.includes('--once')) {
-  run().then(() => process.exit(0)).catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
+  Promise.resolve()
+    .then(() => agentStartup(AGENT))
+    .then(() => run())
+    .then(() => process.exit(0))
+    .catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
 }

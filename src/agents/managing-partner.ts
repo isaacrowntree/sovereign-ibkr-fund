@@ -6,6 +6,7 @@ import { connect, disconnect, getAccountSummary, getMarketPrices, getUsdBalances
 import { TARGET_PORTFOLIO, validateTargets } from '../config.js';
 import { loadState, mergeState } from '../state/store.js';
 import { log, logError } from '../log.js';
+import { agentStartup } from '../startup.js';
 
 const AGENT = 'ManagingPartner';
 
@@ -142,5 +143,9 @@ async function run(): Promise<void> {
 }
 
 if (process.argv.includes('--once')) {
-  run().then(() => process.exit(0)).catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
+  Promise.resolve()
+    .then(() => agentStartup(AGENT))
+    .then(() => run())
+    .then(() => process.exit(0))
+    .catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
 }
