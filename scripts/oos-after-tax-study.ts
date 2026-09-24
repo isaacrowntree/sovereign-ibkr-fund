@@ -1,4 +1,4 @@
-import { runBacktest, DEFAULT_CONFIG, loadHistoricalData, type BacktestConfig, type Position } from '../src/validation/backtest-engine.js';
+import { runBacktest, clampToWarmup, DEFAULT_CONFIG, loadHistoricalData, type BacktestConfig, type Position } from '../src/validation/backtest-engine.js';
 import { toTradeRecords, evaluateAfterTax } from '../src/validation/after-tax.js';
 import { TARGET_PORTFOLIO } from '../src/config.js';
 
@@ -37,7 +37,7 @@ function run(label: string, from: string, to: string) {
   console.log(`\n=== ${label}  (${from} -> ${to}) ===`);
   console.log('strategy                              trades   gross%   after-tax%   liq%    maxDD%   Sharpe   ST$      LT$');
   for (const [name, cfg] of CONFIGS) {
-    const r = runBacktest(cfg, CAPITAL, openingPositions, from, to);
+    const r = runBacktest(cfg, CAPITAL, openingPositions, clampToWarmup(cfg, from), to);
     const recs = toTradeRecords(r, startPrices, `${from}T20:00:00Z`);
     const t = evaluateAfterTax(r, recs, RATE);
     const liq = [...recs];

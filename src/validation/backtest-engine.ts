@@ -10,7 +10,6 @@ import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import { maxDrawdown } from '../risk/drawdown';
 import { historicalVaR, conditionalVaR } from '../risk/var';
-import { config as appConfig } from '../config';
 import {
   computeTargetWeights,
   computeExposure,
@@ -115,6 +114,26 @@ export interface BacktestConfig {
    * this many calendar days. 0 = off (current production behaviour).
    */
   cashFlowRebuyGuardDays: number;
+  /**
+   * Live-path knobs (2026-09-24, G1/G3). All optional; absent means the
+   * engine's historical behaviour, so every existing study reproduces.
+   *   minTradeUsd        — rebalance order floor (engine legacy: 50)
+   *   cashBufferPct      — % of NAV held back from rebalance targets (legacy: 0)
+   *   fillMode           — rebalance buy allocation when cash-short (legacy: proportional)
+   *   cashFlowFillMode   — allocateCashFlow mode (legacy: proportional)
+   *   cashFlowReserveUsd — cash the cash-flow path never deploys (legacy: 1000)
+   *   cashFlowReserveBase — the same reserve stated in AUD, converted at the
+   *                        day's rate; wins over cashFlowReserveUsd when an FX
+   *                        series is loaded (as live: CASH_FLOW_RESERVE_BASE)
+   */
+  minTradeUsd?: number;
+  cashBufferPct?: number;
+  fillMode?: 'greedy' | 'proportional';
+  cashFlowFillMode?: 'greedy' | 'proportional';
+  cashFlowReserveUsd?: number;
+  cashFlowReserveBase?: number;
+  /** FX series in data/ ({ date: AUD per USD }); required by cashFlowReserveBase. */
+  fxDataFile?: string;
 }
 
 export interface TradeRecord {
@@ -169,6 +188,32 @@ export function loadHistoricalData(dataFile?: string): Record<string, DailyBar[]
   return data;
 }
 
+const _cachedFx = new Map<string, { dates: string[]; rates: number[] }>();
+
+/** AUD-per-USD series from data/, sorted by date. */
+export function loadFxSeries(file: string): { dates: string[]; rates: number[] } {
+  const cached = _cachedFx.get(file);
+  if (cached) return cached;
+  const raw = JSON.parse(readFileSync(resolve(__dirname, 'data', file), 'utf8')) as Record<string, number>;
+  const dates = Object.keys(raw).sort();
+  const out = { dates, rates: dates.map(d => raw[d]) };
+  _cachedFx.set(file, out);
+  return out;
+}
+
+/** The last rate on or before `date` (FX trades on days the NYSE doesn't, and vice versa). */
+export function fxOn(series: { dates: string[]; rates: number[] }, date: string): number {
+  let lo = 0;
+  let hi = series.dates.length - 1;
+  if (hi < 0) throw new Error('empty FX series');
+  if (date < series.dates[0]) return series.rates[0];
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (series.dates[mid] <= date) lo = mid; else hi = mid - 1;
+  }
+  return series.rates[lo];
+}
+
 export const SYMBOLS = ['PLTR', 'AMZN', 'TWLO', 'ARM', 'TSLA', 'BRK-B', 'NET'];
 
 // ---------- Helpers ----------
@@ -214,21 +259,25 @@ function getActiveSymbols(symbols: string[], symbolDateMap: Map<string, Map<stri
   return symbols.filter(s => symbolDateMap.get(s)!.has(date));
 }
 
-// ---------- Default Config (reads from centralized config.ts) ----------
+// ---------- Default + live configs ----------
+//
+// Studies never read ambient env (2026-09-24 review, G1). DEFAULT_CONFIG used to
+// be assembled from `config.ts`, i.e. from whatever `.env` happened to be loaded:
+// the same study gave different answers on the workstation (live .env) and in CI
+// (code defaults), and changing a production default silently changed every
+// backtest assertion. It is now a literal — the code defaults as they stood when
+// the coupling was removed — and LIVE_CONFIG layers a sanitised snapshot of the
+// production knobs on top of it.
 
 export const DEFAULT_CONFIG: BacktestConfig = {
   name: 'Default HRP + Regime + Vol Target',
-  optimizerMethod: appConfig.strategy.optimizer,
-  rebalanceDriftPct: appConfig.rebalance.driftThreshold,
-  rebalanceFreqDays: appConfig.rebalance.frequencyDays,
-  drawdownLimits: {
-    warningPct: appConfig.risk.drawdownWarningPct,
-    deriskPct: appConfig.risk.drawdownDeriskPct,
-    hardStopPct: appConfig.risk.drawdownHardStopPct,
-  },
-  targetVol: appConfig.risk.targetVol,
-  maxLeverage: appConfig.risk.maxLeverage,
-  enableRegimeOverlay: appConfig.strategy.enableRegimeOverlay,
+  optimizerMethod: 'hrp',
+  rebalanceDriftPct: 10,
+  rebalanceFreqDays: 45,
+  drawdownLimits: { warningPct: 7, deriskPct: 15, hardStopPct: 25 },
+  targetVol: 0.20,
+  maxLeverage: 1.0,
+  enableRegimeOverlay: true,
   // OFF for production parity (2026-08-29 gate audit): risk-manager computes
   // volTargetLeverage and writes it to state, but portfolio-strategist never
   // reads it — no live order path applies a vol multiplier. Simulating one
@@ -236,7 +285,7 @@ export const DEFAULT_CONFIG: BacktestConfig = {
   // recomputes from the trailing 60d daily it swings targets (and therefore
   // drift, urgent triggers, and cash-flow churn) that production never sees.
   enableVolTargeting: false,
-  lookbackDays: appConfig.strategy.lookbackDays,
+  lookbackDays: 180,
   commissionPerTrade: 1.0,
   slippagePctPerSide: 0.0005, // 5 bps/side; see BacktestConfig
   regimeLookbackDays: 200,    // production quant-analyst's history requirement
@@ -246,11 +295,77 @@ export const DEFAULT_CONFIG: BacktestConfig = {
   regimeMinHistory: 200,
   unknownRegimeExposure: 1.0,
   useTotalReturn: true,
-  urgentDriftPct: appConfig.rebalance.urgentDriftThreshold,
+  urgentDriftPct: 25,
   modelCashFlowPath: true,
   exposureDeadBand: 0,       // churn guards default OFF — matches live today
   cashFlowRebuyGuardDays: 0,
 };
+
+/**
+ * The production knobs as of 2026-09-24, sanitised: switches and thresholds
+ * only, no account figures. Update it when the live `.env` changes — it is the
+ * one place a study learns what "live" means.
+ */
+export const LIVE_KNOBS = {
+  asOf: '2026-09-24',
+  OPTIMIZER: 'static',
+  ENABLE_REGIME: false,
+  REBALANCE_DRIFT_THRESHOLD: 10,
+  REBALANCE_URGENT_DRIFT_THRESHOLD: 25,
+  REBALANCE_FREQ_DAYS: 45,
+  REBALANCE_MIN_TRADE_USD: 200,
+  REBALANCE_CASH_BUFFER_PCT: 1,
+  REBALANCE_FILL_MODE: 'greedy',
+  REBALANCE_CASHFLOW_FILL_MODE: 'greedy',
+  CASH_FLOW_RESERVE_BASE: 500,
+  CASH_FLOW_REBUY_GUARD_DAYS: 30,
+  DD_WARNING: 7,
+  DD_DERISK: 15,
+  DD_HARD_STOP: 25,
+} as const;
+
+/** DEFAULT_CONFIG with the live knobs applied. Callers still supply `staticWeights`. */
+export const LIVE_CONFIG: BacktestConfig = {
+  ...DEFAULT_CONFIG,
+  name: `Live (${LIVE_KNOBS.asOf})`,
+  optimizerMethod: LIVE_KNOBS.OPTIMIZER,
+  enableRegimeOverlay: LIVE_KNOBS.ENABLE_REGIME,
+  rebalanceDriftPct: LIVE_KNOBS.REBALANCE_DRIFT_THRESHOLD,
+  urgentDriftPct: LIVE_KNOBS.REBALANCE_URGENT_DRIFT_THRESHOLD,
+  rebalanceFreqDays: LIVE_KNOBS.REBALANCE_FREQ_DAYS,
+  drawdownLimits: {
+    warningPct: LIVE_KNOBS.DD_WARNING,
+    deriskPct: LIVE_KNOBS.DD_DERISK,
+    hardStopPct: LIVE_KNOBS.DD_HARD_STOP,
+  },
+  minTradeUsd: LIVE_KNOBS.REBALANCE_MIN_TRADE_USD,
+  cashBufferPct: LIVE_KNOBS.REBALANCE_CASH_BUFFER_PCT,
+  fillMode: LIVE_KNOBS.REBALANCE_FILL_MODE,
+  cashFlowFillMode: LIVE_KNOBS.REBALANCE_CASHFLOW_FILL_MODE,
+  cashFlowReserveBase: LIVE_KNOBS.CASH_FLOW_RESERVE_BASE,
+  cashFlowRebuyGuardDays: LIVE_KNOBS.CASH_FLOW_REBUY_GUARD_DAYS,
+  fxDataFile: 'fx-audusd.json',
+};
+
+/**
+ * The earliest `startDate` runBacktest accepts for `config` — the end of its
+ * optimizer warm-up on the dataset it would load. For studies that used to pass
+ * the dataset's first day and rely on the (now removed) silent shift.
+ */
+export function firstUsableStart(config: BacktestConfig): string {
+  const allData = loadHistoricalData(config.dataFile);
+  const { dates } = buildDateIndex(allData, config.symbols ?? SYMBOLS);
+  if (dates.length <= config.lookbackDays) {
+    throw new Error(`dataset has ${dates.length} days, fewer than the ${config.lookbackDays}-day warm-up`);
+  }
+  return dates[config.lookbackDays];
+}
+
+/** `from`, or the first usable start if `from` falls inside the warm-up. */
+export function clampToWarmup(config: BacktestConfig, from: string): string {
+  const first = firstUsableStart(config);
+  return from < first ? first : from;
+}
 
 // ---------- Core Backtest ----------
 
@@ -261,6 +376,9 @@ export function runBacktest(
   startDate?: string,
   endDate?: string,
 ): BacktestResult {
+  if (config.cashFlowReserveBase !== undefined && !config.fxDataFile) {
+    throw new Error('cashFlowReserveBase is stated in AUD and needs fxDataFile to convert it — refusing to guess a rate');
+  }
   const allData = loadHistoricalData(config.dataFile);
   const symbols = config.symbols ?? SYMBOLS;
 
@@ -279,7 +397,16 @@ export function runBacktest(
   if (startDate) {
     const idx = dates.findIndex(x => x >= startDate); // first trading day on/after
     if (idx < 0 || dates[0] > startDate) throw outsideDataset('startDate', startDate);
-    startIdx = Math.max(idx, config.lookbackDays);
+    // A start inside the optimizer warm-up used to be moved silently to the end
+    // of it (2026-09-24 review, G5) — the same class of lie as the window
+    // fallback above: a "2024" study that actually began mid-2024.
+    if (idx < config.lookbackDays) {
+      throw new Error(
+        `startDate ${startDate} is inside the ${config.lookbackDays}-day warm-up of this dataset; ` +
+        `the first usable start is ${dates[config.lookbackDays]}. Start later, or use a longer dataFile.`,
+      );
+    }
+    startIdx = idx;
   }
   if (endDate) {
     if (endDate < dates[0] || endDate > dates[dates.length - 1]) throw outsideDataset('endDate', endDate);
@@ -287,6 +414,9 @@ export function runBacktest(
     while (idx > 0 && dates[idx] > endDate) idx--; // last trading day on/before
     endIdx = idx + 1;
   }
+
+  const fx = config.fxDataFile ? loadFxSeries(config.fxDataFile) : null;
+  const minTradeUsd = config.minTradeUsd ?? 50;
 
   let positions: Position[] = initialPositions ? initialPositions.map(p => ({ ...p })) : [];
   let cash = startingCapital;
@@ -492,7 +622,9 @@ export function runBacktest(
       // Production deploys idle cash buy-only into underweights here, and it
       // does NOT reset the rebalance cooldown (a cash deployment must never
       // silence the only mechanism that can SELL an overweight).
-      const CASH_THRESHOLD = 1000;
+      const CASH_THRESHOLD = config.cashFlowReserveBase !== undefined && fx
+        ? config.cashFlowReserveBase / fxOn(fx, date)
+        : (config.cashFlowReserveUsd ?? 1000);
       if (config.modelCashFlowPath && cash > CASH_THRESHOLD) {
         const holdings = optimSymbols.map((s, i) => ({
           symbol: s,
@@ -507,7 +639,9 @@ export function runBacktest(
             if (dateMs - ms <= guardMs) exclude.add(sym);
           }
         }
-        const cashOrders = allocateCashFlow(holdings, cash - CASH_THRESHOLD, 100, prices, exclude);
+        const cashOrders = allocateCashFlow(
+          holdings, cash - CASH_THRESHOLD, 100, prices, exclude, config.cashFlowFillMode ?? 'proportional',
+        );
         for (const o of cashOrders) {
           const price = (prices.get(o.symbol) ?? 0) * (1 + config.slippagePctPerSide);
           const cost = o.shares * price + config.commissionPerTrade;
@@ -529,7 +663,10 @@ export function runBacktest(
     if (decision === 'too-soon') continue;
 
     // 'urgent' or 'regular' — full rebalance
-    const rebalOrders = generateRebalanceOrders(snapshot, targetWeightMap, weightSource, 50);
+    const rebalOrders = generateRebalanceOrders(snapshot, targetWeightMap, weightSource, minTradeUsd, {
+      cashBufferPct: config.cashBufferPct ?? 0,
+      fillMode: config.fillMode ?? 'proportional',
+    });
     if (rebalOrders.length === 0) continue;
 
     lastRebalanceMs = dateMs;

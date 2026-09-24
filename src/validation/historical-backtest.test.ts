@@ -228,11 +228,19 @@ describe.skipIf(!BACKTEST_DATA_AVAILABLE)('MECE scenario tests', () => {
     expect(result.finalPortfolioValue).toBeGreaterThan(0);
   });
 
-  it('Scenario: Bull run (2024)', () => {
-    const result = runBacktest(DEFAULT_CONFIG, STARTING_NLV, undefined, '2024-01-01', '2024-12-31');
+  // Also predates the default dataset's 180-day warm-up (first usable start
+  // 2024-06): the engine used to shift the start to mid-2024 without a word.
+  // It throws now (2026-09-24, G5), so this runs on the long dataset too.
+  it.skipIf(!LONG_DATA_AVAILABLE)('Scenario: Bull run (2024)', () => {
+    const result = runBacktest(
+      { ...DEFAULT_CONFIG, dataFile: 'historical-long.json' },
+      STARTING_NLV, undefined, '2024-01-01', '2024-12-31',
+    );
 
     console.log(`\n--- 2024 Bull Run ---`);
     console.log(formatResult(result));
+
+    expect(result.startDate.startsWith('2024-01')).toBe(true);
 
     // Regime should detect bullish conditions
     const riskOnDays = (result.regimeCounts['risk_on'] ?? 0) + (result.regimeCounts['neutral'] ?? 0);
