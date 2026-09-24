@@ -20,6 +20,7 @@ import {
   placeMarketOrder,
   placeAdaptiveOrder,
   placeMidpriceOrder,
+  findOrderByRef,
   type TradeResult,
   type AdaptivePriority,
   type OrderReply,
@@ -66,7 +67,7 @@ const usd = (n: number): string => `$${n.toLocaleString('en-US', { maximumFracti
 async function reportRun(outcome: ExecutionOutcome, runAt: string): Promise<void> {
   // Anomalies first, individually: these are correctness events, not volume.
   for (const a of outcome.anomalies) {
-    const isDivergence = a.kind === 'ledger-diverged';
+    const isDivergence = a.kind === 'ledger-diverged' || a.kind === 'placement-unknown';
     await notify(
       {
         severity: isDivergence ? 'critical' : 'warn',
@@ -76,7 +77,9 @@ async function reportRun(outcome: ExecutionOutcome, runAt: string): Promise<void
             ? 'Order event stream is silent — fills confirmed from executions instead'
             : a.kind === 'order-refused'
               ? `Order not placed — IBKR confirmation prompt refused (${a.symbol})`
-              : `Fill recovered from IBKR — ${a.symbol}`,
+              : a.kind === 'placement-unknown'
+                ? `Order state unknown — placement unanswered and not found (${a.symbol})`
+                : `Fill recovered from IBKR — ${a.symbol}`,
         body: a.detail,
         fields: [
           { label: 'Symbol', value: a.symbol },
@@ -258,7 +261,9 @@ async function placeOrder(
   order: StagedOrder,
   strategy: AlgoPlan['strategy'],
   urgency: AlgoPriority,
+  cOID?: string,
 ): Promise<TradeResult> {
+  const opts = cOID ? { cOID } : undefined;
   // Wire the execution strategy. CPAPI passthrough doesn't have a tested
   // TWAP/VWAP path, so those route to Adaptive(Patient) which gives a
   // similar slippage profile for retail-size orders. MIDPRICE is currently
@@ -266,16 +271,16 @@ async function placeOrder(
   // we want to be very passive.
   switch (strategy) {
     case 'adaptive':
-      return placeAdaptiveOrder(order.symbol, order.action, order.qty, urgency as AdaptivePriority);
+      return placeAdaptiveOrder(order.symbol, order.action, order.qty, urgency as AdaptivePriority, opts);
     case 'twap':
     case 'vwap':
       log(`${strategy.toUpperCase()} not yet wired in CPAPI passthrough — using Adaptive(Patient) instead`, AGENT);
-      return placeAdaptiveOrder(order.symbol, order.action, order.qty, 'Patient');
+      return placeAdaptiveOrder(order.symbol, order.action, order.qty, 'Patient', opts);
     case 'limit':
-      return placeMidpriceOrder(order.symbol, order.action, order.qty);
+      return placeMidpriceOrder(order.symbol, order.action, order.qty, opts);
     case 'market':
     default:
-      return placeMarketOrder(order.symbol, order.action, order.qty);
+      return placeMarketOrder(order.symbol, order.action, order.qty, opts);
   }
 }
 
@@ -680,9 +685,9 @@ async function run(): Promise<void> {
     if (regime === 'unknown') log(`Regime unknown (${String(rawRegime)}) — using Patient urgency`, AGENT);
 
     const deps: ExecutorDeps = {
-      placeOrder: async (order, strategy, urgency) => {
+      placeOrder: async (order, strategy, urgency, cOID) => {
         try {
-          const result = await placeOrder(order, strategy, urgency);
+          const result = await placeOrder(order, strategy, urgency, cOID);
           recordReplies(order, result.replies);
           return result;
         } catch (e) {
@@ -698,6 +703,8 @@ async function run(): Promise<void> {
       // Idempotency source: never place a duplicate for a symbol+side already
       // working at IBKR.
       getLiveOrders: () => getLiveOrders(),
+      // After a placement with no usable answer: find it by its cOID (~30 s).
+      findOrderByRef: (ref) => findOrderByRef(ref),
       // Authoritative executions — verifies a fill the WS stream missed so it's
       // never lost. Avg costs — fallback cost basis for sells with no FIFO lot.
       getExecutions: () => getExecutions(),
@@ -740,6 +747,8 @@ async function run(): Promise<void> {
         fillConfirmationEnabled: (process.env.FILL_CONFIRMATION_ENABLED ?? '1') !== '0',
         cashHeadroomPct: config.execution.cashHeadroomPct,
         ordersCursorFloor,
+        // The lease holder token doubles as the run id: short, random, unique.
+        runId: runLock?.holder,
         caps: {
           maxOrderNotionalUsd: config.execution.maxOrderNotionalUsd,
           maxOrderPctNav: config.execution.maxOrderPctNav,

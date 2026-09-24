@@ -152,7 +152,7 @@ describe('gateway HTTP client', () => {
         return { body: [{ symbol: 'AAPL', conid: 265598 }] };
       }
       if (url.includes('/orders')) {
-        return { body: [{ order_id: 'abc123', order_status: 'Submitted' }] };
+        return { body: [{ order_id: '123456', order_status: 'Submitted' }] };
       }
       throw new Error(`unexpected URL: ${url}`);
     });

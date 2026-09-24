@@ -1,6 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   placeMarketOrder,
+  placeAdaptiveOrder,
+  parseExecutions,
+  findOrderByRef,
+  GatewayError,
   evaluateReply,
   replyPolicy,
   OrderNotPlacedError,
@@ -125,5 +129,116 @@ describe('submitOrder — confirmation prompts', () => {
     globalThis.fetch = f.fetchFn as unknown as typeof fetch;
     const r = await placeMarketOrder('ABC', 'SELL', 2);
     expect(r.replies).toBeUndefined();
+  });
+});
+
+describe('submitOrder — fail closed on the answer', () => {
+  it('an answer without a usable order id throws (ambiguous) instead of returning order 0', async () => {
+    for (const final of [{ order_status: 'Submitted' }, { order_id: 'abc', order_status: 'Submitted' }]) {
+      const f = fakeCpapi({ final });
+      globalThis.fetch = f.fetchFn as unknown as typeof fetch;
+      const err = await placeMarketOrder('ABC', 'BUY', 1).catch(e => e);
+      expect(err).toBeInstanceOf(GatewayError);
+      expect(err.message).toMatch(/without an order id/);
+      expect(err.rejected).toBeUndefined();
+      expect(err.notPlaced).toBeUndefined();
+    }
+  });
+
+  it('an explicit rejection is marked rejected', async () => {
+    const f = fakeCpapi({ final: { error: 'Insufficient funds' } });
+    globalThis.fetch = f.fetchFn as unknown as typeof fetch;
+    await expect(placeMarketOrder('ABC', 'BUY', 1)).rejects.toMatchObject({ rejected: true });
+  });
+
+  it('a missing status is "unknown", not an assumed "Submitted"', async () => {
+    const f = fakeCpapi({ final: { order_id: 55 } });
+    globalThis.fetch = f.fetchFn as unknown as typeof fetch;
+    expect((await placeMarketOrder('ABC', 'BUY', 1)).status).toBe('unknown');
+  });
+});
+
+describe('cOID', () => {
+  it('rides on the order body when given, and is absent otherwise', async () => {
+    const f = fakeCpapi();
+    globalThis.fetch = f.fetchFn as unknown as typeof fetch;
+    await placeAdaptiveOrder('ABC', 'SELL', 3, 'Patient', { cOID: 'r1-ABC-SELL-1' });
+    await placeMarketOrder('ABC', 'SELL', 3);
+    const posts = f.requests.filter(r => r.method === 'POST' && /\/orders$/.test(r.url));
+    expect((posts[0].body as { orders: Array<Record<string, unknown>> }).orders[0]).toMatchObject({
+      cOID: 'r1-ABC-SELL-1', algoStrategy: 'Adaptive',
+    });
+    expect((posts[1].body as { orders: Array<Record<string, unknown>> }).orders[0].cOID).toBeUndefined();
+  });
+
+  it('order_ref is read as the cOID string, never Number()ed into NaN', () => {
+    const [e] = parseExecutions([
+      { execution_id: 'x1', symbol: 'ABC', side: 'B', size: 1, price: 10, sec_type: 'STK', order_ref: 'r1-ABC-BUY-1' },
+    ]);
+    expect(e.orderId).toBeUndefined();
+    expect(e.orderRef).toBe('r1-ABC-BUY-1');
+  });
+});
+
+describe('findOrderByRef', () => {
+  /** Scripted feeds: each poll pops the next orders page / trades page. */
+  function feeds(pages: { orders: Array<Array<Record<string, unknown>>>; trades: Array<Array<Record<string, unknown>>> }) {
+    const urls: string[] = [];
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      const url = String(input);
+      urls.push(url);
+      let body: unknown;
+      if (url.includes('/iserver/account/orders')) body = { orders: pages.orders.shift() ?? [] };
+      else if (url.includes('/iserver/account/trades')) body = pages.trades.shift() ?? [];
+      else throw new Error(`unexpected ${url}`);
+      return new Response(JSON.stringify(body), { status: 200 });
+    }) as unknown as typeof fetch;
+    return urls;
+  }
+  const fast = () => {
+    let t = 0;
+    return { now: () => t, sleep: async (ms: number) => { t += ms; } };
+  };
+
+  it('forces a refresh on the first poll only, then finds the order in the live orders', async () => {
+    const urls = feeds({
+      orders: [[], [{ orderId: 777, order_ref: 'r1-ABC-BUY-1', status: 'Submitted', ticker: 'ABC', side: 'BUY' }]],
+      trades: [[], []],
+    });
+    const found = await findOrderByRef('r1-ABC-BUY-1', fast());
+    expect(found).toEqual({ orderId: 777, status: 'Submitted', source: 'orders' });
+    const orderUrls = urls.filter(u => u.includes('/orders'));
+    expect(orderUrls[0]).toMatch(/force=true/);
+    expect(orderUrls[1]).not.toMatch(/force=true/);
+  });
+
+  it('finds an order that already filled (gone from the orders feed) in the trades', async () => {
+    feeds({ orders: [[]], trades: [[{ order_ref: 'r1-ABC-BUY-1', order_id: '888', execution_id: 'e' }]] });
+    expect(await findOrderByRef('r1-ABC-BUY-1', fast())).toEqual({ orderId: 888, status: 'executed', source: 'trades' });
+  });
+
+  it('does not match a different cOID', async () => {
+    feeds({ orders: Array(20).fill([{ orderId: 1, order_ref: 'r1-ABC-BUY-2' }]), trades: [] });
+    expect(await findOrderByRef('r1-ABC-BUY-1', fast())).toBeNull();
+  });
+
+  it('gives up after ~30 s and returns null (unknown), polling every 3 s', async () => {
+    const urls = feeds({ orders: [], trades: [] });
+    expect(await findOrderByRef('r1-ABC-BUY-1', fast())).toBeNull();
+    expect(urls.filter(u => u.includes('/orders')).length).toBe(11); // t = 0, 3, … 30 s
+  });
+
+  it('survives a failing feed and keeps polling', async () => {
+    let n = 0;
+    globalThis.fetch = vi.fn(async (input: unknown) => {
+      const url = String(input);
+      if (url.includes('/orders')) {
+        n++;
+        if (n < 3) return new Response('gateway down', { status: 503 });
+        return new Response(JSON.stringify({ orders: [{ orderId: 9, order_ref: 'ref' }] }), { status: 200 });
+      }
+      return new Response('[]', { status: 200 });
+    }) as unknown as typeof fetch;
+    expect(await findOrderByRef('ref', fast())).toMatchObject({ orderId: 9 });
   });
 });

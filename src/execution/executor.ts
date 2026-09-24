@@ -16,8 +16,10 @@
  *   - A confirmation timeout is NOT requeued — the order may still be
  *     working at IBKR, and a requeue would double-trade. The strategist
  *     rebuilds the queue from live positions, which reconciles it.
- *   - A failed submission IS requeued (nothing reached IBKR) but still
- *     halts the run.
+ *   - A submission with no usable answer (timeout, 5xx, no order id) is
+ *     looked up by its cOID; found → confirmed as usual, not found → dropped
+ *     and never re-placed, and the run halts. A submission that provably
+ *     never went live (a refused confirmation prompt) stays queued.
  *   - Once halted, no further order is placed; the untouched remainder
  *     requeues verbatim.
  */
@@ -57,6 +59,12 @@ export interface ExecutorContext {
    * breaches them halts the run. Omit to disable (tests).
    */
   caps?: NotionalCaps;
+  /**
+   * Short id for this run. When present every placement carries a unique cOID
+   * `${runId}-${symbol}-${side}-${attempt}`, which is how an order whose
+   * placement timed out is found again. Omit → no cOIDs (tests).
+   */
+  runId?: string;
 }
 
 export interface ExecutorDeps {
@@ -65,7 +73,15 @@ export interface ExecutorDeps {
     order: StagedOrder,
     strategy: AlgoPlan['strategy'],
     urgency: AlgoPriority,
+    /** cOID for this placement (see ExecutorContext.runId); undefined when there is no runId. */
+    clientOrderId?: string,
   ): Promise<TradeResult>;
+  /**
+   * Find an order by the cOID it was placed with, after a placement whose
+   * answer never came back. Null = not found, which is NOT proof it was never
+   * placed. Optional: absent → an ambiguous placement is dropped unlooked-up.
+   */
+  findOrderByRef?(clientOrderId: string): Promise<{ orderId: number; status: string } | null>;
   /**
    * Wait for the order's terminal state on the event stream, asking IBKR's
    * executions along the way (`probe`) so a dead stream does not cost the
@@ -164,7 +180,7 @@ export interface ExecutorDeps {
  * see post-run NAV/cash) do the telling.
  */
 export interface ExecutionAnomaly {
-  kind: 'ledger-diverged' | 'fill-recovered' | 'stream-silent' | 'order-refused';
+  kind: 'ledger-diverged' | 'fill-recovered' | 'stream-silent' | 'order-refused' | 'placement-unknown';
   symbol: string;
   detail: string;
   orderId?: string | number;
@@ -545,6 +561,52 @@ export async function executeQueue(
     halt(`${reason} (${order.symbol})`);
   };
 
+  // cOID attempt counter per side+symbol, so a second placement of the same
+  // name in one run (a remainder) still gets an id IBKR has never seen.
+  const attempts = new Map<string, number>();
+  const nextClientOrderId = (order: StagedOrder): string | undefined => {
+    if (!ctx.runId) return undefined;
+    const k = `${order.action}:${order.symbol}`;
+    const n = (attempts.get(k) ?? 0) + 1;
+    attempts.set(k, n);
+    return `${ctx.runId}-${order.symbol}-${order.action}-${n}`;
+  };
+
+  /**
+   * A placement with no usable answer (timeout, 5xx, no order id) may still
+   * have gone live. Look it up by its cOID; found → carry on as if the answer
+   * had arrived. Not found → the state is unknown: never place it again this
+   * run (the caller drops it and halts), and say so loudly.
+   */
+  const recoverAmbiguous = async (
+    order: StagedOrder,
+    clientOrderId: string | undefined,
+    why: string,
+  ): Promise<TradeResult | null> => {
+    if (!clientOrderId || !deps.findOrderByRef) return null;
+    deps.log(`${order.symbol}: ${why} — looking the order up by cOID ${clientOrderId}…`);
+    let found: { orderId: number; status: string } | null = null;
+    try {
+      deps.onPhase?.(`lookup:${order.symbol}`);
+      found = await deps.findOrderByRef(clientOrderId);
+    } catch (e) {
+      deps.logError(`Lookup by cOID ${clientOrderId} failed`, e);
+    }
+    if (found && found.orderId > 0) {
+      deps.log(`${order.symbol}: found at IBKR as orderId=${found.orderId} (${found.status}) — confirming as usual`);
+      return { orderId: found.orderId, symbol: order.symbol, action: order.action, qty: order.qty, status: found.status };
+    }
+    anomalies.push({
+      kind: 'placement-unknown',
+      symbol: order.symbol,
+      detail:
+        `${order.action} ${order.qty} ${order.symbol}: ${why}, and no order with cOID ${clientOrderId} turned up at IBKR. ` +
+        'It may still be live. It was dropped from the queue and will not be placed again; the next run\'s ' +
+        'working-order guard and position check will catch it if it went through.',
+    });
+    return null;
+  };
+
   /** Longest this run may wait for one order's fill (Patient 180s, else 60s). */
   const fillWaitMs = (urgency: AlgoPriority): number => (urgency === 'Patient' ? 180_000 : 60_000);
 
@@ -610,10 +672,11 @@ export async function executeQueue(
       const decisionPrice = order.estimatedValue / order.qty;
       deps.log(`${order.action} ${order.qty} ${order.symbol} via ${strategy} (${urgency}) — ${order.reason}`);
 
+      const clientOrderId = nextClientOrderId(order);
       let result: TradeResult;
       try {
         deps.onPhase?.(`placing:${order.symbol}`);
-        result = await deps.placeOrder(order, strategy, urgency);
+        result = await deps.placeOrder(order, strategy, urgency, clientOrderId);
       } catch (err) {
         deps.logError(`Order submission failed: ${order.action} ${order.qty} ${order.symbol}`, err);
         if ((err as { notPlaced?: unknown } | null)?.notPlaced === true) {
@@ -626,28 +689,39 @@ export async function executeQueue(
           halt(`order not placed (${order.symbol}): confirmation prompt refused`);
           continue;
         }
-        // AMBIGUOUS: a client-side timeout / 5xx can occur AFTER IBKR accepted
-        // the order (placement is non-idempotent — no client order id), so
-        // requeueing verbatim risks a duplicate. Drop it and halt. Next run's
-        // idempotency guard skips it if it went live; else the strategist
-        // regenerates it from positions.
-        drop(order);
-        halt(`order submission failed (${order.symbol})`);
-        continue;
+        // An explicit IBKR rejection is definite: the order is not live, and
+        // retrying verbatim just rejects again. Drop, halt.
+        const rejected = (err as { rejected?: unknown } | null)?.rejected === true;
+        // Otherwise AMBIGUOUS: a timeout / 5xx can arrive AFTER IBKR accepted
+        // the order, so requeueing verbatim risks a duplicate. Look it up by
+        // cOID; if it can't be found, drop it and halt. Next run's idempotency
+        // guard skips it if it went live; else the strategist regenerates it.
+        const found = rejected
+          ? null
+          : await recoverAmbiguous(order, clientOrderId, `submission failed (${err instanceof Error ? err.message : String(err)})`);
+        if (!found) {
+          drop(order);
+          halt(`order submission failed (${order.symbol})`);
+          continue;
+        }
+        result = found;
       }
 
-      // An accepted response with no usable orderId (gateway coerces a
-      // missing/unparseable CPAPI order_id — e.g. a confirmation prompt — to
-      // 0) means we can neither confirm nor safely retry. Drop, halt.
+      // An accepted response with no usable orderId means we can neither
+      // confirm nor safely retry. Look it up by cOID, else drop and halt.
       if (!result.orderId || result.orderId <= 0) {
         deps.logError(
           `Order accepted with no usable orderId (${order.action} ${order.qty} ${order.symbol}) — ` +
-            `cannot confirm; dropping (idempotency guard catches it if live). Halting run.`,
+            `cannot confirm without finding it.`,
           undefined,
         );
-        drop(order);
-        halt(`no usable orderId (${order.symbol})`);
-        continue;
+        const found = await recoverAmbiguous(order, clientOrderId, 'accepted with no usable orderId');
+        if (!found) {
+          drop(order);
+          halt(`no usable orderId (${order.symbol})`);
+          continue;
+        }
+        result = found;
       }
 
       // The order reached IBKR — count it toward the per-run notional cap.

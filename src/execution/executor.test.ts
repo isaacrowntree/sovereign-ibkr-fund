@@ -927,3 +927,78 @@ describe('executeQueue — a refused confirmation prompt', () => {
     expect(outcome.anomalies).toEqual([expect.objectContaining({ kind: 'order-refused', symbol: 'BRK-B' })]);
   });
 });
+
+describe('executeQueue — cOID per placement and lookup after an unanswered placement', () => {
+  it('gives every placement a unique cOID from the run id', async () => {
+    const { deps } = makeDeps();
+    const coids: Array<string | undefined> = [];
+    const place = deps.placeOrder;
+    deps.placeOrder = async (o, s, u, c) => { coids.push(c); return place(o, s, u, c); };
+    await executeQueue(MIXED_QUEUE, ctx({ runId: 'r1' }), deps);
+    expect(coids).toEqual(['r1-BRK-B-SELL-1', 'r1-NET-SELL-1', 'r1-AVGO-BUY-1', 'r1-GLD-BUY-1']);
+  });
+
+  it('no run id → no cOID (unchanged behaviour)', async () => {
+    const { deps } = makeDeps();
+    const coids: Array<string | undefined> = [];
+    const place = deps.placeOrder;
+    deps.placeOrder = async (o, s, u, c) => { coids.push(c); return place(o, s, u, c); };
+    await executeQueue([order('NET', 'SELL', 100)], ctx(), deps);
+    expect(coids).toEqual([undefined]);
+  });
+
+  it('a timed-out placement found by its cOID is confirmed and recorded like any other', async () => {
+    const { deps, calls, trades } = makeDeps({ failPlace: ['NET'] });
+    const lookups: string[] = [];
+    deps.findOrderByRef = async (ref) => { lookups.push(ref); return { orderId: 555, status: 'Submitted' }; };
+    const confirmIds: number[] = [];
+    const confirm = deps.confirmFill;
+    deps.confirmFill = async (id, o) => { confirmIds.push(id); return confirm(id, o); };
+    const outcome = await executeQueue(MIXED_QUEUE, ctx({ runId: 'r1' }), deps);
+    expect(lookups).toEqual(['r1-NET-SELL-1']);
+    expect(confirmIds).toContain(555);
+    expect(outcome.halted).toBe(false);
+    expect(trades.map(t => t.symbol)).toContain('NET');
+    // Never placed twice.
+    expect(calls.filter(c => c === 'place:SELL:NET')).toHaveLength(1);
+  });
+
+  it('not found → dropped, never re-placed, halted, and a placement-unknown anomaly', async () => {
+    const { deps, calls } = makeDeps({ failPlace: ['NET'] });
+    deps.findOrderByRef = async () => null;
+    const outcome = await executeQueue(MIXED_QUEUE, ctx({ runId: 'r1' }), deps);
+    expect(outcome.halted).toBe(true);
+    expect(outcome.haltReason).toBe('order submission failed (NET)');
+    expect(outcome.requeue.map(o => o.symbol)).not.toContain('NET');
+    expect(calls.filter(c => c === 'place:SELL:NET')).toHaveLength(1);
+    expect(outcome.anomalies).toEqual([expect.objectContaining({ kind: 'placement-unknown', symbol: 'NET' })]);
+  });
+
+  it('a lookup that throws is treated as not found', async () => {
+    const { deps } = makeDeps({ failPlace: ['NET'] });
+    deps.findOrderByRef = async () => { throw new Error('bezant down'); };
+    const outcome = await executeQueue([order('NET', 'SELL', 100)], ctx({ runId: 'r1' }), deps);
+    expect(outcome.halted).toBe(true);
+    expect(outcome.anomalies[0]?.kind).toBe('placement-unknown');
+  });
+
+  it('an explicit rejection is not looked up — it is definitely not live', async () => {
+    const { deps } = makeDeps();
+    let looked = false;
+    deps.findOrderByRef = async () => { looked = true; return null; };
+    deps.placeOrder = async (o) => { throw Object.assign(new Error(`order rejected for ${o.symbol}`), { rejected: true }); };
+    const outcome = await executeQueue([order('NET', 'SELL', 100)], ctx({ runId: 'r1' }), deps);
+    expect(looked).toBe(false);
+    expect(outcome.halted).toBe(true);
+    expect(outcome.requeue).toEqual([]);
+    expect(outcome.anomalies).toEqual([]);
+  });
+
+  it('an accepted answer with no order id is looked up too', async () => {
+    const { deps } = makeDeps({ zeroOrderId: ['BRK-B'] });
+    deps.findOrderByRef = async () => ({ orderId: 4242, status: 'Submitted' });
+    const outcome = await executeQueue(MIXED_QUEUE, ctx({ runId: 'r1' }), deps);
+    expect(outcome.halted).toBe(false);
+    expect(outcome.executed.map(o => o.symbol)).toContain('BRK-B');
+  });
+});
