@@ -380,6 +380,30 @@ describe('generateRebalanceOrders — wash-sale guard', () => {
   });
 });
 
+describe('generateRebalanceOrders — WASH_SALE_BLOCK', () => {
+  const snap = () => snapshot({
+    symbols: ['A'], prices: new Map([['A', 100]]), currentShares: new Map(),
+    nav: 10_000, cash: 10_000, peakNav: 10_000,
+  });
+  const active = () => [{ symbol: 'A', soldAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86_400_000).toISOString() }];
+  const buys = (o: ReturnType<typeof generateRebalanceOrders>) => o.filter(x => x.action === 'BUY').map(x => x.symbol);
+
+  it('off: an active wash-sale entry no longer blocks the buy', () => {
+    const prev = process.env.WASH_SALE_BLOCK;
+    process.env.WASH_SALE_BLOCK = 'off';
+    try {
+      expect(buys(generateRebalanceOrders(snap(), new Map([['A', 0.4]]), 'static', 50, { washSales: active() }))).toContain('A');
+    } finally {
+      if (prev === undefined) delete process.env.WASH_SALE_BLOCK; else process.env.WASH_SALE_BLOCK = prev;
+    }
+  });
+
+  it('an explicit option overrides the flag either way', () => {
+    expect(buys(generateRebalanceOrders(snap(), new Map([['A', 0.4]]), 'static', 50, { washSales: active(), washSaleBlock: false }))).toContain('A');
+    expect(buys(generateRebalanceOrders(snap(), new Map([['A', 0.4]]), 'static', 50, { washSales: active(), washSaleBlock: true }))).not.toContain('A');
+  });
+});
+
 describe('generateRebalanceOrders — loss-first SELL ordering for tax', () => {
   it('orders sells by P&L per share ascending when avgCosts provided', () => {
     // Three holdings, all overweight, all need selling. We want the

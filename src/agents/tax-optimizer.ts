@@ -1,10 +1,13 @@
 /**
  * Tax Optimizer
- * Daily scan for tax-loss harvesting opportunities, manages wash sale restrictions.
+ * Prunes expired wash-sale entries. Tax-loss harvesting is DISABLED by
+ * default (TAX_HARVESTING): it is US logic, see tax/harvesting.ts. Even when
+ * on, it only reports candidates; nothing acts on them.
  */
 import { connect, disconnect, getAccountSummary, getMarketPrices , requestDelayedData } from '../connection/gateway.js';
 import { TARGET_PORTFOLIO } from '../config.js';
-import { findHarvestCandidates, createWashSaleEntry, WashSaleEntry, TaxLot } from '../tax/harvesting.js';
+import { findHarvestCandidates, harvestingEnabled, WashSaleEntry, TaxLot } from '../tax/harvesting.js';
+import { runLotEngine } from '../tax/lots.js';
 import { loadState, mergeState, loadTradeHistory } from '../state/store.js';
 import { log, logError } from '../log.js';
 
@@ -16,10 +19,6 @@ async function run(): Promise<void> {
   requestDelayedData();
 
   try {
-    const account = await getAccountSummary();
-    const symbols = TARGET_PORTFOLIO.map(t => t.symbol);
-    const prices = await getMarketPrices(symbols);
-
     const state = loadState();
     const washSales = (state.washSales || []) as WashSaleEntry[];
 
@@ -30,22 +29,29 @@ async function run(): Promise<void> {
       log(`Pruned ${washSales.length - activeWashSales.length} expired wash sale entries`, AGENT);
     }
 
-    // Build tax lots from positions, using trade history for acquisition dates
-    const tradeHistory = loadTradeHistory();
-    const lots: TaxLot[] = account.positions.map(pos => {
-      // Find earliest BUY for this symbol to get acquisition date (sorted FIFO)
-      const earliestBuy = tradeHistory
-        .filter(t => t.action === 'BUY' && t.symbol === pos.symbol)
-        .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())[0] ?? null;
-      return {
-        id: `${pos.symbol}-${pos.avgCost}`,
+    if (!harvestingEnabled()) {
+      log('Tax-loss harvesting is disabled (TAX_HARVESTING) — no candidates scanned', AGENT);
+      mergeState({ washSales: activeWashSales, harvestCandidates: [], lastTaxScanAt: new Date().toISOString() });
+      return;
+    }
+
+    const account = await getAccountSummary();
+    const symbols = TARGET_PORTFOLIO.map(t => t.symbol);
+    const prices = await getMarketPrices(symbols);
+
+    // Parcels from the one lot engine: real acquisition dates and per-parcel
+    // cost, not the position's blended average cost dated at its first buy.
+    const engine = runLotEngine(loadTradeHistory());
+    const lots: TaxLot[] = account.positions.flatMap(pos =>
+      (engine.openLots.get(pos.symbol) ?? []).map(l => ({
+        id: `${pos.symbol}-${l.buyTimestamp}`,
         symbol: pos.symbol,
-        qty: pos.qty,
-        costBasis: pos.avgCost,
-        acquiredAt: earliestBuy?.timestamp ?? new Date().toISOString(),
+        qty: l.qty,
+        costBasis: l.costPerShareUsd,
+        acquiredAt: l.buyTimestamp,
         currentPrice: prices.get(pos.symbol) || pos.marketPrice,
-      };
-    });
+      })),
+    );
 
     const candidates = findHarvestCandidates(lots, activeWashSales);
 

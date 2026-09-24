@@ -17,7 +17,7 @@ import { trendSignal, trendStrengthSignal, momentumBreadthSignal, volRegimeSigna
 import { realizedVolatility, annualizeVol, volTargetLeverage } from '../risk/volatility.js';
 import { assessDrawdown, drawdownExposureMultiplier, type DrawdownLimits, type DrawdownState } from '../risk/drawdown.js';
 import { momentumScore } from '../quant/factors.js';
-import { isWashSaleRestricted, type WashSaleEntry } from '../tax/harvesting.js';
+import { isWashSaleRestricted, washSaleBlockEnabled, type WashSaleEntry } from '../tax/harvesting.js';
 import { covToCorr } from './covariance.js';
 
 // ---------- Types ----------
@@ -355,6 +355,12 @@ export interface RebalanceOptions {
    * underweight.
    */
   washSales?: WashSaleEntry[];
+  /**
+   * Whether `washSales` blocks buys at all. Defaults to the WASH_SALE_BLOCK
+   * flag (see harvesting.washSaleBlockEnabled). The 31-day window is a US
+   * rule; the ATO's test (TR 2008/1) is about purpose, not a day count.
+   */
+  washSaleBlock?: boolean;
 }
 
 /**
@@ -375,7 +381,7 @@ export function generateRebalanceOrders(
   const cashBufferPct = options.cashBufferPct ?? 0;
   const fillMode = options.fillMode ?? 'proportional';
   const avgCosts = options.avgCosts;
-  const washSales = options.washSales ?? [];
+  const washSales = (options.washSaleBlock ?? washSaleBlockEnabled()) ? (options.washSales ?? []) : [];
 
   // Apply cash buffer to target values: each target is scaled down by
   // `(1 - cashBufferPct/100)`, reserving that percentage of NAV as cash.
