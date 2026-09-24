@@ -1,0 +1,17 @@
+{
+  "_source": "Shape of IBKR Client Portal WebSocket 'spl' (PnL) frames as bezant-server stores them: the whole CPAPI frame is the event payload. Field set and nesting from IBKR's documented spl/pnl partitioned response (account key '<acct>.Core'; rowType, dpl, nl, upl, el, mv). IBKR sends partial updates, so a frame can omit nl. Account id and figures are synthetic. Replace with a frame captured from the live observed_events table when one is exported.",
+  "events": [
+    { "cursor": 101, "topic": "pnl", "receivedAt": "2026-09-23T13:31:02.114Z", "resetEpoch": 7,
+      "payload": { "topic": "spl", "args": { "U0000000.Core": { "rowType": 1, "dpl": 12.5, "nl": 50000.0, "upl": 3100.0, "el": 48000.0, "mv": 0.0 } } } },
+    { "cursor": 102, "topic": "pnl", "receivedAt": "2026-09-23T14:05:40.002Z", "resetEpoch": 7,
+      "payload": { "topic": "spl", "args": { "U0000000.Core": { "rowType": 1, "dpl": -240.0, "upl": 2860.0 } } } },
+    { "cursor": 103, "topic": "pnl", "receivedAt": "2026-09-23T14:05:41.500Z", "resetEpoch": 7,
+      "payload": { "topic": "spl", "args": { "U0000000.Core": { "rowType": 1, "dpl": -240.0, "nl": 49760.0, "upl": 2860.0, "el": 47760.0, "mv": 0.0 } } } },
+    { "cursor": 104, "topic": "pnl", "receivedAt": "2026-09-23T16:12:09.870Z", "resetEpoch": 7,
+      "payload": { "topic": "spl", "args": { "U0000000.Core": { "rowType": 1, "dpl": 510.0, "nl": 50510.0, "upl": 3610.0, "el": 48510.0, "mv": 0.0 } } } },
+    { "cursor": 105, "topic": "pnl", "receivedAt": "2026-09-23T19:40:33.001Z", "resetEpoch": 7,
+      "payload": { "topic": "spl", "args": { "U0000000.Core": { "rowType": 1, "dpl": -9.0, "nl": 0, "upl": 0 } } } },
+    { "cursor": 106, "topic": "pnl", "receivedAt": "2026-09-23T19:55:00.000Z", "resetEpoch": 7,
+      "payload": { "topic": "spl", "args": { "U0000000.Core": { "rowType": 1, "dpl": 305.0, "nl": 50305.0, "upl": 3405.0, "el": 48305.0, "mv": 0.0 } } } }
+  ]
+}

@@ -112,3 +112,94 @@ describe('computeIntradayDrawdownFromEvents', () => {
     expect(out.samples).toBe(0);
   });
 });
+
+import { computeIntradayDrawdownFromNl, extractNl } from './intraday-pnl.js';
+import frames from './fixtures/spl-frames.json';
+
+const W = { start: new Date('2026-09-23T13:30:00Z'), end: new Date('2026-09-23T20:00:00Z') };
+const nlEvt = (t: string, nl: number | undefined, extra: Record<string, number> = {}): ObservedEvent => ({
+  cursor: 0, topic: 'pnl', receivedAt: t, resetEpoch: 1,
+  payload: { topic: 'spl', args: { 'U1.Core': nl === undefined ? { rowType: 1, ...extra } : { rowType: 1, nl, ...extra } } },
+});
+
+describe('computeIntradayDrawdownFromNl (C′3)', () => {
+  it('reads the fixture frames: skips partial and zeroed nl, measures peak → later trough', () => {
+    const out = computeIntradayDrawdownFromNl(frames.events as ObservedEvent[], W);
+    // 50000 → 49760 (−0.48%) → 50510 → [nl:0 ignored] → 50305 (−0.41% from 50510)
+    expect(out.samples).toBe(4);
+    expect(out.ignored).toBe(2); // the partial frame without nl and the nl:0 frame
+    expect(out.drawdownPct).toBeCloseTo(0.48, 2);
+    expect(out.peakNav).toBe(50000);
+    expect(out.troughNav).toBe(49760);
+    expect(out.sessionHigh).toBe(50510);
+    expect(out.sessionLow).toBe(49760);
+    expect(out.lastNav).toBe(50305);
+  });
+
+  it('the legacy reconstruction finds nothing in the same real-shaped frames', () => {
+    // The whole reason C′3 exists: upnl/rpnl are not what CPAPI sends.
+    const legacy = computeIntradayDrawdownFromEvents(frames.events as ObservedEvent<any>[], 50_000);
+    expect(legacy.samples).toBe(0);
+  });
+
+  it('does not reset the trough at a new peak: an early deep dip survives a later small high', () => {
+    const out = computeIntradayDrawdownFromNl([
+      nlEvt('2026-09-23T13:31:00Z', 100_000),
+      nlEvt('2026-09-23T14:00:00Z', 90_000), // −10%
+      nlEvt('2026-09-23T15:00:00Z', 100_500), // new high
+      nlEvt('2026-09-23T16:00:00Z', 100_300),
+    ], W);
+    expect(out.drawdownPct).toBeCloseTo(10, 6);
+    expect(out.peakNav).toBe(100_000);
+    expect(out.troughNav).toBe(90_000);
+    // Legacy on the equivalent upnl series reports only the last, tiny fall.
+    const legacy = computeIntradayDrawdownFromEvents([
+      pnl('2026-09-23T13:31:00Z', { upnl: 0 }),
+      pnl('2026-09-23T14:00:00Z', { upnl: -10_000 }),
+      pnl('2026-09-23T15:00:00Z', { upnl: 500 }),
+      pnl('2026-09-23T16:00:00Z', { upnl: 300 }),
+    ], 100_000);
+    expect(legacy.drawdownPct).toBeLessThan(0.3);
+  });
+
+  it('a dip BEFORE the session high is not a drawdown from that high', () => {
+    const out = computeIntradayDrawdownFromNl([
+      nlEvt('2026-09-23T13:31:00Z', 95_000),
+      nlEvt('2026-09-23T14:00:00Z', 100_000),
+    ], W);
+    expect(out.drawdownPct).toBe(0);
+    expect(out.sessionLow).toBe(95_000);
+  });
+
+  it('only the session window counts (pre-market and after-hours frames drop)', () => {
+    const out = computeIntradayDrawdownFromNl([
+      nlEvt('2026-09-23T12:00:00Z', 80_000), // pre-market
+      nlEvt('2026-09-23T13:31:00Z', 100_000),
+      nlEvt('2026-09-23T21:00:00Z', 70_000), // after the close
+    ], W);
+    expect(out.samples).toBe(1);
+    expect(out.drawdownPct).toBe(0);
+  });
+
+  it('sorts by receivedAt rather than trusting row order', () => {
+    const out = computeIntradayDrawdownFromNl([
+      nlEvt('2026-09-23T15:00:00Z', 90_000),
+      nlEvt('2026-09-23T14:00:00Z', 100_000),
+    ], W);
+    expect(out.drawdownPct).toBeCloseTo(10, 6);
+  });
+
+  it('no usable frames → zero samples, not a zero NAV', () => {
+    const out = computeIntradayDrawdownFromNl([nlEvt('2026-09-23T14:00:00Z', undefined, { dpl: 5 })], W);
+    expect(out.samples).toBe(0);
+    expect(out.ignored).toBe(1);
+  });
+
+  it('extractNl accepts the frame, REST and bare shapes and sums accounts', () => {
+    expect(extractNl({ topic: 'spl', args: { 'A.Core': { nl: 10 }, 'B.Core': { nl: '5' } } })).toBe(15);
+    expect(extractNl({ upnl: { 'A.Core': { nl: 7 } } })).toBe(7);
+    expect(extractNl({ nl: 3 })).toBe(3);
+    expect(extractNl({ args: { 'A.Core': { nl: 0 } } })).toBeNaN();
+    expect(extractNl(null)).toBeNaN();
+  });
+});

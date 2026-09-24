@@ -10,7 +10,9 @@ import { ewmaVolatility, annualizeVol, volTargetLeverage } from '../risk/volatil
 import { correlationStressTest } from '../risk/stress-test.js';
 import { buildStressInputs } from '../risk/stress-inputs.js';
 import { marketDate } from '../quant/price-history.js';
-import { computeIntradayDrawdownFromEvents } from '../observability/intraday-pnl.js';
+import { computeIntradayDrawdownFromEvents, computeIntradayDrawdownFromNl } from '../observability/intraday-pnl.js';
+import { latestSession } from '../strategy/session-window.js';
+import { readRolloutFlags, describeRollout } from '../rollout.js';
 import { loadState, mergeState, loadObservedEvents, type ObservedEventState } from '../state/store.js';
 import { notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
@@ -43,6 +45,9 @@ const DD_LIMITS: DrawdownLimits = {
 
 export async function run(): Promise<void> {
   log('Risk assessment starting', AGENT);
+  const flags = readRolloutFlags();
+  log(`Rollout: ${describeRollout(flags)}`, AGENT);
+  for (const p of flags.problems) log(`Rollout flag ignored: ${p}`, AGENT);
   // The drawdown ladder this writes scales the strategist's weights, so a
   // report computed against the wrong book corrupts real decisions.
   validateTargets();
@@ -192,13 +197,15 @@ export async function run(): Promise<void> {
       }
     }
 
+    // LEGACY intraday reconstruction — gates under INTRADAY_DD_SOURCE=legacy and
+    // =shadow, kept byte-for-byte until the nl figure has earned the switch.
     // WS-derived intraday drawdown enrichment. Only used when the
     // observer agent has been populating state.observedEvents — when
     // empty, we fall back to the snapshot-based DD above.
     // Rows now, and only the topic this needs — previously it deserialised the
     // entire 1.3MB history to filter for 'pnl'.
     const observed = loadObservedEvents({ topic: 'pnl' });
-    if (observed.length > 0) {
+    if (observed.length > 0 && flags.intradayDdSource !== 'nl') {
       const sessionStart = new Date();
       sessionStart.setUTCHours(13, 30, 0, 0); // 09:30 ET as a reasonable session anchor
       const intraday = computeIntradayDrawdownFromEvents(
@@ -245,6 +252,57 @@ export async function run(): Promise<void> {
           },
         };
         mergeState(updatesIntraday);
+      }
+    }
+
+    // `nl`-based intraday drawdown (C′3). INTRADAY_DD_SOURCE=shadow (default)
+    // computes and logs it next to the legacy figure above, which still gates;
+    // =nl makes it the gate and skips the legacy reconstruction; =legacy skips
+    // this block entirely. Window: the latest NYSE session from the ET wall
+    // clock (DST-correct), not a hard-coded 13:30Z anchored on today.
+    if (observed.length > 0 && flags.intradayDdSource !== 'legacy') {
+      const session = latestSession(new Date());
+      if (!session) {
+        log('Intraday DD (nl): no session found in the last 10 days — skipped', AGENT);
+      } else {
+        const nl = computeIntradayDrawdownFromNl(observed, { start: session.start, end: session.end });
+        const mode = flags.intradayDdSource === 'nl' ? 'gating' : 'shadow';
+        if (nl.samples === 0) {
+          log(`Intraday DD (nl, ${mode}): no usable nl frames in the ${session.date} session ` +
+            `(${nl.ignored} without nl)`, AGENT);
+        } else {
+          const nlLevel = assessDrawdown(nl.sessionLow, Math.max(peak, nl.sessionHigh), DD_LIMITS).level;
+          log(
+            `Intraday DD (nl, ${mode}): ${nl.drawdownPct.toFixed(2)}% worst intraday fall over ${nl.samples} samples ` +
+              `in the ${session.date} session (high ${nl.sessionHigh.toFixed(2)}, low ${nl.sessionLow.toFixed(2)}, ` +
+              `${nl.ignored} partial frames ignored) → ladder level ${nlLevel}`,
+            AGENT,
+          );
+          mergeState({
+            intradayDrawdownNl: {
+              session: session.date,
+              drawdownPct: nl.drawdownPct,
+              sessionHigh: nl.sessionHigh,
+              sessionLow: nl.sessionLow,
+              samples: nl.samples,
+              ignored: nl.ignored,
+              level: nlLevel,
+              mode,
+              at: new Date().toISOString(),
+            },
+          });
+          if (flags.intradayDdSource === 'nl') {
+            effectiveLevel = worseDrawdownLevel(effectiveLevel, nlLevel);
+            mergeState({
+              intradayDrawdown: {
+                peakNav: nl.peakNav,
+                troughNav: nl.troughNav,
+                drawdownPct: nl.drawdownPct,
+                samples: nl.samples,
+              },
+            });
+          }
+        }
       }
     }
 
