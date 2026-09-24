@@ -137,6 +137,29 @@ export interface TradeRecord {
    * same fill being recorded twice.
    */
   execId?: string;
+  /**
+   * The exchange trade date (YYYY-MM-DD, US/Eastern) — the contract date and
+   * so the CGT event date. Derived from `timestamp` when absent; set
+   * explicitly where only a date is known (opening lots).
+   */
+  tradeDate?: string;
+  /**
+   * AUD per 1 USD for this trade, from IBKR's own per-trade `fxRate` (the
+   * figure on the broker statements). Absent until the ledger is annotated.
+   */
+  audPerUsd?: number;
+  /** Where `audPerUsd` came from: IBKR's trade feed, or the RBA F11 fallback. */
+  fxSource?: 'ibkr' | 'rba';
+  /** True when `commission` is an estimate, not a figure IBKR reported. */
+  commissionEstimated?: boolean;
+  /** True when `fillPrice` was inferred (e.g. from average cost), not observed. */
+  priceInferred?: boolean;
+  /** How the record entered the ledger, when not by a live fill. */
+  source?: 'opening' | 'recovered' | 'reconciled';
+  /** IBKR contract id, when known. */
+  conid?: number;
+  /** Idempotency key of an opening lot: conid:date:qty:price. */
+  openingKey?: string;
 }
 
 let _db: DatabaseSync | null = null;

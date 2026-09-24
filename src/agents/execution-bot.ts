@@ -343,9 +343,12 @@ async function run(): Promise<void> {
     // FIFO cost basis / wash-sale windows don't silently diverge, and so
     // positions reflect it. Best-effort: a reconcile failure must not block
     // trading.
+    // Kept for orphan recovery below: a fill it recovers is priced from these.
+    let sessionExecutions: Awaited<ReturnType<typeof getExecutions>> = [];
     try {
       phase('reconcile-executions');
       const execs = await getExecutions();
+      sessionExecutions = execs;
       // Computed and written in one transaction, against the ledger as it stands.
       const backfill = appendReconciledTrades(history => reconcileExecutions(history, execs));
       if (backfill.length > 0) {
@@ -397,6 +400,7 @@ async function run(): Promise<void> {
         })),
         baselineSignature: state.ledgerDriftBaseline as string | undefined,
         now: new Date(),
+        executions: sessionExecutions,
       });
     } catch (err) {
       logError('Orphan recovery failed — halting run (cannot verify the queue has not already run)', err, AGENT);

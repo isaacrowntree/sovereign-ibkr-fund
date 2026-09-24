@@ -443,3 +443,50 @@ describe('formatDriftSignature — ordering must not depend on the locale', () =
     expect(got).toEqual([...symbols].sort());
   });
 });
+
+describe('recoverOrphanedFills — priced from IBKR executions when it has them', () => {
+  const ex = (execId: string, qty: number, price: number, time: string, commission?: number) =>
+    ({ execId, symbol: 'HHH', action: 'BUY' as const, qty, price, time, orderId: 42, commission });
+  const base = {
+    pending: [order('HHH', 'BUY', 4, 402)],
+    history: [] as TradeRecord[],
+    positions: [pos('HHH', 4, 90)],
+    baselineSignature: '',
+    now: NOW,
+  };
+
+  it('uses the execution time, price and commission, not now and average cost', () => {
+    const out = recoverOrphanedFills({ ...base, executions: [ex('X1', 4, 101.25, '2026-09-08T14:31:00.000Z', 1)] });
+    const t = out.recovered[0].trade;
+    expect(t.timestamp).toBe('2026-09-08T14:31:00.000Z');
+    expect(t.fillPrice).toBe(101.25);
+    expect(t.commission).toBe(1);
+    expect(t.execId).toBe('X1');
+    expect(t.priceInferred).toBeUndefined();
+  });
+
+  it('weights the price across split executions', () => {
+    const out = recoverOrphanedFills({
+      ...base,
+      executions: [ex('X1', 1, 100, '2026-09-08T14:31:00Z', 1), ex('X2', 3, 104, '2026-09-08T14:31:02Z', 0.5)],
+    });
+    const t = out.recovered[0].trade;
+    expect(t.fillPrice).toBeCloseTo(103, 9);
+    expect(t.commission).toBeCloseTo(1.5, 9);
+    expect(t.execId).toBeUndefined(); // two executions: no single id to claim
+  });
+
+  it('ignores executions already in the ledger, and falls back (flagged) without an exact cover', () => {
+    const out = recoverOrphanedFills({
+      ...base,
+      history: [rec({ symbol: 'ZZZ', execId: 'X1' })],
+      positions: [pos('HHH', 4, 90), pos('ZZZ', 1, 1)],
+      baselineSignature: 'ZZZ:0',
+      executions: [ex('X1', 4, 101, '2026-09-08T14:31:00Z'), ex('X2', 3, 101, '2026-09-08T14:32:00Z')],
+    });
+    const t = out.recovered[0].trade;
+    expect(t.fillPrice).toBe(90);
+    expect(t.priceInferred).toBe(true);
+    expect(t.timestamp).toBe(NOW.toISOString());
+  });
+});

@@ -38,6 +38,7 @@
  * `unexplained`, and stores `baseline`.
  */
 import type { TradeRecord } from '../state/store.js';
+import type { Execution } from '../connection/gateway.js';
 import type { StagedOrder } from './staging.js';
 
 export interface BrokerPosition {
@@ -62,6 +63,13 @@ export interface OrphanRecoveryInput {
    */
   baselineSignature?: string;
   now: Date;
+  /**
+   * IBKR's executions for the session, when the caller has them. A recovered
+   * fill that one of these accounts for is recorded at the execution's own
+   * time, price and commission — the tax facts — instead of `now` and the
+   * position's average cost, which is a blend of every lot ever bought.
+   */
+  executions?: Execution[];
 }
 
 export interface RecoveredFill {
@@ -202,6 +210,30 @@ export function recoverOrphanedFills(input: OrphanRecoveryInput): OrphanRecovery
   const recovered: RecoveredFill[] = [];
   const remaining: StagedOrder[] = [];
 
+  // Executions the ledger has not recorded, per symbol+side, oldest first.
+  // Each can explain at most one recovered fill.
+  const recordedExecIds = new Set(history.map(t => t.execId).filter(Boolean));
+  const unrecordedExecs = new Map<string, Execution[]>();
+  for (const e of [...(input.executions ?? [])].sort((a, b) => (a.time ?? '').localeCompare(b.time ?? ''))) {
+    if (!e.execId || recordedExecIds.has(e.execId)) continue;
+    const k = `${e.action}:${e.symbol}`;
+    unrecordedExecs.set(k, [...(unrecordedExecs.get(k) ?? []), e]);
+  }
+  /** Take unrecorded executions covering exactly `qty` shares, or null. */
+  const takeExecutions = (action: string, symbol: string, qty: number): Execution[] | null => {
+    const pool = unrecordedExecs.get(`${action}:${symbol}`) ?? [];
+    const taken: Execution[] = [];
+    let sum = 0;
+    for (const e of pool) {
+      if (sum >= qty) break;
+      taken.push(e);
+      sum += e.qty;
+    }
+    if (sum !== qty) return null; // no exact cover: do not guess which fills these were
+    unrecordedExecs.set(`${action}:${symbol}`, pool.slice(taken.length));
+    return taken;
+  };
+
   // Queue order, first claim wins: two staged orders on one symbol must not
   // both be retired by a surplus that only covers one of them.
   for (const order of pending) {
@@ -217,27 +249,58 @@ export function recoverOrphanedFills(input: OrphanRecoveryInput): OrphanRecovery
     }
 
     const unitEstimate = order.qty > 0 ? order.estimatedValue / order.qty : 0;
-    const price = avgCost.get(order.symbol);
-    recovered.push({
-      order: { ...order, qty: filled },
-      trade: {
-        timestamp: now.toISOString(),
-        symbol: order.symbol,
-        action: order.action,
-        qty: filled,
-        // Prefer real money paid over our own pre-trade guess, but never drop
-        // the record just because the broker withheld a cost.
-        estimatedValue: price != null ? filled * price : filled * unitEstimate,
-        fillPrice: price,
-        orderId: 0, // the orderId died with the run that placed it
-        status: 'filled',
-        reason:
-          `recovered_orphan: ${order.reason} — filled at IBKR but never recorded; ` +
-          (price != null
-            ? 'price INFERRED from broker average cost, not observed'
-            : 'no fill price available'),
-      },
-    });
+    const execs = takeExecutions(order.action, order.symbol, filled);
+    if (execs) {
+      const notional = execs.reduce((sum, e) => sum + e.qty * e.price, 0);
+      const commissions = execs.map(e => e.commission).filter((c): c is number => c != null && Number.isFinite(c));
+      recovered.push({
+        order: { ...order, qty: filled },
+        trade: {
+          timestamp: execs[execs.length - 1].time || now.toISOString(),
+          symbol: order.symbol,
+          action: order.action,
+          qty: filled,
+          estimatedValue: notional,
+          fillPrice: notional / filled,
+          orderId: execs[0].orderId ?? 0,
+          status: 'filled',
+          reason: `recovered_orphan: ${order.reason} — filled at IBKR but never recorded; priced from IBKR executions`,
+          source: 'recovered',
+          // One execution: its id makes the record idempotent against reconcile.
+          ...(execs.length === 1 ? { execId: execs[0].execId } : {}),
+          ...(commissions.length === execs.length && commissions.length > 0
+            ? { commission: commissions.reduce((a, b) => a + Math.abs(b), 0) }
+            : {}),
+        },
+      });
+    } else {
+      const price = avgCost.get(order.symbol);
+      recovered.push({
+        order: { ...order, qty: filled },
+        trade: {
+          timestamp: now.toISOString(),
+          symbol: order.symbol,
+          action: order.action,
+          qty: filled,
+          // Prefer real money paid over our own pre-trade guess, but never drop
+          // the record just because the broker withheld a cost.
+          estimatedValue: price != null ? filled * price : filled * unitEstimate,
+          fillPrice: price,
+          orderId: 0, // the orderId died with the run that placed it
+          status: 'filled',
+          reason:
+            `recovered_orphan: ${order.reason} — filled at IBKR but never recorded; ` +
+            (price != null
+              ? 'price INFERRED from broker average cost, not observed'
+              : 'no fill price available'),
+          source: 'recovered',
+          // Flagged so the tax report lists it and the ledger annotation
+          // (scripts/seed-opening-lots.mjs) corrects the date and price from
+          // IBKR's transaction history.
+          priceInferred: true,
+        },
+      });
+    }
 
     // Consume what this order explains so the next one cannot claim it twice.
     surplus.set(order.symbol, available - (order.action === 'BUY' ? filled : -filled));
