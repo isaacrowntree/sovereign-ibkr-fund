@@ -6,43 +6,44 @@ healthy; the watchdog operates on bezant from the outside.
 
 ## What it does
 
-Runs once a minute. Probes `http://localhost:8080/health`. If the
-container is in a state that's empirically required a manual `docker
-restart bezant` to recover (server alive but health stuck), the
-watchdog does it automatically.
+Runs once a minute. Probes `/health`, `/events/_status` and (while logged out)
+the SSO bridge. The decisions live in `watchdog.ts`; `index.ts` wires them up.
 
-## Restart triggers
+| Condition | After (elapsed) | Action | Quiet hours 23:00–07:00 |
+|---|---|---|---|
+| `/health` 5xx or unreachable — the gateway is dead | 300 s | restart; clear relogin's park | restart yes, park **not** cleared |
+| logged out and `ssodh/init` 5xx — SSO bridge wedged | 300 s | restart (park untouched) | no restart |
+| `/health` carries `upstream_failing: true` — bezant up, api.ibkr.com failing | 900 s | **never restart**; alert once | same |
+| authenticated but the event stream is silent/disconnected | 600 s | `POST /events/_reconnect` (debug token; 404 = older bezant, skip) | same |
+| ...still silent | +300 s | `POST /iserver/reauthenticate` | same |
+| ...still silent | 1800 s total | alert once; **never restart** | same |
+| logged out 30 min with relogin parked | 1800 s | ops-feed entry, ≤ every 6 h | same |
 
-| Trigger | Threshold | Why |
-|---|---|---|
-| `/health` returns 5xx or unreachable | 5 consecutive probes (~5 min) | Server crashed but container PID still alive, or networking stack wedged |
+Thresholds are elapsed seconds since the condition was first seen. A gap of
+more than 180 s between probes (Pi off, timer stopped) resets every streak.
+2-hour cooldown between restarts.
 
-## What does NOT trigger a restart
+Nothing that touches the session — restart, reauthenticate, the SSO probe —
+happens while another program holds the **session lock**
+(`~/.local/state/ibkr-session/holder.json`, see `../lib/session-lock.ts`), and
+the watchdog takes that lock for its own restart.
 
-- `/health` returns 401 not_authenticated — that's the normal state
-  immediately after session expiry; the relogin timer handles it
-- A single 5xx — could be transient
-- `bezant-relogin/disabled` sentinel exists — that's the user's "I'm
-  not around to tap a phone push right now" signal. Restarting bezant
-  and clearing the sentinel just spams the phone with IB Key pushes
-  while you're away. Manual reset is the right recovery path here.
+## `WATCHDOG_RESTART`
 
-## Recovery vs. relogin disabled
+`dry-run` (the default for now) logs `DRY-RUN — would ...` for every restart,
+park clear and reauthenticate, and does none of them; the stream reconnect and
+the alerts still happen. `on` acts. Watch a few days of
 
-If the watchdog DOES fire (5xx restart) and `bezant-relogin/disabled`
-happens to be present at the same time, the watchdog clears it after
-the restart succeeds. Working assumption: the disabled state was
-caused by the same wedged condition the restart just fixed, so let
-relogin retry against the freshly-restarted container.
+```bash
+journalctl --user -u ibkr-fund-watchdog | grep DRY-RUN
+```
 
-If `/health` is returning a clean 401 (server fine, just no auth), the
-watchdog leaves the disabled sentinel alone — bezant isn't broken,
-the user is just away.
+before switching.
 
-## Cooldown
+## Tests
 
-**2 hours** minimum between restarts. Belt-and-braces against
-persistent issues that restart can't fix.
+`watchdog.test.ts` (run by the repo's `pnpm test`) drives `tick()` against
+`test/fake-bezant.mjs` with a fake clock; the restart is a recorded callback.
 
 ## Pi setup
 
@@ -71,52 +72,24 @@ systemctl --user enable --now ibkr-fund-watchdog.timer
 journalctl --user -u ibkr-fund-watchdog -f
 ```
 
-You'll see one line per minute like:
-
-```
-[2026-05-05T00:55:01.234Z] [watchdog] status: health=authenticated relogin_failures=0 (healthy)
-```
-
-When something fires:
-
-```
-[2026-05-05T05:30:01.000Z] [watchdog] /health transition: authenticated → not_authenticated
-[2026-05-05T05:35:01.000Z] [watchdog] RESTARTING bezant: 5 consecutive server_error/unreachable probes
-[2026-05-05T05:35:08.000Z] [watchdog] docker restart returned successfully — waiting for /health to respond
-[2026-05-05T05:35:13.000Z] [watchdog] Post-restart /health responsive: not_authenticated
-[2026-05-05T05:35:13.000Z] [watchdog] Cleared bezant-relogin disabled sentinel — next 5-min relogin tick will retry
-```
+One status line per minute (`status: health=... dead_for=...s ... mode=dry-run`),
+plus a line for each transition and action (`RESTARTING bezant: ...`,
+`DRY-RUN — would restart bezant: ...`, `session lock held by ...`).
 
 ## State
 
-Persisted at `~/.local/state/bezant-watchdog/state.json`:
-
-```json
-{
-  "lastHealthState": "authenticated",
-  "consecutiveServerErrors": 0,
-  "lastRestartAt": null,
-  "lastRestartReason": null,
-  "totalRestarts": 0
-}
-```
+`~/.local/state/bezant-watchdog/state.json`: the `...Since` timestamp of each
+open condition, the stream ladder's step, and restart history. Old
+counter-based files load fine; the counters are dropped.
 
 ## Tuning
 
-All thresholds are env-overridable. Defaults (top of `index.ts`):
-
-- `IBKR_FUND_ALERT_WEBHOOK` — **recommended**, no default. Without it the
-  watchdog restarts the container silently and you never hear that it happened.
-  Set the SAME webhook as the fund and `pi/relogin` — one channel. Read from
-  `.env` in this directory (optional file; the unit tolerates its absence).
-- `BEZANT_HEALTH_URL` — default `http://localhost:8080/health`
-- `BEZANT_CONTAINER` — default `bezant`
-- `BEZANT_RELOGIN_DISABLED_FILE` — default `~/.local/state/bezant-relogin/disabled`
-- `BEZANT_RELOGIN_STATE_FILE` — default `~/.local/state/bezant-relogin/state.json`
-- `BEZANT_WATCHDOG_STATE_DIR` — default `~/.local/state/bezant-watchdog`
-
-The thresholds (server-error count, restart cooldown) live as `const`s
-in `index.ts` — change there if you need different behavior.
+Env (or `.env` here, see `.env.example`): `WATCHDOG_RESTART`,
+`BEZANT_DEBUG_TOKEN`, `IBKR_FUND_ALERT_WEBHOOK`, `BEZANT_HEALTH_URL`,
+`BEZANT_CONTAINER`, `BEZANT_RESTART_CMD`, `IBKR_SESSION_LOCK_DIR`,
+`QUIET_HOURS_TZ`, `QUIET_HOURS`, `BEZANT_RELOGIN_DISABLED_FILE`,
+`BEZANT_RELOGIN_STATE_FILE`, `BEZANT_WATCHDOG_STATE_DIR`. Thresholds are
+`DEFAULT_THRESHOLDS` in `watchdog.ts`.
 
 ## Manual override
 

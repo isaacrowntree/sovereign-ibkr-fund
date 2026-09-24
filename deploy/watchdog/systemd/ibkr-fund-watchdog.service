@@ -1,5 +1,5 @@
 [Unit]
-Description=Bezant container liveness watchdog (auto-restart on wedged session)
+Description=Bezant container liveness watchdog (restarts only a dead gateway)
 Documentation=https://github.com/isaacrowntree/sovereign-ibkr-fund/tree/main/deploy/watchdog
 After=network-online.target docker.service
 Wants=network-online.target
@@ -15,7 +15,12 @@ WorkingDirectory=%h/sovereign-ibkr-fund/deploy/watchdog
 # index.ts also does `import 'dotenv/config'` against WorkingDirectory, so this
 # is belt-and-braces; it exists so the unit works the same way as relogin's
 # (whose .env IS required, hence no dash there).
-EnvironmentFile=%h/sovereign-ibkr-fund/deploy/watchdog/.env
+# (The dash was described here but missing from the line below until
+# 2026-09-24 — the installed unit was undashed too.)
+EnvironmentFile=-%h/sovereign-ibkr-fund/deploy/watchdog/.env
+# The session lock directory. Created by the host's tmpfiles.d at boot (so it
+# exists before docker bind-mounts it into bezant); this is the fallback.
+ExecStartPre=/bin/mkdir -p %h/.local/state/ibkr-session
 ExecStart=/usr/bin/env npx tsx %h/sovereign-ibkr-fund/deploy/watchdog/index.ts
 StandardOutput=journal
 StandardError=journal
