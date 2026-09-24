@@ -8,7 +8,10 @@ import { TARGET_PORTFOLIO, validateTargets, config } from '../config.js';
 import { decideDeposit } from '../portfolio/deposit-policy.js';
 import { loadDepositPolicy } from '../portfolio/deposit-policy-file.js';
 import { planDepositBuy } from '../portfolio/deposit-plan.js';
-import { allocateCashFlow, recentlySoldSymbols } from '../portfolio/cashflow-rebalance.js';
+import { allocateCashFlow, recentlySoldSymbols, rebuyGuardExclusions } from '../portfolio/cashflow-rebalance.js';
+import { assessBands, decideBands, generateBandOrders, describeBands, openLotsFifo } from '../portfolio/drift-bands.js';
+import { readRolloutFlags, describeRollout } from '../rollout.js';
+import { etDate } from '../strategy/session-window.js';
 import { resolveCashReserveUsd } from '../portfolio/cash-reserve.js';
 import {
   computeTargetWeights,
@@ -44,8 +47,16 @@ function navViolationClass(reason: string): string {
   return 'nav-other';
 }
 
-async function run(): Promise<void> {
+/** Same test as the executor's staging module: a directed-deposit order. */
+function isDirectedDeposit(reason: string | undefined): boolean {
+  return /^directed[ _]deposit/.test(reason ?? '');
+}
+
+export async function run(): Promise<void> {
   log('Portfolio strategy analysis starting', AGENT);
+  const flags = readRolloutFlags();
+  log(`Rollout: ${describeRollout(flags)}`, AGENT);
+  for (const p of flags.problems) log(`Rollout flag ignored: ${p}`, AGENT);
   validateTargets();
   await connect();
   requestDelayedData();
@@ -65,6 +76,32 @@ async function run(): Promise<void> {
     const settledCashUsd = usd.usdSettledCash;
 
     log(`NAV(USD): $${navUsd.toFixed(2)}, Cash(USD): $${cashUsd.toFixed(2)} [base AUD NAV $${account.netLiquidation.toFixed(2)}]`, AGENT);
+
+    // F4: an AUD deposit funds no USD buy until it is converted (a cash
+    // account cannot borrow USD, and IBKR does not auto-convert). Above the
+    // tolerance that is money sitting idle — say so rather than let the
+    // cash-flow path look inexplicably stuck. Alert only; nothing trades.
+    const unconverted = usd.nonUsdCashBase;
+    if (unconverted > config.rebalance.unconvertedBaseAlert) {
+      log(`Unconverted non-USD cash: ${unconverted.toFixed(2)} base (tolerance ${config.rebalance.unconvertedBaseAlert})`, AGENT);
+      await notify(
+        {
+          severity: 'warn',
+          title: 'Unconverted AUD is sitting idle',
+          body:
+            'Cash in the AUD bucket cannot fund a USD buy until it is converted to USD in IBKR. ' +
+            'The strategist deploys USD only, so this stays in cash until you convert it.',
+          fields: [
+            { label: 'Non-USD cash (base)', value: fmtUsd(unconverted).replace('$', '') },
+            { label: 'Tolerance', value: String(config.rebalance.unconvertedBaseAlert) },
+          ],
+          agent: AGENT,
+          // Fingerprint on the condition, not the amount (which moves with FX).
+          dedupe: { key: 'strategist:unconverted-base-cash', fingerprint: 'over-tolerance' },
+        },
+        storeHooks,
+      );
+    }
 
     const state = loadState();
     const historicalReturns = state.historicalReturns as number[][] | undefined;
@@ -112,13 +149,26 @@ async function run(): Promise<void> {
     // the history is stale, the sanity check is comparing today's prices to old
     // ones — it stops being able to catch a bad tick exactly when it matters, and
     // would itself start firing spuriously on legitimate multi-day moves.
-    const freshness = marketDataFreshness({
+    // F8: quant → strategist ordering. Under DRIFT_GATE=bands the strategist
+    // refuses unless quant-analyst has run since the strategist's own previous
+    // run (this cycle's data, not last cycle's). Under legacy that check only
+    // logs, so the record shows how often it would have skipped.
+    const freshnessInput = {
       lastQuantAt: state.lastQuantAt as string | undefined,
       priceHistoryDates: state.priceHistoryDates as string[] | undefined,
       now: new Date(),
       maxQuantAgeMs: config.dataSanity.maxQuantAgeMs,
       maxHistoryGapDays: config.dataSanity.maxHistoryGapDays,
+    };
+    const lastStrategyAt = state.lastStrategyAt as string | undefined;
+    const freshness = marketDataFreshness({
+      ...freshnessInput,
+      requireQuantAfter: flags.driftGate === 'bands' ? lastStrategyAt : undefined,
     });
+    if (freshness.fresh && flags.driftGate !== 'bands') {
+      const cycle = marketDataFreshness({ ...freshnessInput, requireQuantAfter: lastStrategyAt });
+      if (!cycle.fresh) log(`Quant ordering: ${cycle.detail} — would skip under DRIFT_GATE=bands`, AGENT);
+    }
     if (!freshness.fresh) {
       log(`STALE MARKET DATA — skipping order generation: ${freshness.detail}`, AGENT);
       mergeState({ lastStrategyAt: new Date().toISOString() });
@@ -343,11 +393,145 @@ async function run(): Promise<void> {
       washSales: activeWashSales,
     };
 
-    const decision = decideRebalance(maxDrift, daysSince, {
+    const legacyDecision = decideRebalance(maxDrift, daysSince, {
       driftThreshold: config.rebalance.driftThreshold,
       urgentDriftThreshold: config.rebalance.urgentDriftThreshold,
       frequencyDays: config.rebalance.frequencyDays,
     });
+
+    // ── Tolerance-band gate (F1) — evaluated on EVERY run ─────────────────
+    // Under DRIFT_GATE=legacy it only logs what it would do ("bands gate
+    // would: …") and keeps a short history in state.bandsShadow: that record,
+    // on live prices from deploy onwards, is the out-of-sample evidence the
+    // switch-on decision waits for (plan G9). Under DRIFT_GATE=bands it decides.
+    const bandsActive = flags.driftGate === 'bands';
+    const trades = loadTradeHistory();
+    const targetPctMap = new Map<string, number>(symbols.map((s, i) => [s, adjustedWeights[i] * 100]));
+    const guardDays = config.rebalance.cashFlowRebuyGuardDays;
+    const bandGuard = rebuyGuardExclusions(trades, guardDays, targetPctMap);
+    const lots = new Map(symbols.map(s => [s, openLotsFifo(trades, s, currentShares.get(s) ?? 0)]));
+    const bandAssessment = assessBands(snapshot, targetWeightMap);
+    const bandDecision = decideBands(bandAssessment, daysSince, config.rebalance.frequencyDays);
+    const bandOrders = generateBandOrders(snapshot, bandAssessment, {
+      decision: bandDecision,
+      minTradeUsd: config.rebalance.minTradeUsd,
+      cashBufferPct: config.rebalance.cashBufferPct,
+      lots,
+      today: etDate(new Date()),
+      excludeBuys: bandGuard.excluded,
+    });
+    log(`bands gate would: ${describeBands(bandAssessment, bandDecision, bandOrders)}` +
+      ` [legacy gate: ${legacyDecision}; ${bandsActive ? 'BANDS ACTIVE' : 'shadow'}]`, AGENT);
+    const shadowEntry = {
+      at: new Date().toISOString(),
+      active: bandsActive,
+      decision: bandDecision,
+      legacyDecision,
+      halfL1Pct: +(bandAssessment.halfL1 * 100).toFixed(3),
+      outOfBand: bandAssessment.names.filter(n => n.out).map(n => n.symbol),
+      urgent: bandAssessment.urgent,
+      sells: bandOrders.orders.filter(o => o.action === 'SELL').map(o => ({ symbol: o.symbol, qty: o.shares })),
+      buys: bandOrders.orders.filter(o => o.action === 'BUY').map(o => ({ symbol: o.symbol, qty: o.shares })),
+      notes: bandOrders.notes,
+    };
+    const bandsShadow = [...((state.bandsShadow as unknown[] | undefined) ?? []), shadowEntry].slice(-500);
+
+    const decision = bandsActive ? bandDecision : legacyDecision;
+
+    // Cash-flow deployment (buy-only). Legacy: exactly as before. Bands: sized
+    // on SETTLED cash (an unsettled deposit shows in the balance but funds
+    // nothing), the target-aware rebuy guard, the half-share rule for greedy
+    // fills, and — while a sell cooldown runs — overweights excluded.
+    const deployCash = (extraExcluded: ReadonlySet<string>): void => {
+      // Cash-flow rebalancing for deposits (USD cash — buys are USD). The
+      // reserve is stated in base currency when the operator set it that way
+      // (CASH_FLOW_RESERVE_BASE) and converted at the ledger's rate.
+      const reserve = resolveCashReserveUsd({
+        reserveUsd: config.rebalance.cashFlowReserveUsd,
+        reserveBase: config.rebalance.cashFlowReserveBase,
+        baseRatePerUsd: usd.baseRatePerUsd,
+      });
+      const CASH_THRESHOLD = reserve.reserveUsd;
+      const deployableCash = bandsActive ? Math.min(cashUsd, settledCashUsd) : cashUsd;
+      log(`Cash reserve: $${CASH_THRESHOLD.toFixed(2)} USD (${reserve.source === 'base'
+        ? `${config.rebalance.cashFlowReserveBase} base @ ${usd.baseRatePerUsd}`
+        : 'USD setting'}); deployable $${Math.max(0, deployableCash - CASH_THRESHOLD).toFixed(2)}` +
+        (bandsActive ? ' (settled cash)' : ''), AGENT);
+      if (deployableCash <= CASH_THRESHOLD) return;
+      const holdings = TARGET_PORTFOLIO.map((t, i) => ({
+        symbol: t.symbol,
+        currentValue: (currentShares.get(t.symbol) ?? 0) * (prices.get(t.symbol) ?? 0),
+        targetPct: adjustedWeights[i] * 100,
+      }));
+
+      // Rebuy guard: don't let buy-only cash flow round-trip a name the
+      // strategy sold within the guard window (churn study 2026-08-29).
+      const excluded = bandsActive
+        ? new Set([...bandGuard.excluded, ...extraExcluded])
+        : recentlySoldSymbols(trades, guardDays);
+      if (excluded.size > 0) {
+        log(`Rebuy guard (${guardDays}d): excluding ${[...excluded].sort().join(', ')} from cash-flow deployment`, AGENT);
+      }
+      if (bandsActive && bandGuard.lifted.length > 0) {
+        log(`Rebuy guard lifted (target raised since the sale): ${bandGuard.lifted
+          .map(l => `${l.symbol} sold to ${l.soldTo}% → target ${l.targetNow.toFixed(1)}%`).join(', ')}`, AGENT);
+      }
+
+      // Standing instruction. When one is in force this deploys the deposit
+      // against the PUBLISHED model rather than pro-rata against deficits:
+      // directed names first and exempt from the rebuy guard (a name written
+      // down in advance is an instruction, not churn), then a greedy fill.
+      // Gated on SETTLED cash — an unsettled deposit shows in the balance but
+      // funds nothing, and the executor defers such buys silently.
+      const deposit = decideDeposit({
+        policy: loadDepositPolicy(),
+        settledCashUsd,
+        cashThresholdUsd: CASH_THRESHOLD,
+        now: new Date(),
+      });
+      log(`Cash deployment: ${deposit.reason}`, AGENT);
+
+      if (deposit.directed) {
+        const policy = loadDepositPolicy()!;
+        const targets: Record<string, number> = {};
+        TARGET_PORTFOLIO.forEach((t, i) => { targets[t.symbol] = adjustedWeights[i] * 100; });
+        const plan = planDepositBuy({
+          targets,
+          holdings: new Map(holdings.map(h => [h.symbol, h.currentValue])),
+          prices,
+          // NAV already includes the cash; the deposit is not additional to it.
+          nav: navUsd,
+          cash: deposit.deployableUsd,
+          depositUsd: 0,
+          directed: policy.directed.filter(sym => sym in targets),
+          reserveUsd: policy.reserveUsd,
+          excluded,
+        });
+        for (const o of plan.orders) {
+          log(`  Deposit: BUY ${o.qty} ${o.symbol} ($${o.estimatedValue.toFixed(2)})`, AGENT);
+          pendingOrders.push({
+            symbol: o.symbol, action: 'BUY', qty: o.qty,
+            estimatedValue: o.estimatedValue, reason: 'directed_deposit',
+          });
+        }
+        log(`  Deposit plan: $${plan.deployedUsd.toFixed(0)} deployed, `
+          + `$${plan.residualCashUsd.toFixed(0)} residual, `
+          + `max drift ${plan.maxDriftPct.toFixed(2)}pp`, AGENT);
+      } else {
+        const cashOrders = allocateCashFlow(
+          holdings, deployableCash - CASH_THRESHOLD, 100, prices, excluded,
+          config.rebalance.cashFlowFillMode,
+          bandsActive ? 0.5 : 0,
+        );
+        for (const o of cashOrders) {
+          log(`  Cash flow: BUY ${o.shares} ${o.symbol} ($${o.amountUsd.toFixed(2)})`, AGENT);
+          pendingOrders.push({
+            symbol: o.symbol, action: 'BUY', qty: o.shares,
+            estimatedValue: o.amountUsd, reason: 'cash_flow_rebalance',
+          });
+        }
+      }
+    };
 
     // Hard-stop drawdown: do NOT generate orders. At 'stopped' the exposure
     // multiplier is 0, which would make every target weight 0 and turn a
@@ -363,6 +547,16 @@ async function run(): Promise<void> {
         `Outside US RTH (${describeWindow(STRATEGIST_WINDOW)}) — analysis logged but no orders queued`,
         AGENT,
       );
+    } else if ((decision === 'urgent' || decision === 'regular') && bandsActive) {
+      log(`Bands gate: ${decision} — ${bandOrders.orders.length} order(s)`, AGENT);
+      pendingOrders = bandOrders.orders.map(o => ({
+        symbol: o.symbol, action: o.action, qty: o.shares,
+        estimatedValue: o.estimatedValue, reason: o.reason,
+      }));
+      for (const o of pendingOrders) {
+        log(`  ${o.action} ${o.qty} ${o.symbol} ($${o.estimatedValue.toFixed(0)}) — ${o.reason}`, AGENT);
+      }
+      for (const n of bandOrders.notes) log(`  note: ${n}`, AGENT);
     } else if (decision === 'urgent' || decision === 'regular') {
       const trigger = decision === 'urgent'
         ? `URGENT: drift ${maxDrift.toFixed(1)}% >= urgent threshold ${config.rebalance.urgentDriftThreshold}% (cooldown bypassed)`
@@ -389,89 +583,17 @@ async function run(): Promise<void> {
         }
       }
     } else if (decision === 'within-threshold') {
-      log('Portfolio within drift threshold — no rebalance needed', AGENT);
-
-      // Cash-flow rebalancing for deposits (USD cash — buys are USD). The
-      // reserve is stated in base currency when the operator set it that way
-      // (CASH_FLOW_RESERVE_BASE) and converted at the ledger's rate.
-      const reserve = resolveCashReserveUsd({
-        reserveUsd: config.rebalance.cashFlowReserveUsd,
-        reserveBase: config.rebalance.cashFlowReserveBase,
-        baseRatePerUsd: usd.baseRatePerUsd,
-      });
-      const CASH_THRESHOLD = reserve.reserveUsd;
-      log(`Cash reserve: $${CASH_THRESHOLD.toFixed(2)} USD (${reserve.source === 'base'
-        ? `${config.rebalance.cashFlowReserveBase} base @ ${usd.baseRatePerUsd}`
-        : 'USD setting'}); deployable $${Math.max(0, cashUsd - CASH_THRESHOLD).toFixed(2)}`, AGENT);
-      if (cashUsd > CASH_THRESHOLD) {
-        const holdings = TARGET_PORTFOLIO.map((t, i) => ({
-          symbol: t.symbol,
-          currentValue: (currentShares.get(t.symbol) ?? 0) * (prices.get(t.symbol) ?? 0),
-          targetPct: adjustedWeights[i] * 100,
-        }));
-
-        // Rebuy guard: don't let buy-only cash flow round-trip a name the
-        // strategy sold within the guard window (churn study 2026-08-29).
-        const guardDays = config.rebalance.cashFlowRebuyGuardDays;
-        const excluded = recentlySoldSymbols(loadTradeHistory(), guardDays);
-        if (excluded.size > 0) {
-          log(`Rebuy guard (${guardDays}d): excluding ${[...excluded].sort().join(', ')} from cash-flow deployment`, AGENT);
-        }
-
-        // Standing instruction. When one is in force this deploys the deposit
-        // against the PUBLISHED model rather than pro-rata against deficits:
-        // directed names first and exempt from the rebuy guard (a name written
-        // down in advance is an instruction, not churn), then a greedy fill.
-        // Gated on SETTLED cash — an unsettled deposit shows in the balance but
-        // funds nothing, and the executor defers such buys silently.
-        const deposit = decideDeposit({
-          policy: loadDepositPolicy(),
-          settledCashUsd,
-          cashThresholdUsd: CASH_THRESHOLD,
-          now: new Date(),
-        });
-        log(`Cash deployment: ${deposit.reason}`, AGENT);
-
-        if (deposit.directed) {
-          const policy = loadDepositPolicy()!;
-          const targets: Record<string, number> = {};
-          TARGET_PORTFOLIO.forEach((t, i) => { targets[t.symbol] = adjustedWeights[i] * 100; });
-          const plan = planDepositBuy({
-            targets,
-            holdings: new Map(holdings.map(h => [h.symbol, h.currentValue])),
-            prices,
-            // NAV already includes the cash; the deposit is not additional to it.
-            nav: navUsd,
-            cash: deposit.deployableUsd,
-            depositUsd: 0,
-            directed: policy.directed.filter(sym => sym in targets),
-            reserveUsd: policy.reserveUsd,
-            excluded,
-          });
-          for (const o of plan.orders) {
-            log(`  Deposit: BUY ${o.qty} ${o.symbol} ($${o.estimatedValue.toFixed(2)})`, AGENT);
-            pendingOrders.push({
-              symbol: o.symbol, action: 'BUY', qty: o.qty,
-              estimatedValue: o.estimatedValue, reason: 'directed_deposit',
-            });
-          }
-          log(`  Deposit plan: $${plan.deployedUsd.toFixed(0)} deployed, `
-            + `$${plan.residualCashUsd.toFixed(0)} residual, `
-            + `max drift ${plan.maxDriftPct.toFixed(2)}pp`, AGENT);
-        } else {
-          const cashOrders = allocateCashFlow(
-            holdings, cashUsd - CASH_THRESHOLD, 100, prices, excluded,
-            config.rebalance.cashFlowFillMode,
-          );
-          for (const o of cashOrders) {
-            log(`  Cash flow: BUY ${o.shares} ${o.symbol} ($${o.amountUsd.toFixed(2)})`, AGENT);
-            pendingOrders.push({
-              symbol: o.symbol, action: 'BUY', qty: o.shares,
-              estimatedValue: o.amountUsd, reason: 'cash_flow_rebalance',
-            });
-          }
-        }
-      }
+      log(bandsActive
+        ? 'Bands gate: within threshold — cash-flow deployment only'
+        : 'Portfolio within drift threshold — no rebalance needed', AGENT);
+      deployCash(new Set());
+    } else if (bandsActive) {
+      // too-soon under bands: the cooldown gates SELLS only. Cash still
+      // deploys, buy-only, into underweights — never into an overweight.
+      const overweights = new Set(bandAssessment.names.filter(n => n.dev > 0).map(n => n.symbol));
+      log(`Bands gate: trigger fired inside the ${config.rebalance.frequencyDays}d sell cooldown ` +
+        `(${daysSince.toFixed(0)}d) — buy-only cash flow, overweights excluded`, AGENT);
+      deployCash(overweights);
     } else {
       log(`Drift ${maxDrift.toFixed(1)}% but only ${daysSince.toFixed(0)}d since last rebalance (min ${config.rebalance.frequencyDays}d)`, AGENT);
     }
@@ -485,8 +607,16 @@ async function run(): Promise<void> {
         : { [weightSource]: targetWeights },
       lastStrategyAt: new Date().toISOString(),
       lastNavUsd: navUsd, // baseline for the next cycle's NAV-move sanity check
+      bandsShadow,
     };
-    if (pendingOrders.length > 0) {
+    // A queue holding a directed deposit is an operator instruction; this run's
+    // orders never replace it (F4). They are regenerated next run, once the
+    // directed buys have executed.
+    const existingQueue = (state.pendingOrders as Array<{ reason?: string }> | undefined) ?? [];
+    const directedQueued = existingQueue.some(o => isDirectedDeposit(o.reason));
+    if (pendingOrders.length > 0 && directedQueued) {
+      log(`Queue holds a directed deposit — not replacing it with this run's ${pendingOrders.length} order(s)`, AGENT);
+    } else if (pendingOrders.length > 0) {
       updates.pendingOrders = pendingOrders;
       // Only a real rebalance restarts the frequencyDays cooldown. This used to
       // fire for ANY order, including cash_flow_rebalance — which is buy-only
@@ -496,7 +626,12 @@ async function run(): Promise<void> {
       // below the threshold that would have triggered the sell. An overweight
       // created by a bad rebalance could therefore become permanent, with the
       // fund quietly buying around it forever.
-      if (decision === 'urgent' || decision === 'regular') {
+      //
+      // Under bands the cooldown is a SELL cooldown, so only a sell restarts it.
+      const restartsCooldown = bandsActive
+        ? pendingOrders.some(o => o.action === 'SELL')
+        : decision === 'urgent' || decision === 'regular';
+      if (restartsCooldown) {
         updates.lastRebalanceAt = new Date().toISOString();
       }
     }
