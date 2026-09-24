@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { appendToBuffer, formatEvent, judgeStream, observedToState } from './observer.js';
+import { appendToBuffer, formatEvent, judgeStream, observedToState, planStreamAlert, reconcileStaleness, type StreamMemory } from './observer.js';
 import type { ObservedEvent } from '../observability/event-types.js';
 import type { ObservedEventState } from '../state/store.js';
 
@@ -164,5 +164,90 @@ describe('judgeStream — is the stream telling us what we rely on it for?', () 
 
   it('subscribed, connected, no gaps: nothing to say', () => {
     expect(judgeStream({ connected: true, subscriptions: { orders: 'subscribed', pnl: 'subscribed' } }, 0)).toBeNull();
+  });
+});
+
+describe('planStreamAlert — a blip is a record, an outage is a page', () => {
+  const MIN = 60_000;
+  const BLIP = 10 * MIN;
+  const t0 = new Date('2026-09-24T10:00:00Z');
+  const at = (m: number) => new Date(t0.getTime() + m * MIN);
+  const down = judgeStream({ connected: false }, 0);
+  const up = judgeStream({ connected: true, subscriptions: { orders: 'subscribed' } }, 0);
+  const gap = judgeStream({ connected: true, subscriptions: { orders: 'subscribed' } }, 1);
+
+  it('first sight of an outage is recorded, not paged', () => {
+    const r = planStreamAlert({}, down, t0, BLIP);
+    expect(r.action).toEqual({ kind: 'record', reason: 'disconnected' });
+    expect(r.next.streamOutage).toEqual({ since: t0.toISOString(), reason: 'disconnected', paged: false });
+  });
+
+  it('a blip that clears inside the threshold never pages, and its recovery is a record', () => {
+    let mem: StreamMemory = planStreamAlert({}, down, t0, BLIP).next;
+    const still = planStreamAlert(mem, down, at(5), BLIP);
+    expect(still.action).toBeNull(); // recorded once per outage, not per poll
+    mem = still.next;
+    const over = planStreamAlert(mem, up, at(8), BLIP);
+    expect(over.action).toEqual({ kind: 'recover-record', minutes: 8 });
+    expect(over.next.streamOutage).toBeUndefined();
+    expect(over.next.lastStreamOutageEndedAt).toBe(at(8).toISOString());
+  });
+
+  it('an outage that outlasts the threshold pages once, then leaves re-nags to the dedupe ttl', () => {
+    let mem = planStreamAlert({}, down, t0, BLIP).next;
+    const page = planStreamAlert(mem, down, at(10), BLIP);
+    expect(page.action).toEqual({ kind: 'page', reason: 'disconnected' });
+    mem = page.next;
+    expect(planStreamAlert(mem, down, at(15), BLIP).action).toBeNull();
+    expect(planStreamAlert(mem, up, at(20), BLIP).action).toEqual({ kind: 'recover-page', minutes: 20 });
+  });
+
+  it('a SECOND outage within 24h pages at once, however short', () => {
+    const mem: StreamMemory = { lastStreamOutageEndedAt: at(-60 * 23).toISOString() };
+    expect(planStreamAlert(mem, down, t0, BLIP).action).toEqual({ kind: 'page', reason: 'disconnected' });
+  });
+
+  it('…but one a day later is a fresh first outage', () => {
+    const mem: StreamMemory = { lastStreamOutageEndedAt: at(-60 * 25).toISOString() };
+    expect(planStreamAlert(mem, down, t0, BLIP).action?.kind).toBe('record');
+  });
+
+  it('a refused orders subscription is an outage too', () => {
+    const refused = judgeStream({ connected: true, subscriptions: { orders: 'refused' } }, 0);
+    expect(planStreamAlert({}, refused, t0, 0).action).toEqual({ kind: 'page', reason: 'orders-refused' });
+  });
+
+  it('a gap is not an outage (it stays a record of its own)', () => {
+    expect(planStreamAlert({}, gap, t0, BLIP)).toEqual({ action: null, next: {} });
+  });
+
+  it('OBSERVER_BLIP_MINUTES=0 pages on first sight, as before', () => {
+    expect(planStreamAlert({}, down, t0, 0).action?.kind).toBe('page');
+  });
+
+  it('healthy and nothing remembered: nothing to do', () => {
+    expect(planStreamAlert({}, up, t0, BLIP)).toEqual({ action: null, next: {} });
+  });
+});
+
+describe('reconcileStaleness', () => {
+  const now = new Date('2026-09-24T12:00:00Z');
+  const saved = process.env.RECONCILE_STALE_HOURS;
+  const restore = () => { if (saved === undefined) delete process.env.RECONCILE_STALE_HOURS; else process.env.RECONCILE_STALE_HOURS = saved; };
+
+  it('quiet inside 14h, stale past it', () => {
+    delete process.env.RECONCILE_STALE_HOURS;
+    expect(reconcileStaleness('2026-09-24T00:00:00Z', now)).toBeNull(); // 12h
+    expect(reconcileStaleness('2026-09-23T21:00:00Z', now)).toBeCloseTo(15);
+    restore();
+  });
+
+  it('0 switches it off; a missing or unreadable stamp is not guessed at', () => {
+    process.env.RECONCILE_STALE_HOURS = '0';
+    expect(reconcileStaleness('2020-01-01T00:00:00Z', now)).toBeNull();
+    delete process.env.RECONCILE_STALE_HOURS;
+    expect(reconcileStaleness(undefined, now)).toBeNull();
+    expect(reconcileStaleness('garbage', now)).toBeNull();
+    restore();
   });
 });
