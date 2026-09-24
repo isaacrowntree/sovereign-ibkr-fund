@@ -2,15 +2,23 @@
  * Risk Manager
  * VaR/CVaR, drawdown control, volatility targeting, correlation monitoring.
  */
-import { connect, disconnect, getAccountSummary, getMarketPrices , requestDelayedData } from '../connection/gateway.js';
+import { connect, disconnect, getAccountSummary, getMarketPrices, getUsdBalances, requestDelayedData, type UsdBalances } from '../connection/gateway.js';
 import { TARGET_PORTFOLIO, config, validateTargets } from '../config.js';
 import { historicalVaR, conditionalVaR } from '../risk/var.js';
 import { assessDrawdown, maxDrawdown, type DrawdownLimits, type DrawdownState } from '../risk/drawdown.js';
 import { ewmaVolatility, annualizeVol, volTargetLeverage } from '../risk/volatility.js';
 import { correlationStressTest } from '../risk/stress-test.js';
-import { sampleCovMatrix } from '../portfolio/covariance.js';
+import { buildStressInputs } from '../risk/stress-inputs.js';
 import { marketDate } from '../quant/price-history.js';
-import { computeIntradayDrawdownFromEvents } from '../observability/intraday-pnl.js';
+import { computeIntradayDrawdownFromEvents, computeIntradayDrawdownFromNl } from '../observability/intraday-pnl.js';
+import { latestSession } from '../strategy/session-window.js';
+import { nyseCloseMinutes } from '../strategy/market-hours.js';
+import { readRolloutFlags, describeRollout } from '../rollout.js';
+import {
+  buildUnitIndex, liveUnitReading, recordCloseSample, usdExposurePct,
+  type NavSample, type CapitalFlow,
+} from '../risk/unit-nav.js';
+import { etDate } from '../strategy/session-window.js';
 import { loadState, mergeState, loadObservedEvents, type ObservedEventState } from '../state/store.js';
 import { notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
@@ -34,6 +42,8 @@ function worseDrawdownLevel(a: DrawdownState['level'], b: DrawdownState['level']
   return DD_RANK[a] >= DD_RANK[b] ? a : b;
 }
 const TARGET_VOL = config.risk.targetVol;
+/** Daily returns a name needs before the stress test includes it (F5). */
+const STRESS_MIN_OBS = 60;
 const DD_LIMITS: DrawdownLimits = {
   warningPct: config.risk.drawdownWarningPct,
   deriskPct: config.risk.drawdownDeriskPct,
@@ -42,6 +52,9 @@ const DD_LIMITS: DrawdownLimits = {
 
 export async function run(): Promise<void> {
   log('Risk assessment starting', AGENT);
+  const flags = readRolloutFlags();
+  log(`Rollout: ${describeRollout(flags)}`, AGENT);
+  for (const p of flags.problems) log(`Rollout flag ignored: ${p}`, AGENT);
   // The drawdown ladder this writes scales the strategist's weights, so a
   // report computed against the wrong book corrupts real decisions.
   validateTargets();
@@ -66,8 +79,11 @@ export async function run(): Promise<void> {
     // withdrawal — not a market drawdown — so the legacy peak is meaningless
     // for risk gating. Drop history older than the discontinuity and rebuild
     // peak from the current account state.
+    // Under RISK_NAV_SOURCE=units the guard is dropped (F6): a withdrawal is a
+    // recorded capital flow there, not something to infer, and the legacy
+    // history is kept intact as a record instead of being wiped.
     let phantomReset: { oldPeak: number; nav: number } | null = null;
-    if (navHistory.length > 0) {
+    if (navHistory.length > 0 && flags.riskNavSource === 'legacy') {
       const oldPeak = Math.max(...navHistory);
       if (oldPeak > account.netLiquidation * 3) {
         log(
@@ -110,8 +126,65 @@ export async function run(): Promise<void> {
 
     // Drawdown
     const peak = Math.max(...navHistory);
-    const dd = assessDrawdown(account.netLiquidation, peak, DD_LIMITS);
-    log(`Drawdown: ${dd.drawdownPct.toFixed(2)}% (${dd.level}) | Peak: $${dd.peak.toFixed(2)}`, AGENT);
+    const legacyDd = assessDrawdown(account.netLiquidation, peak, DD_LIMITS);
+    log(`Drawdown: ${legacyDd.drawdownPct.toFixed(2)}% (${legacyDd.level}) | Peak: $${legacyDd.peak.toFixed(2)}` +
+      (flags.riskNavSource === 'units' ? ' [legacy, not gating]' : ''), AGENT);
+
+    // ── Unit NAV index (F6) ─────────────────────────────────────────────────
+    // Samples are collected on every run whatever the flag, so the index has a
+    // history by the time anyone switches it on. Under RISK_NAV_SOURCE=units
+    // the ladder runs on the USD unit price and a failed ledger read is fatal
+    // (the run fails, lastRiskAt goes stale, execution-bot's staleness gate
+    // blocks trading) — under legacy it is only logged.
+    let usdBal: UsdBalances | null = null;
+    try {
+      usdBal = await getUsdBalances();
+    } catch (e) {
+      if (flags.riskNavSource === 'units') throw e;
+      log(`Unit NAV: ledger read failed (${e instanceof Error ? e.message : String(e)}) — no sample this run`, AGENT);
+    }
+    const now = new Date();
+    let navSamples = (state.navSamples ?? []) as NavSample[];
+    const lastSession = latestSession(now, nyseCloseMinutes);
+    if (usdBal && lastSession && !lastSession.inProgress) {
+      navSamples = recordCloseSample(navSamples, {
+        date: lastSession.date,
+        navAud: account.netLiquidation,
+        navUsd: usdBal.usdNav > 0 ? usdBal.usdNav : null,
+        audPerUsd: usdBal.baseRatePerUsd,
+        source: 'close',
+      });
+    }
+    const flows = (state.capitalFlows ?? []) as CapitalFlow[];
+    const unitIndex = buildUnitIndex(navSamples, flows);
+    for (const p of unitIndex.problems) log(`Unit NAV: ${p}`, AGENT);
+    const live = liveUnitReading(unitIndex, {
+      date: etDate(now),
+      navAud: account.netLiquidation,
+      navUsd: usdBal && usdBal.usdNav > 0 ? usdBal.usdNav : null,
+      audPerUsd: usdBal?.baseRatePerUsd ?? null,
+    }, flows);
+    // The ladder's series: USD units; AUD units only until the USD index has
+    // a first sample (a migration without FX leaves it empty until a close).
+    const unitSeries = live.unitPriceUsd !== null && live.peakUnitPriceUsd !== null
+      ? { ccy: 'USD', now: live.unitPriceUsd, peak: live.peakUnitPriceUsd }
+      : { ccy: 'AUD', now: live.unitPriceAud, peak: live.peakUnitPriceAud };
+    const unitDd = assessDrawdown(unitSeries.now, unitSeries.peak, DD_LIMITS);
+    const fxExposure = usdBal ? usdExposurePct(account.netLiquidation, usdBal.nonUsdCashBase) : null;
+    log(
+      `Unit NAV: AUD ${live.unitPriceAud.toFixed(4)} (peak ${live.peakUnitPriceAud.toFixed(4)}), ` +
+        `USD ${live.unitPriceUsd?.toFixed(4) ?? 'n/a'} (peak ${live.peakUnitPriceUsd?.toFixed(4) ?? 'n/a'}) — ` +
+        `${unitSeries.ccy} drawdown ${unitDd.drawdownPct.toFixed(2)}% (${unitDd.level}) ` +
+        `[${flags.riskNavSource === 'units' ? 'gating' : 'shadow'}; ${navSamples.length} samples, ` +
+        `${flows.length} flows; USD exposure ${fxExposure === null ? 'n/a' : `${fxExposure.toFixed(1)}%`}]`,
+      AGENT,
+    );
+    if (unitIndex.flowsPending.length > 0) {
+      log(`Unit NAV: ${unitIndex.flowsPending.length} flow(s) dated after the last close sample — priced live, stored at the next close`, AGENT);
+    }
+
+    const useUnits = flags.riskNavSource === 'units';
+    const dd = useUnits ? unitDd : legacyDd;
     // Effective level starts from the snapshot; the intraday WS block below may
     // escalate it if a sharp mid-session drop is worse than the agent-cadence
     // snapshots see. This is what actually gates execution.
@@ -146,34 +219,37 @@ export async function run(): Promise<void> {
         realizedVol: annVol * 100,
         volTargetLeverage: leverage,
       };
+    } else {
+      log(`VaR/vol skipped: ${navHistory.length} daily NAV samples (need 20)`, AGENT);
+    }
 
-      // Correlation stress test using portfolio weights and covariance
-      const historicalReturns = state.historicalReturns as number[][] | undefined;
-      // Keyed by weightSource since 2026-08-19, so `static` appears here when the
-      // optimizer is gated off. Stress the weights the fund is ACTUALLY targeting
-      // — a static book is just as stressable, and reading only `hrp` meant the
-      // test silently stopped running whenever the gate closed.
-      // Prefer HRP — backtest shows Risk Parity degenerates with high vol dispersion
+    // Correlation stress test (F5, 2026-09-24): per-name returns from each
+    // holding's own price history, pairwise covariance, and names with under
+    // 60 daily returns EXCLUDED rather than shortening everyone. Every skip is
+    // logged — it used to vanish silently whenever a new holding was added.
+    //
+    // Keyed by weightSource since 2026-08-19, so `static` appears here when the
+    // optimizer is gated off. Stress the weights the fund is ACTUALLY targeting.
+    // Prefer HRP — backtest shows Risk Parity degenerates with high vol dispersion
+    {
       const optimizedWeights = state.optimizedWeights as
         { hrp?: number[] | null; riskParity?: number[] | null; static?: number[] | null } | undefined;
       const weights = optimizedWeights?.hrp || optimizedWeights?.riskParity || optimizedWeights?.static;
-
-      // `historicalReturns.length` is the ASSET count, not the observation count —
-      // this used to build a 17x17 covariance from 3 observations, exactly the
-      // input portfolio-strategist now refuses.
-      const stressObs = historicalReturns?.[0]?.length ?? 0;
-      const STRESS_MIN_OBS = Math.max(30, symbols.length * 2);
-
-      // A reweight changes the model's asset count immediately; historicalReturns
-      // only catches up as the observer accumulates the new names. Skipping for a
-      // few cycles is right — dying is not, and silently stressing mismatched
-      // vectors would be worse than either.
-      if (weights && historicalReturns && weights.length !== historicalReturns.length) {
-        log(`Stress test skipped: ${weights.length} model weights vs `
-          + `${historicalReturns.length} assets of return history (model recently changed)`, AGENT);
-      } else if (historicalReturns && historicalReturns.length >= 2 && stressObs >= STRESS_MIN_OBS && weights) {
-        const cov = sampleCovMatrix(historicalReturns);
-        const stress = correlationStressTest(weights, cov, account.netLiquidation);
+      const built = buildStressInputs(
+        symbols, weights, state.priceHistory as Record<string, number[]> | undefined, STRESS_MIN_OBS,
+      );
+      if (!built.ok) {
+        log(`Stress test skipped: ${built.reason}`, AGENT);
+      } else {
+        const { inputs } = built;
+        if (inputs.excluded.length > 0) {
+          log(
+            `Stress test excludes ${inputs.excluded.map(e => `${e.symbol}(${e.observations}d)`).join(', ')} — ` +
+              `under ${STRESS_MIN_OBS} daily returns; ${(inputs.excludedWeight * 100).toFixed(1)}% of model weight not stressed`,
+            AGENT,
+          );
+        }
+        const stress = correlationStressTest(inputs.weights, inputs.cov, account.netLiquidation);
         log(`Stress test: baseline VaR $${stress.baselineVaR.toFixed(2)} → stressed VaR $${stress.stressedVaR.toFixed(2)} (corr=0.9)`, AGENT);
         state.stressTest = {
           baselineVol: stress.baselineVol,
@@ -181,18 +257,22 @@ export async function run(): Promise<void> {
           baselineVaR: stress.baselineVaR,
           stressedVaR: stress.stressedVaR,
           portfolioValue: stress.portfolioValue,
+          excludedSymbols: inputs.excluded.map(e => e.symbol),
+          excludedWeight: inputs.excludedWeight,
           timestamp: (stressComputedAt = new Date().toISOString()),
         };
       }
     }
 
+    // LEGACY intraday reconstruction — gates under INTRADAY_DD_SOURCE=legacy and
+    // =shadow, kept byte-for-byte until the nl figure has earned the switch.
     // WS-derived intraday drawdown enrichment. Only used when the
     // observer agent has been populating state.observedEvents — when
     // empty, we fall back to the snapshot-based DD above.
     // Rows now, and only the topic this needs — previously it deserialised the
     // entire 1.3MB history to filter for 'pnl'.
     const observed = loadObservedEvents({ topic: 'pnl' });
-    if (observed.length > 0) {
+    if (observed.length > 0 && flags.intradayDdSource !== 'nl') {
       const sessionStart = new Date();
       sessionStart.setUTCHours(13, 30, 0, 0); // 09:30 ET as a reasonable session anchor
       const intraday = computeIntradayDrawdownFromEvents(
@@ -242,6 +322,62 @@ export async function run(): Promise<void> {
       }
     }
 
+    // `nl`-based intraday drawdown (C′3). INTRADAY_DD_SOURCE=shadow (default)
+    // computes and logs it next to the legacy figure above, which still gates;
+    // =nl makes it the gate and skips the legacy reconstruction; =legacy skips
+    // this block entirely. Window: the latest NYSE session from the ET wall
+    // clock (DST-correct), not a hard-coded 13:30Z anchored on today.
+    if (observed.length > 0 && flags.intradayDdSource !== 'legacy') {
+      const session = latestSession(new Date(), nyseCloseMinutes);
+      if (!session) {
+        log('Intraday DD (nl): no session found in the last 10 days — skipped', AGENT);
+      } else {
+        const nl = computeIntradayDrawdownFromNl(observed, { start: session.start, end: session.end });
+        const mode = flags.intradayDdSource === 'nl' ? 'gating' : 'shadow';
+        if (nl.samples === 0) {
+          log(`Intraday DD (nl, ${mode}): no usable nl frames in the ${session.date} session ` +
+            `(${nl.ignored} without nl)`, AGENT);
+        } else {
+          // In the units frame the session's AUD nl moves are applied to the
+          // live unit price proportionally (flows are rare and priced at the
+          // close, so intraday they are noise either way).
+          const scale = useUnits && account.netLiquidation > 0 ? unitSeries.now / account.netLiquidation : 1;
+          const ladderPeak = useUnits ? unitSeries.peak : peak;
+          const nlLevel = assessDrawdown(nl.sessionLow * scale, Math.max(ladderPeak, nl.sessionHigh * scale), DD_LIMITS).level;
+          log(
+            `Intraday DD (nl, ${mode}): ${nl.drawdownPct.toFixed(2)}% worst intraday fall over ${nl.samples} samples ` +
+              `in the ${session.date} session (high ${nl.sessionHigh.toFixed(2)}, low ${nl.sessionLow.toFixed(2)}, ` +
+              `${nl.ignored} partial frames ignored) → ladder level ${nlLevel}`,
+            AGENT,
+          );
+          mergeState({
+            intradayDrawdownNl: {
+              session: session.date,
+              drawdownPct: nl.drawdownPct,
+              sessionHigh: nl.sessionHigh,
+              sessionLow: nl.sessionLow,
+              samples: nl.samples,
+              ignored: nl.ignored,
+              level: nlLevel,
+              mode,
+              at: new Date().toISOString(),
+            },
+          });
+          if (flags.intradayDdSource === 'nl') {
+            effectiveLevel = worseDrawdownLevel(effectiveLevel, nlLevel);
+            mergeState({
+              intradayDrawdown: {
+                peakNav: nl.peakNav,
+                troughNav: nl.troughNav,
+                drawdownPct: nl.drawdownPct,
+                samples: nl.samples,
+              },
+            });
+          }
+        }
+      }
+    }
+
     // Fix #7: Persist the EFFECTIVE drawdown level (snapshot ⊔ intraday) so the
     // execution bot can enforce it.
     //
@@ -257,6 +393,20 @@ export async function run(): Promise<void> {
       lastRiskAt: new Date().toISOString(),
     };
     updates.navHistoryDates = dates;
+    updates.navSamples = navSamples;
+    updates.unitNav = {
+      source: flags.riskNavSource,
+      series: unitSeries.ccy,
+      unitPriceAud: live.unitPriceAud,
+      unitPriceUsd: live.unitPriceUsd,
+      peakUnitPriceAud: live.peakUnitPriceAud,
+      peakUnitPriceUsd: live.peakUnitPriceUsd,
+      drawdownPct: unitDd.drawdownPct,
+      level: unitDd.level,
+      usdExposurePct: fxExposure,
+      samples: navSamples.length,
+      at: now.toISOString(),
+    };
     if (state.riskMetrics) updates.riskMetrics = state.riskMetrics;
     // Carry a stressTest forward only if it was recomputed THIS run; otherwise
     // CLEAR it. It used to be re-persisted unconditionally, and since its gate
@@ -300,11 +450,18 @@ export async function run(): Promise<void> {
     // Drawdown level. Fingerprinted on the level itself, so this alerts on
     // TRANSITIONS (normal → warning → derisking → stopped) rather than on every
     // run, and re-nags only once the ttl lapses on a stuck condition.
-    const ddFields = [
-      { label: 'Drawdown', value: `${dd.drawdownPct.toFixed(1)}%` },
-      { label: 'Peak NAV', value: usd(dd.peak) },
-      { label: 'Current NAV', value: usd(account.netLiquidation) },
-    ];
+    const ddFields = useUnits
+      ? [
+          { label: 'Drawdown', value: `${dd.drawdownPct.toFixed(1)}% (${unitSeries.ccy} unit price)` },
+          { label: 'Peak unit price', value: dd.peak.toFixed(4) },
+          { label: 'Unit price', value: dd.currentValue.toFixed(4) },
+          { label: 'Current NAV', value: usd(account.netLiquidation) },
+        ]
+      : [
+          { label: 'Drawdown', value: `${dd.drawdownPct.toFixed(1)}%` },
+          { label: 'Peak NAV', value: usd(dd.peak) },
+          { label: 'Current NAV', value: usd(account.netLiquidation) },
+        ];
 
     if (effectiveLevel === 'stopped') {
       log('HARD STOP: Portfolio drawdown exceeds limit', AGENT);

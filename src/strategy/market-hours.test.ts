@@ -13,6 +13,7 @@ import {
   etClock,
   NYSE_CALENDAR,
   tradingMsBetween,
+  nyseCloseMinutes,
 } from './market-hours';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -270,5 +271,14 @@ describe('tradingMsBetween', () => {
     const t = etDate(2026, 9, 22, 11, 0, 'EDT');
     expect(tradingMsBetween(t, t)).toBe(0);
     expect(tradingMsBetween(t, new Date(t.getTime() - H))).toBe(0);
+  });
+});
+
+describe('nyseCloseMinutes', () => {
+  it('is null on a holiday and a weekend, 13:00 on an early close, 16:00 otherwise', () => {
+    expect(nyseCloseMinutes('2026-11-26')).toBeNull(); // Thanksgiving
+    expect(nyseCloseMinutes('2026-09-26')).toBeNull(); // Saturday
+    expect(nyseCloseMinutes('2026-11-27')).toBe(13 * 60); // day after Thanksgiving
+    expect(nyseCloseMinutes('2026-09-24')).toBe(16 * 60);
   });
 });

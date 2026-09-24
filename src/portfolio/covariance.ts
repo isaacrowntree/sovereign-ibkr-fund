@@ -24,6 +24,38 @@ export function sampleCovMatrix(returns: number[][]): number[][] {
   return cov;
 }
 
+/**
+ * Pairwise-complete sample covariance for RIGHT-ANCHORED series of unequal
+ * length (2026-09-24 review, F5): every series ends on the same trading day, a
+ * recently added holding simply has fewer. cov(i,j) uses the last
+ * min(len_i, len_j) observations of both, with means over that same window.
+ *
+ * The alternative the fund used — truncate every name to the shortest history —
+ * let one new holding shrink the whole book's estimate to a few weeks (and push
+ * the stress test under its observation floor, where it was silently skipped).
+ *
+ * Not guaranteed positive semi-definite (each entry uses its own window); a
+ * caller computing a quadratic form should clamp the result at 0.
+ */
+export function pairwiseCovMatrix(series: number[][]): number[][] {
+  const n = series.length;
+  const cov: number[][] = Array.from({ length: n }, () => new Array(n).fill(0));
+  for (let i = 0; i < n; i++) {
+    for (let j = i; j < n; j++) {
+      const m = Math.min(series[i].length, series[j].length);
+      if (m < 2) { cov[i][j] = cov[j][i] = NaN; continue; }
+      const a = series[i].slice(-m);
+      const b = series[j].slice(-m);
+      const ma = a.reduce((s, v) => s + v, 0) / m;
+      const mb = b.reduce((s, v) => s + v, 0) / m;
+      let sum = 0;
+      for (let k = 0; k < m; k++) sum += (a[k] - ma) * (b[k] - mb);
+      cov[i][j] = cov[j][i] = sum / (m - 1);
+    }
+  }
+  return cov;
+}
+
 /** Correlation matrix from covariance matrix */
 export function covToCorr(cov: number[][]): number[][] {
   const n = cov.length;
@@ -52,6 +84,14 @@ export function ledoitWolfShrinkage(returns: number[][]): {
   const n = returns.length;
   const t = returns[0]?.length || 0;
   if (n === 0 || t < 2) return { shrunk: [], shrinkageIntensity: 0 };
+  // NaN guard (2026-09-24 review, F9). One NaN/Infinity return — a zero price in
+  // the history, a ragged row — poisons every entry of the matrix, and
+  // downstream that became NaN weights and NaN drift, which the gate reads as
+  // "within threshold". An empty result is the documented "no estimate" answer
+  // every caller already handles (static targets, equal-weight fallback).
+  if (returns.some(r => r.length !== t || r.some(v => !Number.isFinite(v)))) {
+    return { shrunk: [], shrinkageIntensity: 0 };
+  }
 
   const sample = sampleCovMatrix(returns);
   const mu = trace(sample) / n; // average variance
@@ -80,7 +120,11 @@ export function ledoitWolfShrinkage(returns: number[][]): {
     }
   }
 
-  const delta = Math.max(0, Math.min(1, (pi / t) / gammaSum));
+  // gammaSum = 0 means the sample already IS the scaled identity (e.g. identical
+  // flat series): 0/0 used to make delta NaN and the whole matrix NaN. Any delta
+  // gives the same matrix there, so take 0.
+  const rawDelta = (pi / t) / gammaSum;
+  const delta = Number.isFinite(rawDelta) ? Math.max(0, Math.min(1, rawDelta)) : 0;
   const shrunk = matAdd(matScale(target, delta), matScale(sample, 1 - delta));
 
   return { shrunk, shrinkageIntensity: delta };

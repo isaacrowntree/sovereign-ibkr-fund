@@ -7,7 +7,7 @@
  * configuration through the COVID crash (a ~5-week collapse) and the 2022 bear
  * (a 12-month grind), and reports what the machinery DID, not just the return.
  */
-import { runBacktest, DEFAULT_CONFIG, loadHistoricalData, type BacktestConfig, type Position } from '../src/validation/backtest-engine.js';
+import { runBacktest, clampToWarmup, DEFAULT_CONFIG, loadHistoricalData, type BacktestConfig, type Position } from '../src/validation/backtest-engine.js';
 import { toTradeRecords, evaluateAfterTax } from '../src/validation/after-tax.js';
 import { TARGET_PORTFOLIO } from '../src/config.js';
 
@@ -50,7 +50,7 @@ function run(label: string, from: string, to: string) {
   console.log(`\n=== ${label}  (${from} -> ${to}) ===`);
   console.log('config                                 gross%  after-tax%  maxDD%  haltDays  trades  regimes');
   for (const [name, cfg] of CONFIGS) {
-    const r = runBacktest(cfg, CAPITAL, positions, from, to);
+    const r = runBacktest(cfg, CAPITAL, positions, clampToWarmup(cfg, from), to);
     const t = evaluateAfterTax(r, toTradeRecords(r, opening, `${from}T20:00:00Z`), RATE);
     const regimes = Object.entries(r.regimeCounts).map(([k, v]) => `${k}:${v}`).join(' ') || '(none)';
     console.log(

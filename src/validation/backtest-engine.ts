@@ -10,7 +10,6 @@ import { readFileSync } from 'fs';
 import { resolve } from 'path';
 import { maxDrawdown } from '../risk/drawdown';
 import { historicalVaR, conditionalVaR } from '../risk/var';
-import { config as appConfig } from '../config';
 import {
   computeTargetWeights,
   computeExposure,
@@ -23,6 +22,9 @@ import {
   type PortfolioSnapshot,
 } from '../portfolio/rebalance';
 import { allocateCashFlow } from '../portfolio/cashflow-rebalance';
+import {
+  assessBands, decideBands, generateBandOrders, PLAN_BANDS, type BandParams, type OpenLot,
+} from '../portfolio/drift-bands';
 
 // ---------- Types ----------
 
@@ -115,6 +117,46 @@ export interface BacktestConfig {
    * this many calendar days. 0 = off (current production behaviour).
    */
   cashFlowRebuyGuardDays: number;
+  /**
+   * Live-path knobs (2026-09-24, G1/G3). All optional; absent means the
+   * engine's historical behaviour, so every existing study reproduces.
+   *   minTradeUsd        — rebalance order floor (engine legacy: 50)
+   *   cashBufferPct      — % of NAV held back from rebalance targets (legacy: 0)
+   *   fillMode           — rebalance buy allocation when cash-short (legacy: proportional)
+   *   cashFlowFillMode   — allocateCashFlow mode (legacy: proportional)
+   *   cashFlowReserveUsd — cash the cash-flow path never deploys (legacy: 1000)
+   *   cashFlowReserveBase — the same reserve stated in AUD, converted at the
+   *                        day's rate; wins over cashFlowReserveUsd when an FX
+   *                        series is loaded (as live: CASH_FLOW_RESERVE_BASE)
+   */
+  minTradeUsd?: number;
+  cashBufferPct?: number;
+  fillMode?: 'greedy' | 'proportional';
+  cashFlowFillMode?: 'greedy' | 'proportional';
+  cashFlowReserveUsd?: number;
+  cashFlowReserveBase?: number;
+  /** FX series in data/ ({ date: AUD per USD }); required by cashFlowReserveBase and deposits. */
+  fxDataFile?: string;
+  /**
+   * G4 — one price basis: pay cash dividends (data/<file>, ex-date, USD/share)
+   * net of `dividendWithholding` (default 15% US WHT) into cash, on RAW closes.
+   * Requires useTotalReturn: false; mixing both would count dividends twice.
+   */
+  dividendsFile?: string;
+  dividendWithholding?: number;
+  /** G3 — AUD deposits (+) / withdrawals (−), converted to USD at that day's rate. Needs fxDataFile. */
+  deposits?: Array<{ date: string; amountAud: number }>;
+  /** G3 — fraction of trading days the strategist misses (seeded, deterministic). Default 0. */
+  missedRunRate?: number;
+  missedRunSeed?: number;
+  /** G7 — 'ibkr-fixed': USD 0.005/share, min 1.00, capped at 1% of value. Default flat commissionPerTrade. */
+  commissionModel?: 'flat' | 'ibkr-fixed';
+  /** G7 — dated opening lots (cost in USD/share). Replaces initialPositions when given. */
+  initialLots?: Array<{ symbol: string; shares: number; cost: number; date: string }>;
+  /** F1 — rebalance gate. Default 'legacy' (decideRebalance). */
+  gate?: 'legacy' | 'bands';
+  /** F1 — band parameters when gate is 'bands'. Default PLAN_BANDS. */
+  bandParams?: BandParams;
 }
 
 export interface TradeRecord {
@@ -149,6 +191,18 @@ export interface BacktestResult {
   finalPositions: Position[];
   var95: number;
   cvar95: number;
+  /** Trading date of each dailyValues entry (the last one repeats the final date, post-trade). */
+  dailyDates: string[];
+  /** Cash dividends received (G4). */
+  dividends: Array<{ date: string; symbol: string; grossUsd: number; withheldUsd: number }>;
+  /** Capital flows applied (G3). */
+  flows: Array<{ date: string; amountAud: number; amountUsd: number }>;
+  /** Days the strategist was modelled as not running (G3). */
+  missedRunDays: number;
+  /** Gate outcomes per day (both gates use the same four labels). */
+  decisionCounts: Record<string, number>;
+  /** Open FIFO lots at the end, per symbol. */
+  finalLots: Record<string, OpenLot[]>;
 }
 
 // ---------- Data Loading ----------
@@ -167,6 +221,61 @@ export function loadHistoricalData(dataFile?: string): Record<string, DailyBar[]
   const data = JSON.parse(readFileSync(dataPath, 'utf8')) as Record<string, DailyBar[]>;
   _cachedData.set(file, data);
   return data;
+}
+
+const _cachedFx = new Map<string, { dates: string[]; rates: number[] }>();
+
+/** AUD-per-USD series from data/, sorted by date. */
+export function loadFxSeries(file: string): { dates: string[]; rates: number[] } {
+  const cached = _cachedFx.get(file);
+  if (cached) return cached;
+  const raw = JSON.parse(readFileSync(resolve(__dirname, 'data', file), 'utf8')) as Record<string, number>;
+  const dates = Object.keys(raw).sort();
+  const out = { dates, rates: dates.map(d => raw[d]) };
+  _cachedFx.set(file, out);
+  return out;
+}
+
+const _cachedDivs = new Map<string, Map<string, Map<string, number>>>();
+
+/** Cash dividends from data/: symbol → ex-date → USD per share. */
+export function loadDividends(file: string): Map<string, Map<string, number>> {
+  const cached = _cachedDivs.get(file);
+  if (cached) return cached;
+  const raw = JSON.parse(readFileSync(resolve(__dirname, 'data', file), 'utf8')) as Record<string, Array<{ date: string; amount: number }>>;
+  const out = new Map<string, Map<string, number>>();
+  for (const [sym, list] of Object.entries(raw)) {
+    const m = new Map<string, number>();
+    for (const d of list) m.set(d.date, (m.get(d.date) ?? 0) + d.amount);
+    out.set(sym, m);
+  }
+  _cachedDivs.set(file, out);
+  return out;
+}
+
+/** Deterministic PRNG (mulberry32) for the missed-run model. */
+function prng(seed: number): () => number {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6D2B79F5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/** The last rate on or before `date` (FX trades on days the NYSE doesn't, and vice versa). */
+export function fxOn(series: { dates: string[]; rates: number[] }, date: string): number {
+  let lo = 0;
+  let hi = series.dates.length - 1;
+  if (hi < 0) throw new Error('empty FX series');
+  if (date < series.dates[0]) return series.rates[0];
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (series.dates[mid] <= date) lo = mid; else hi = mid - 1;
+  }
+  return series.rates[lo];
 }
 
 export const SYMBOLS = ['PLTR', 'AMZN', 'TWLO', 'ARM', 'TSLA', 'BRK-B', 'NET'];
@@ -214,23 +323,24 @@ function getActiveSymbols(symbols: string[], symbolDateMap: Map<string, Map<stri
   return symbols.filter(s => symbolDateMap.get(s)!.has(date));
 }
 
-// ---------- Default Config (reads from centralized config.ts) ----------
+// ---------- Default + live configs ----------
+//
+// Studies never read ambient env (2026-09-24 review, G1). DEFAULT_CONFIG used to
+// be assembled from `config.ts`, i.e. from whatever `.env` happened to be loaded:
+// the same study gave different answers on the workstation (live .env) and in CI
+// (code defaults), and changing a production default silently changed every
+// backtest assertion. It is now a literal — the code defaults as they stood when
+// the coupling was removed — and LIVE_CONFIG layers a sanitised snapshot of the
+// production knobs on top of it.
 
 export const DEFAULT_CONFIG: BacktestConfig = {
   name: 'Default HRP + Regime + Vol Target',
-  // Pinned rather than read from the live config: the live defaults moved to
-  // static / no regime (safe for a real book), and this config's name and every
-  // study built on it describe HRP + regime. Research defaults belong here.
   optimizerMethod: 'hrp',
-  rebalanceDriftPct: appConfig.rebalance.driftThreshold,
-  rebalanceFreqDays: appConfig.rebalance.frequencyDays,
-  drawdownLimits: {
-    warningPct: appConfig.risk.drawdownWarningPct,
-    deriskPct: appConfig.risk.drawdownDeriskPct,
-    hardStopPct: appConfig.risk.drawdownHardStopPct,
-  },
-  targetVol: appConfig.risk.targetVol,
-  maxLeverage: appConfig.risk.maxLeverage,
+  rebalanceDriftPct: 10,
+  rebalanceFreqDays: 45,
+  drawdownLimits: { warningPct: 7, deriskPct: 15, hardStopPct: 25 },
+  targetVol: 0.20,
+  maxLeverage: 1.0,
   enableRegimeOverlay: true,
   // OFF for production parity (2026-08-29 gate audit): risk-manager computes
   // volTargetLeverage and writes it to state, but portfolio-strategist never
@@ -249,11 +359,77 @@ export const DEFAULT_CONFIG: BacktestConfig = {
   regimeMinHistory: 200,
   unknownRegimeExposure: 1.0,
   useTotalReturn: true,
-  urgentDriftPct: appConfig.rebalance.urgentDriftThreshold,
+  urgentDriftPct: 25,
   modelCashFlowPath: true,
   exposureDeadBand: 0,       // churn guards default OFF — matches live today
   cashFlowRebuyGuardDays: 0,
 };
+
+/**
+ * The production knobs as of 2026-09-24, sanitised: switches and thresholds
+ * only, no account figures. Update it when the live `.env` changes — it is the
+ * one place a study learns what "live" means.
+ */
+export const LIVE_KNOBS = {
+  asOf: '2026-09-24',
+  OPTIMIZER: 'static',
+  ENABLE_REGIME: false,
+  REBALANCE_DRIFT_THRESHOLD: 10,
+  REBALANCE_URGENT_DRIFT_THRESHOLD: 25,
+  REBALANCE_FREQ_DAYS: 45,
+  REBALANCE_MIN_TRADE_USD: 200,
+  REBALANCE_CASH_BUFFER_PCT: 1,
+  REBALANCE_FILL_MODE: 'greedy',
+  REBALANCE_CASHFLOW_FILL_MODE: 'greedy',
+  CASH_FLOW_RESERVE_BASE: 500,
+  CASH_FLOW_REBUY_GUARD_DAYS: 30,
+  DD_WARNING: 7,
+  DD_DERISK: 15,
+  DD_HARD_STOP: 25,
+} as const;
+
+/** DEFAULT_CONFIG with the live knobs applied. Callers still supply `staticWeights`. */
+export const LIVE_CONFIG: BacktestConfig = {
+  ...DEFAULT_CONFIG,
+  name: `Live (${LIVE_KNOBS.asOf})`,
+  optimizerMethod: LIVE_KNOBS.OPTIMIZER,
+  enableRegimeOverlay: LIVE_KNOBS.ENABLE_REGIME,
+  rebalanceDriftPct: LIVE_KNOBS.REBALANCE_DRIFT_THRESHOLD,
+  urgentDriftPct: LIVE_KNOBS.REBALANCE_URGENT_DRIFT_THRESHOLD,
+  rebalanceFreqDays: LIVE_KNOBS.REBALANCE_FREQ_DAYS,
+  drawdownLimits: {
+    warningPct: LIVE_KNOBS.DD_WARNING,
+    deriskPct: LIVE_KNOBS.DD_DERISK,
+    hardStopPct: LIVE_KNOBS.DD_HARD_STOP,
+  },
+  minTradeUsd: LIVE_KNOBS.REBALANCE_MIN_TRADE_USD,
+  cashBufferPct: LIVE_KNOBS.REBALANCE_CASH_BUFFER_PCT,
+  fillMode: LIVE_KNOBS.REBALANCE_FILL_MODE,
+  cashFlowFillMode: LIVE_KNOBS.REBALANCE_CASHFLOW_FILL_MODE,
+  cashFlowReserveBase: LIVE_KNOBS.CASH_FLOW_RESERVE_BASE,
+  cashFlowRebuyGuardDays: LIVE_KNOBS.CASH_FLOW_REBUY_GUARD_DAYS,
+  fxDataFile: 'fx-audusd.json',
+};
+
+/**
+ * The earliest `startDate` runBacktest accepts for `config` — the end of its
+ * optimizer warm-up on the dataset it would load. For studies that used to pass
+ * the dataset's first day and rely on the (now removed) silent shift.
+ */
+export function firstUsableStart(config: BacktestConfig): string {
+  const allData = loadHistoricalData(config.dataFile);
+  const { dates } = buildDateIndex(allData, config.symbols ?? SYMBOLS);
+  if (dates.length <= config.lookbackDays) {
+    throw new Error(`dataset has ${dates.length} days, fewer than the ${config.lookbackDays}-day warm-up`);
+  }
+  return dates[config.lookbackDays];
+}
+
+/** `from`, or the first usable start if `from` falls inside the warm-up. */
+export function clampToWarmup(config: BacktestConfig, from: string): string {
+  const first = firstUsableStart(config);
+  return from < first ? first : from;
+}
 
 // ---------- Core Backtest ----------
 
@@ -264,6 +440,15 @@ export function runBacktest(
   startDate?: string,
   endDate?: string,
 ): BacktestResult {
+  if (config.cashFlowReserveBase !== undefined && !config.fxDataFile) {
+    throw new Error('cashFlowReserveBase is stated in AUD and needs fxDataFile to convert it — refusing to guess a rate');
+  }
+  if (config.dividendsFile && config.useTotalReturn) {
+    throw new Error('dividendsFile pays dividends as cash on raw closes; set useTotalReturn: false (one price basis)');
+  }
+  if (config.deposits?.length && !config.fxDataFile) {
+    throw new Error('deposits are stated in AUD and need fxDataFile to convert them');
+  }
   const allData = loadHistoricalData(config.dataFile);
   const symbols = config.symbols ?? SYMBOLS;
 
@@ -282,7 +467,16 @@ export function runBacktest(
   if (startDate) {
     const idx = dates.findIndex(x => x >= startDate); // first trading day on/after
     if (idx < 0 || dates[0] > startDate) throw outsideDataset('startDate', startDate);
-    startIdx = Math.max(idx, config.lookbackDays);
+    // A start inside the optimizer warm-up used to be moved silently to the end
+    // of it (2026-09-24 review, G5) — the same class of lie as the window
+    // fallback above: a "2024" study that actually began mid-2024.
+    if (idx < config.lookbackDays) {
+      throw new Error(
+        `startDate ${startDate} is inside the ${config.lookbackDays}-day warm-up of this dataset; ` +
+        `the first usable start is ${dates[config.lookbackDays]}. Start later, or use a longer dataFile.`,
+      );
+    }
+    startIdx = idx;
   }
   if (endDate) {
     if (endDate < dates[0] || endDate > dates[dates.length - 1]) throw outsideDataset('endDate', endDate);
@@ -291,10 +485,44 @@ export function runBacktest(
     endIdx = idx + 1;
   }
 
-  let positions: Position[] = initialPositions ? initialPositions.map(p => ({ ...p })) : [];
+  const fx = config.fxDataFile ? loadFxSeries(config.fxDataFile) : null;
+  const minTradeUsd = config.minTradeUsd ?? 50;
+
+  // Open FIFO lots per symbol, kept beside `positions` (whose avgCost is what
+  // the legacy engine always tracked). Lots drive the band gate's CGT guard.
+  const lots = new Map<string, OpenLot[]>();
+  const addLot = (sym: string, qty: number, cost: number, date: string): void => {
+    const l = lots.get(sym) ?? [];
+    l.push({ date, qty, cost });
+    lots.set(sym, l);
+  };
+  const consumeLots = (sym: string, qty: number): void => {
+    const l = lots.get(sym) ?? [];
+    let left = qty;
+    while (left > 0 && l.length > 0) {
+      const take = Math.min(left, l[0].qty);
+      l[0].qty -= take;
+      left -= take;
+      if (l[0].qty <= 0) l.shift();
+    }
+  };
+
+  const seedPositions: Position[] | undefined = config.initialLots
+    ? (() => {
+        const agg = new Map<string, { shares: number; cost: number }>();
+        for (const l of config.initialLots) {
+          const a = agg.get(l.symbol) ?? { shares: 0, cost: 0 };
+          a.shares += l.shares;
+          a.cost += l.shares * l.cost;
+          agg.set(l.symbol, a);
+        }
+        return [...agg.entries()].map(([symbol, a]) => ({ symbol, shares: a.shares, avgCost: a.shares > 0 ? a.cost / a.shares : 0 }));
+      })()
+    : initialPositions;
+  let positions: Position[] = seedPositions ? seedPositions.map(p => ({ ...p })) : [];
   let cash = startingCapital;
 
-  if (initialPositions && initialPositions.length > 0) {
+  if (seedPositions && seedPositions.length > 0) {
     const date0 = dates[startIdx];
     let posValue = 0;
     for (const p of positions) {
@@ -303,6 +531,25 @@ export function runBacktest(
     }
     cash = Math.max(0, startingCapital - posValue);
   }
+  if (config.initialLots) {
+    for (const l of [...config.initialLots].sort((a, b) => a.date.localeCompare(b.date))) addLot(l.symbol, l.shares, l.cost, l.date);
+  } else {
+    for (const p of positions) addLot(p.symbol, p.shares, p.avgCost, dates[startIdx]);
+  }
+
+  const commissionFor = (shares: number, price: number): number =>
+    config.commissionModel === 'ibkr-fixed'
+      ? Math.min(Math.max(1.0, 0.005 * shares), 0.01 * shares * price)
+      : config.commissionPerTrade;
+  const divs = config.dividendsFile ? loadDividends(config.dividendsFile) : null;
+  const wht = config.dividendWithholding ?? 0.15;
+  const dividendsPaid: BacktestResult['dividends'] = [];
+  const flowsApplied: BacktestResult['flows'] = [];
+  const dailyDates: string[] = [];
+  const decisionCounts: Record<string, number> = {};
+  const missed = config.missedRunRate && config.missedRunRate > 0 ? prng(config.missedRunSeed ?? 1) : null;
+  let missedRunDays = 0;
+  const bandParams = config.bandParams ?? PLAN_BANDS;
 
   const trades: TradeRecord[] = [];
   const dailyValues: number[] = [];
@@ -345,12 +592,40 @@ export function runBacktest(
       prices.set(s, getPrice(allData, s, symbolDateMap.get(s)!, date, config.useTotalReturn));
     }
 
+    // G4: cash dividends on their ex-date, net of withholding, on shares held
+    // going into the day.
+    if (divs) {
+      for (const pos of positions) {
+        const amt = divs.get(pos.symbol)?.get(date);
+        if (amt && pos.shares > 0) {
+          const gross = pos.shares * amt;
+          cash += gross * (1 - wht);
+          dividendsPaid.push({ date, symbol: pos.symbol, grossUsd: gross, withheldUsd: gross * wht });
+        }
+      }
+    }
+    // G3: capital flows dated after the previous day, up to and including today.
+    let flowUsd = 0;
+    if (config.deposits?.length && fx) {
+      const prevDate = dayIdx > startIdx ? dates[dayIdx - 1] : date;
+      for (const d of config.deposits) {
+        if (d.date > prevDate && d.date <= date) {
+          const usd = d.amountAud / fxOn(fx, date);
+          flowUsd += usd;
+          flowsApplied.push({ date, amountAud: d.amountAud, amountUsd: usd });
+        }
+      }
+      cash += flowUsd;
+    }
+
     const nav = portfolioValue(positions, prices, cash);
     dailyValues.push(nav);
+    dailyDates.push(date);
 
     if (dailyValues.length > 1) {
       const prev = dailyValues[dailyValues.length - 2];
-      dailyReturnsList.push(prev > 0 ? (nav - prev) / prev : 0);
+      // Flow-adjusted: a deposit is not a return.
+      dailyReturnsList.push(prev > 0 ? (nav - flowUsd - prev) / prev : 0);
     }
 
     peakValue = Math.max(peakValue, nav);
@@ -365,12 +640,20 @@ export function runBacktest(
           const fillPrice = price * (1 + config.slippagePctPerSide);
           const shares = Math.floor(perStock / fillPrice);
           if (shares > 0) {
+            const commission = commissionFor(shares, fillPrice);
             positions.push({ symbol: s, shares, avgCost: fillPrice });
-            cash -= shares * fillPrice + config.commissionPerTrade;
-            trades.push({ day: dayIdx, date, symbol: s, action: 'BUY', shares, price: fillPrice, commission: config.commissionPerTrade, reason: 'Initial equal-weight buy' });
+            addLot(s, shares, fillPrice, date);
+            cash -= shares * fillPrice + commission;
+            trades.push({ day: dayIdx, date, symbol: s, action: 'BUY', shares, price: fillPrice, commission, reason: 'Initial equal-weight buy' });
           }
         }
       }
+      continue;
+    }
+
+    // G3: a day the strategist did not run (host down, gateway logged out).
+    if (missed && missed() < (config.missedRunRate ?? 0)) {
+      missedRunDays++;
       continue;
     }
 
@@ -477,12 +760,105 @@ export function runBacktest(
 
     const snapshot: PortfolioSnapshot = { symbols: optimSymbols, prices, currentShares, nav, cash, peakNav: peakValue };
 
+    const dateMs = new Date(`${date}T20:00:00Z`).getTime();
+    const daysSince = (dateMs - lastRebalanceMs) / 86400000;
+
+    const executeBuy = (symbol: string, shares: number, reason: string): boolean => {
+      const price = (prices.get(symbol) ?? 0) * (1 + config.slippagePctPerSide);
+      const commission = commissionFor(shares, price);
+      const cost = shares * price + commission;
+      if (shares <= 0 || cost > cash) return false;
+      cash -= cost;
+      const existing = positions.find(p => p.symbol === symbol);
+      if (existing) {
+        const totalCost = existing.avgCost * existing.shares + price * shares;
+        existing.shares += shares;
+        existing.avgCost = totalCost / existing.shares;
+      } else {
+        positions.push({ symbol, shares, avgCost: price });
+      }
+      addLot(symbol, shares, price, date);
+      trades.push({ day: dayIdx, date, symbol, action: 'BUY', shares, price, commission, reason });
+      return true;
+    };
+    const executeSell = (symbol: string, shares: number, reason: string): boolean => {
+      const price = (prices.get(symbol) ?? 0) * (1 - config.slippagePctPerSide);
+      const pos = positions.find(p => p.symbol === symbol);
+      if (!pos || pos.shares < shares) return false;
+      const commission = commissionFor(shares, price);
+      pos.shares -= shares;
+      consumeLots(symbol, shares);
+      lastSellMs.set(symbol, dateMs);
+      cash += shares * price - commission;
+      trades.push({ day: dayIdx, date, symbol, action: 'SELL', shares, price, commission, reason });
+      return true;
+    };
+    const recentlySold = (): Set<string> => {
+      const guardMs = config.cashFlowRebuyGuardDays * 86400000;
+      const exclude = new Set<string>();
+      if (guardMs > 0) {
+        for (const [sym, ms] of lastSellMs) {
+          if (dateMs - ms <= guardMs) exclude.add(sym);
+        }
+      }
+      return exclude;
+    };
+    // Production's buy-only cash-flow deployment. It does NOT reset the
+    // rebalance cooldown (a cash deployment must never silence the only
+    // mechanism that can SELL an overweight).
+    const cashFlow = (extraExclude: ReadonlySet<string>, minDeficitShareFraction: number): void => {
+      const CASH_THRESHOLD = config.cashFlowReserveBase !== undefined && fx
+        ? config.cashFlowReserveBase / fxOn(fx, date)
+        : (config.cashFlowReserveUsd ?? 1000);
+      if (!config.modelCashFlowPath || cash <= CASH_THRESHOLD) return;
+      const holdings = optimSymbols.map((s, i) => ({
+        symbol: s,
+        currentValue: (currentShares.get(s) ?? 0) * (prices.get(s) ?? 0),
+        targetPct: adjustedWeights[i] * 100,
+      }));
+      // Rebuy guard (guard B): don't redeploy into names we just sold
+      const exclude = recentlySold();
+      for (const s of extraExclude) exclude.add(s);
+      const cashOrders = allocateCashFlow(
+        holdings, cash - CASH_THRESHOLD, 100, prices, exclude, config.cashFlowFillMode ?? 'proportional',
+        minDeficitShareFraction,
+      );
+      for (const o of cashOrders) executeBuy(o.symbol, o.shares, 'cash_flow_rebalance');
+    };
+
+    if (config.gate === 'bands') {
+      // F1 in the engine: the same pure functions the strategist runs under
+      // DRIFT_GATE=bands, including its cash-flow refinements.
+      const assessment = assessBands(snapshot, targetWeightMap, bandParams);
+      const bandDecision = positions.length === 0 ? 'regular' : decideBands(assessment, daysSince, config.rebalanceFreqDays);
+      decisionCounts[bandDecision] = (decisionCounts[bandDecision] ?? 0) + 1;
+      if (bandDecision === 'within-threshold') { cashFlow(new Set(), 0.5); continue; }
+      if (bandDecision === 'too-soon') {
+        cashFlow(new Set(assessment.names.filter(x => x.dev > 0).map(x => x.symbol)), 0.5);
+        continue;
+      }
+      const bandOrders = generateBandOrders(snapshot, assessment, {
+        decision: bandDecision,
+        params: bandParams,
+        minTradeUsd,
+        cashBufferPct: config.cashBufferPct ?? 0,
+        lots,
+        today: date,
+        excludeBuys: recentlySold(),
+      });
+      let sold = false;
+      for (const o of bandOrders.orders.filter(x => x.action === 'SELL')) sold = executeSell(o.symbol, o.shares, o.reason) || sold;
+      for (const o of bandOrders.orders.filter(x => x.action === 'BUY')) executeBuy(o.symbol, o.shares, o.reason);
+      if (sold) lastRebalanceMs = dateMs; // the cooldown is a SELL cooldown
+      if (bandOrders.orders.length > 0) rebalanceCount++;
+      positions = positions.filter(p => p.shares > 0);
+      continue;
+    }
+
     // Use shared drift calculation and the PRODUCTION gate. An empty book is
     // the backtest bootstrap (production seeds real positions), so day one
     // deploys unconditionally.
     const drift = computeDrift(snapshot, targetWeightMap);
-    const dateMs = new Date(`${date}T20:00:00Z`).getTime();
-    const daysSince = (dateMs - lastRebalanceMs) / 86400000;
     const decision = positions.length === 0
       ? 'regular'
       : decideRebalance(drift, daysSince, {
@@ -490,49 +866,19 @@ export function runBacktest(
           urgentDriftThreshold: config.urgentDriftPct,
           frequencyDays: config.rebalanceFreqDays,
         });
+    decisionCounts[decision] = (decisionCounts[decision] ?? 0) + 1;
 
     if (decision === 'within-threshold') {
-      // Production deploys idle cash buy-only into underweights here, and it
-      // does NOT reset the rebalance cooldown (a cash deployment must never
-      // silence the only mechanism that can SELL an overweight).
-      const CASH_THRESHOLD = 1000;
-      if (config.modelCashFlowPath && cash > CASH_THRESHOLD) {
-        const holdings = optimSymbols.map((s, i) => ({
-          symbol: s,
-          currentValue: (currentShares.get(s) ?? 0) * (prices.get(s) ?? 0),
-          targetPct: adjustedWeights[i] * 100,
-        }));
-        // Rebuy guard (guard B): don't redeploy into names we just sold
-        const guardMs = config.cashFlowRebuyGuardDays * 86400000;
-        const exclude = new Set<string>();
-        if (guardMs > 0) {
-          for (const [sym, ms] of lastSellMs) {
-            if (dateMs - ms <= guardMs) exclude.add(sym);
-          }
-        }
-        const cashOrders = allocateCashFlow(holdings, cash - CASH_THRESHOLD, 100, prices, exclude);
-        for (const o of cashOrders) {
-          const price = (prices.get(o.symbol) ?? 0) * (1 + config.slippagePctPerSide);
-          const cost = o.shares * price + config.commissionPerTrade;
-          if (o.shares <= 0 || cost > cash) continue;
-          cash -= cost;
-          const existing = positions.find(p => p.symbol === o.symbol);
-          if (existing) {
-            const totalCost = existing.avgCost * existing.shares + price * o.shares;
-            existing.shares += o.shares;
-            existing.avgCost = totalCost / existing.shares;
-          } else {
-            positions.push({ symbol: o.symbol, shares: o.shares, avgCost: price });
-          }
-          trades.push({ day: dayIdx, date, symbol: o.symbol, action: 'BUY', shares: o.shares, price, commission: config.commissionPerTrade, reason: 'cash_flow_rebalance' });
-        }
-      }
+      cashFlow(new Set(), 0);
       continue;
     }
     if (decision === 'too-soon') continue;
 
     // 'urgent' or 'regular' — full rebalance
-    const rebalOrders = generateRebalanceOrders(snapshot, targetWeightMap, weightSource, 50);
+    const rebalOrders = generateRebalanceOrders(snapshot, targetWeightMap, weightSource, minTradeUsd, {
+      cashBufferPct: config.cashBufferPct ?? 0,
+      fillMode: config.fillMode ?? 'proportional',
+    });
     if (rebalOrders.length === 0) continue;
 
     lastRebalanceMs = dateMs;
@@ -540,31 +886,8 @@ export function runBacktest(
 
     // Execute orders (sells first, then buys — generateRebalanceOrders already sorts this way)
     for (const order of rebalOrders) {
-      const mid = prices.get(order.symbol) ?? 0;
-      if (order.action === 'SELL') {
-        const price = mid * (1 - config.slippagePctPerSide);
-        const pos = positions.find(p => p.symbol === order.symbol);
-        if (pos && pos.shares >= order.shares) {
-          pos.shares -= order.shares;
-          lastSellMs.set(order.symbol, dateMs);
-          cash += order.shares * price - config.commissionPerTrade;
-          trades.push({ day: dayIdx, date, symbol: order.symbol, action: 'SELL', shares: order.shares, price, commission: config.commissionPerTrade, reason: order.reason });
-        }
-      } else {
-        const price = mid * (1 + config.slippagePctPerSide);
-        const cost = order.shares * price + config.commissionPerTrade;
-        if (cost > cash) continue;
-        cash -= cost;
-        const existing = positions.find(p => p.symbol === order.symbol);
-        if (existing) {
-          const totalCost = existing.avgCost * existing.shares + price * order.shares;
-          existing.shares += order.shares;
-          existing.avgCost = totalCost / existing.shares;
-        } else {
-          positions.push({ symbol: order.symbol, shares: order.shares, avgCost: price });
-        }
-        trades.push({ day: dayIdx, date, symbol: order.symbol, action: 'BUY', shares: order.shares, price, commission: config.commissionPerTrade, reason: order.reason });
-      }
+      if (order.action === 'SELL') executeSell(order.symbol, order.shares, order.reason);
+      else executeBuy(order.symbol, order.shares, order.reason);
     }
     positions = positions.filter(p => p.shares > 0);
   }
@@ -578,6 +901,7 @@ export function runBacktest(
   }
   const finalNav = portfolioValue(positions, finalPrices, cash);
   dailyValues.push(finalNav);
+  dailyDates.push(finalDate);
 
   const totalReturn = ((finalNav - startingCapital) / startingCapital) * 100;
   const years = (endIdx - startIdx) / 252;
@@ -608,6 +932,12 @@ export function runBacktest(
     dailyReturns: dailyReturnsList, finalPositions: positions,
     var95: Math.round(var95 * 100) / 100,
     cvar95: Math.round(cvar95 * 100) / 100,
+    dailyDates,
+    dividends: dividendsPaid,
+    flows: flowsApplied,
+    missedRunDays,
+    decisionCounts,
+    finalLots: Object.fromEntries([...lots.entries()].filter(([, l]) => l.length > 0)),
   };
 }
 

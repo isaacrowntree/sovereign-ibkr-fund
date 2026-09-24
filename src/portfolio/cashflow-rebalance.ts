@@ -31,6 +31,63 @@ export function recentlySoldSymbols(
 }
 
 /**
+ * Target the strategy sold a name DOWN TO, read back from the sale's reason:
+ *   legacy  "rebalance: 9.1% → 7.0% (static)…"          → 7.0
+ *   bands   "bands: 9.1% → 7.5% (target 7.0%, band…)"  → 7.0
+ * null when the reason is not one the strategist writes (manual, reconciled).
+ */
+export function saleTargetPct(reason: string | undefined): number | null {
+  if (!reason) return null;
+  const bands = /^bands[^:]*:.*\(target (\d+(?:\.\d+)?)%/.exec(reason);
+  if (bands) return parseFloat(bands[1]);
+  const legacy = /^rebalance: [\d.]+% → (\d+(?:\.\d+)?)%/.exec(reason);
+  return legacy ? parseFloat(legacy[1]) : null;
+}
+
+/**
+ * Target-aware rebuy guard (2026-09-24 review, F3; DRIFT_GATE=bands).
+ *
+ * The guard exists so a sale the strategy made is not undone by the buy-only
+ * cash-flow path days later. But it excluded the name for the whole window
+ * even when the MODEL had since changed its mind — a reweight that raises a
+ * target left the name stuck underweight for up to 30 days for no reason. Now
+ * a recent sale excludes its name only while it still agrees with the current
+ * target: the target has not been raised above what the sale aimed at
+ * (0.25pp tolerance for rounding in the logged reason). A sale whose reason
+ * cannot be read keeps the old, conservative behaviour.
+ */
+export function rebuyGuardExclusions(
+  trades: ReadonlyArray<{ symbol: string; action: 'BUY' | 'SELL'; timestamp: string; reason?: string }>,
+  guardDays: number,
+  currentTargetPct: ReadonlyMap<string, number>,
+  nowMs: number = Date.now(),
+): { excluded: Set<string>; lifted: Array<{ symbol: string; soldTo: number; targetNow: number }> } {
+  const excluded = new Set<string>();
+  const lifted: Array<{ symbol: string; soldTo: number; targetNow: number }> = [];
+  if (guardDays <= 0) return { excluded, lifted };
+  const cutoff = nowMs - guardDays * 24 * 60 * 60 * 1000;
+  // Latest qualifying sale per name decides.
+  const latest = new Map<string, { ts: number; reason?: string }>();
+  for (const t of trades) {
+    if (t.action !== 'SELL') continue;
+    const ts = new Date(t.timestamp).getTime();
+    if (!Number.isFinite(ts) || ts < cutoff || ts > nowMs) continue;
+    const prev = latest.get(t.symbol);
+    if (!prev || ts > prev.ts) latest.set(t.symbol, { ts, reason: t.reason });
+  }
+  for (const [symbol, sale] of latest) {
+    const soldTo = saleTargetPct(sale.reason);
+    const targetNow = currentTargetPct.get(symbol);
+    if (soldTo !== null && targetNow !== undefined && targetNow > soldTo + 0.25) {
+      lifted.push({ symbol, soldTo, targetNow });
+      continue;
+    }
+    excluded.add(symbol);
+  }
+  return { excluded, lifted };
+}
+
+/**
  * Allocate a cash deposit across holdings to move toward target weights.
  * Only buys underweight assets; never sells.
  */
@@ -69,6 +126,13 @@ export function allocateCashFlow(
    * behaviour; enabling greedy is a deliberate operator decision.
    */
   fillMode: 'proportional' | 'greedy' = 'proportional',
+  /**
+   * Greedy only (F4, DRIFT_GATE=bands): buy a share of a name only while its
+   * remaining deficit is at least this fraction of the share price. 0 (legacy)
+   * lets a $10 deficit buy a $1,000 share — a $990 overweight the next band
+   * check may trim. 0.5 rounds to the nearest share instead of always up.
+   */
+  minDeficitShareFraction = 0,
 ): CashFlowOrder[] {
   if (depositUsd < 0) {
     throw new Error('Deposit must be non-negative');
@@ -99,7 +163,7 @@ export function allocateCashFlow(
     ? Math.min(depositUsd, totalDeficit)
     : depositUsd;
 
-  if (fillMode === 'greedy') return greedyFill(deficits, deployable, prices);
+  if (fillMode === 'greedy') return greedyFill(deficits, deployable, prices, minDeficitShareFraction);
 
   // Allocate deposit proportionally to deficits
   const orders: CashFlowOrder[] = [];
@@ -141,6 +205,7 @@ function greedyFill(
   deficits: { symbol: string; deficit: number }[],
   budgetUsd: number,
   prices: Map<string, number>,
+  minDeficitShareFraction = 0,
 ): CashFlowOrder[] {
   const remaining = new Map(deficits.map((d) => [d.symbol, d.deficit]));
   const shares = new Map<string, number>();
@@ -152,7 +217,7 @@ function greedyFill(
     for (const [symbol, deficit] of remaining) {
       const price = prices.get(symbol);
       if (!price || price <= 0) continue;
-      if (deficit > 0 && price <= budget && deficit > bestDeficit) {
+      if (deficit > 0 && deficit >= price * minDeficitShareFraction && price <= budget && deficit > bestDeficit) {
         bestDeficit = deficit;
         best = symbol;
       }

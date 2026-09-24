@@ -93,9 +93,58 @@ async function fetchYahoo(symbol: string): Promise<DailyBar[]> {
   return bars;
 }
 
+/**
+ * The inputs a LIVE-path study needs besides prices (2026-09-24 review, G3/G4):
+ *   fx-audusd.json — { "YYYY-MM-DD": AUD per 1 USD }, from Yahoo's AUDUSD=X.
+ *   dividends.json — { SYMBOL: [{ date: ex-date, amount: USD/share }] }, the
+ *     split-adjusted cash dividends, so a study can pay them as cash (net of
+ *     withholding) instead of reinvesting them through adjusted closes.
+ * Run with FETCH_EXTRAS=1 (and FETCH_START for the window); FETCH_SYMBOLS
+ * overrides the universe for the dividend pull.
+ */
+async function fetchExtras(dataDir: string): Promise<void> {
+  const period1 = Math.floor(START_DATE.getTime() / 1000);
+  const period2 = Math.floor(END_DATE.getTime() / 1000);
+  const get = async (symbol: string, extra = ''): Promise<any> => {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?period1=${period1}&period2=${period2}&interval=1d${extra}`;
+    const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' } });
+    if (!res.ok) throw new Error(`Yahoo Finance returned ${res.status} for ${symbol}`);
+    const r = ((await res.json()) as any).chart?.result?.[0];
+    if (!r) throw new Error(`No data for ${symbol}`);
+    return r;
+  };
+
+  const fxRaw = await get('AUDUSD=X');
+  const fx: Record<string, number> = {};
+  fxRaw.timestamp.forEach((t: number, i: number) => {
+    const usdPerAud = fxRaw.indicators?.quote?.[0]?.close?.[i];
+    if (typeof usdPerAud === 'number' && usdPerAud > 0) {
+      fx[new Date(t * 1000).toISOString().slice(0, 10)] = Math.round((1 / usdPerAud) * 1e6) / 1e6;
+    }
+  });
+  writeFileSync(resolve(dataDir, 'fx-audusd.json'), JSON.stringify(fx));
+  console.log(`fx-audusd.json: ${Object.keys(fx).length} days`);
+
+  const universe = process.env.FETCH_SYMBOLS ? process.env.FETCH_SYMBOLS.split(',') : SYMBOLS;
+  const divs: Record<string, Array<{ date: string; amount: number }>> = {};
+  for (const symbol of universe) {
+    const r = await get(symbol, '&events=div');
+    divs[symbol] = Object.values((r.events?.dividends ?? {}) as Record<string, { amount: number; date: number }>)
+      .map(d => ({ date: new Date(d.date * 1000).toISOString().slice(0, 10), amount: d.amount }))
+      .sort((a, b) => a.date.localeCompare(b.date));
+    console.log(`  ${symbol}: ${divs[symbol].length} dividends`);
+    await new Promise(res => setTimeout(res, 300));
+  }
+  writeFileSync(resolve(dataDir, 'dividends.json'), JSON.stringify(divs));
+}
+
 async function main() {
   const dataDir = resolve(__dirname, 'data');
   mkdirSync(dataDir, { recursive: true });
+  if (process.env.FETCH_EXTRAS === '1') {
+    await fetchExtras(dataDir);
+    return;
+  }
 
   const allData: Record<string, DailyBar[]> = {};
 

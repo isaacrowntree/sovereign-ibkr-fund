@@ -19,7 +19,7 @@
  * The overlay is OFF throughout, deliberately: this isolates the structural
  * effect from the timing effect rather than confounding the two.
  */
-import { runBacktest, DEFAULT_CONFIG, loadHistoricalData, type BacktestConfig, type Position } from '../src/validation/backtest-engine.js';
+import { runBacktest, clampToWarmup, DEFAULT_CONFIG, loadHistoricalData, type BacktestConfig, type Position } from '../src/validation/backtest-engine.js';
 import { toTradeRecords, evaluateAfterTax } from '../src/validation/after-tax.js';
 import { TARGET_PORTFOLIO } from '../src/config.js';
 
@@ -61,7 +61,7 @@ function run(label: string, from: string, to: string) {
       optimizerMethod: 'static', staticWeights: weightsFor(h),
       rebalanceDriftPct: 10, rebalanceFreqDays: 45, enableRegimeOverlay: false,
     };
-    const r = runBacktest(cfg, CAPITAL, positions, from, to);
+    const r = runBacktest(cfg, CAPITAL, positions, clampToWarmup(cfg, from), to);
     const recs = toTradeRecords(r, opening, `${from}T20:00:00Z`);
     const t = evaluateAfterTax(r, recs, RATE);
     const liq = [...recs];

@@ -130,6 +130,18 @@ export function nyseSession(date: string): NyseSession {
   return { kind: 'regular', closeMinutes: REGULAR_CLOSE_MINS };
 }
 
+/**
+ * Close of the regular session on an ET date, in minutes after midnight ET, or
+ * null when the market does not open. The shape `latestSession` takes, so the
+ * intraday drawdown window follows holidays and early closes.
+ */
+export function nyseCloseMinutes(date: string, env: NodeJS.ProcessEnv = process.env): number | null {
+  const s = nyseSession(date);
+  if (s.kind === 'weekend' || s.kind === 'holiday') return null;
+  if (s.kind === 'unknown') return calendarFailOpen(env) ? REGULAR_CLOSE_MINS : null;
+  return s.closeMinutes ?? REGULAR_CLOSE_MINS;
+}
+
 /** CALENDAR_FAIL_OPEN, default on: an uncovered weekday trades as a regular session. */
 export function calendarFailOpen(env: NodeJS.ProcessEnv = process.env): boolean {
   const v = (env.CALENDAR_FAIL_OPEN ?? '').trim().toLowerCase();

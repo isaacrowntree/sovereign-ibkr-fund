@@ -166,4 +166,20 @@ describe('ledoitWolfShrinkage', () => {
       expect(shrunk[i][i]).toBeLessThanOrEqual(hi + 1e-12);
     }
   });
+
+  it('NaN guard: a non-finite return yields "no estimate", not a NaN matrix', () => {
+    expect(ledoitWolfShrinkage([[0.01, NaN, 0.02], [0.01, 0.02, 0.03]]).shrunk).toEqual([]);
+    expect(ledoitWolfShrinkage([[0.01, Infinity, 0.02], [0.01, 0.02, 0.03]]).shrunk).toEqual([]);
+  });
+
+  it('NaN guard: ragged rows are refused rather than read past their end', () => {
+    expect(ledoitWolfShrinkage([[0.01, 0.02, 0.03], [0.01, 0.02]]).shrunk).toEqual([]);
+  });
+
+  it('NaN guard: a sample that already equals the target (0/0 intensity) stays finite', () => {
+    // Two identical flat series: sample = 0 = target, gammaSum = 0.
+    const { shrunk, shrinkageIntensity } = ledoitWolfShrinkage([[0, 0, 0, 0], [0, 0, 0, 0]]);
+    expect(shrinkageIntensity).toBe(0);
+    expect(shrunk.flat().every(Number.isFinite)).toBe(true);
+  });
 });

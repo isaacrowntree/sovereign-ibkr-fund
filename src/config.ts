@@ -91,6 +91,11 @@ export const config = {
      * generation; enabling it is an operator decision.
      */
     cashFlowFillMode: (process.env.REBALANCE_CASHFLOW_FILL_MODE || 'proportional') as 'greedy' | 'proportional',
+    /**
+     * Alert when non-USD cash (an unconverted AUD deposit) exceeds this many
+     * units of base currency (2026-09-24 review, F4). Alert only.
+     */
+    unconvertedBaseAlert: parseFloat(process.env.UNCONVERTED_BASE_ALERT || '1000'),
   },
   execution: {
     /**
