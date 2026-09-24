@@ -911,3 +911,19 @@ describe('executeQueue — run budget', () => {
     expect(outcome.stoppedReason).toBeDefined();
   });
 });
+
+describe('executeQueue — a refused confirmation prompt', () => {
+  it('keeps the order queued (it never reached IBKR), halts, and raises an anomaly', async () => {
+    const { deps, calls } = makeDeps();
+    deps.placeOrder = async (o) => {
+      calls.push(`place:${o.action}:${o.symbol}`);
+      throw Object.assign(new Error(`order for ${o.symbol} not placed — prompt refused`), { notPlaced: true });
+    };
+    const outcome = await executeQueue(MIXED_QUEUE, ctx(), deps);
+    expect(calls.filter(c => c.startsWith('place:'))).toEqual(['place:SELL:BRK-B']);
+    expect(outcome.halted).toBe(true);
+    expect(outcome.haltReason).toMatch(/confirmation prompt refused/);
+    expect(outcome.requeue.map(o => o.symbol)).toEqual(['BRK-B', 'NET', 'AVGO', 'GLD']);
+    expect(outcome.anomalies).toEqual([expect.objectContaining({ kind: 'order-refused', symbol: 'BRK-B' })]);
+  });
+});

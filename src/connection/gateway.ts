@@ -80,14 +80,30 @@ export interface TradeResult {
   commission?: number;
   commissionCurrency?: string;
   executions?: ExecutionDetail[];
+  /** Confirmation prompts IBKR raised on the way to accepting the order. */
+  replies?: OrderReply[];
 }
 
 // ---------- Internal helpers ----------
 
-class GatewayError extends Error {
+export class GatewayError extends Error {
   constructor(message: string, readonly status?: number, readonly body?: string) {
     super(message);
     this.name = 'GatewayError';
+  }
+}
+
+/**
+ * The order provably never reached IBKR as a live order — a confirmation
+ * prompt was refused, so the order died unconfirmed. Safe to keep queued; a
+ * placement error WITHOUT this marker may have landed and must be treated as
+ * ambiguous.
+ */
+export class OrderNotPlacedError extends GatewayError {
+  readonly notPlaced = true as const;
+  constructor(message: string, readonly replies: OrderReply[]) {
+    super(message);
+    this.name = 'OrderNotPlacedError';
   }
 }
 
@@ -598,12 +614,72 @@ interface SubmitOrderResponse {
   id?: string;
   /** Confirmation/warning text accompanying a reply. */
   message?: string[];
+  /** Stable ids of the prompts in `message` (e.g. `o163`). */
+  messageIds?: string[];
   /** Rejection reason. */
   error?: string;
 }
 
 /** Max chained confirmation replies to answer before giving up. */
 const MAX_ORDER_REPLIES = 10;
+
+/**
+ * Which order-confirmation prompts may be answered "yes" automatically.
+ *
+ * Every prompt used to be confirmed blind. Most are harmless ("this is a
+ * market order", "price exceeds the percentage constraint"), but the same
+ * mechanism carries the ones that mean stop: a trading-permission or
+ * account-restriction warning, a cash shortfall, a price far from the market.
+ * IBKR tags each with `messageIds` (e.g. `o163`), stable across the text.
+ *
+ * REPLY_POLICY=log (default) confirms as before and records what enforce
+ * would have done, so the real ids can be gathered before anything is
+ * refused. REPLY_POLICY=enforce confirms only allowlisted ids; a denied,
+ * unknown or missing id is not confirmed, which leaves the order unplaced.
+ * REPLY_ALLOW_IDS adds ids (comma-separated) — the Market Order Confirmation
+ * id once the log has shown it.
+ */
+export const REPLY_ALLOW_IDS = ['o10151', 'o10153'];
+export const REPLY_DENY_IDS = ['o354', 'o383', 'o451', 'o163', 'o403', 'o2137'];
+
+export type ReplyPolicy = 'log' | 'enforce';
+
+export function replyPolicy(env: NodeJS.ProcessEnv = process.env): ReplyPolicy {
+  return (env.REPLY_POLICY ?? '').trim().toLowerCase() === 'enforce' ? 'enforce' : 'log';
+}
+
+export interface OrderReply {
+  /** CPAPI reply id (the /iserver/reply/{id} path segment). */
+  id: string;
+  messageIds: string[];
+  /** Full prompt text, HTML stripped. */
+  text: string;
+  /** Would the allowlist confirm this? Null when it would; the reason when not. */
+  refusal: string | null;
+  /** What was actually done with it. */
+  decision: 'confirmed' | 'refused';
+  at: string;
+}
+
+/** Allowlist verdict for a prompt's message ids: null = confirm, else why not. Pure. */
+export function evaluateReply(messageIds: string[], env: NodeJS.ProcessEnv = process.env): string | null {
+  const extra = (env.REPLY_ALLOW_IDS ?? '').split(',').map(s => s.trim()).filter(Boolean);
+  const allow = new Set([...REPLY_ALLOW_IDS, ...extra]);
+  const deny = new Set(REPLY_DENY_IDS);
+  if (messageIds.length === 0) return 'prompt carries no messageIds';
+  const denied = messageIds.filter(id => deny.has(id));
+  if (denied.length) return `denied prompt id(s) ${denied.join(', ')}`;
+  const unknown = messageIds.filter(id => !allow.has(id));
+  if (unknown.length) return `unknown prompt id(s) ${unknown.join(', ')}`;
+  return null;
+}
+
+const promptText = (r: SubmitOrderResponse): string =>
+  (Array.isArray(r.message) ? r.message : r.message ? [String(r.message)] : [])
+    .join(' ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 
 async function submitOrder(
   conid: number,
@@ -638,13 +714,31 @@ async function submitOrder(
   // { confirmed: true } via /iserver/reply/{id}; the response is either the
   // next reply in the chain or the final order carrying an order_id. Without
   // this, the very first order of a session never gets an id.
-  let replies = 0;
+  const policy = replyPolicy();
+  const replies: OrderReply[] = [];
   while (first && first.id && first.order_id == null && first.orderId == null && !first.error) {
-    if (replies >= MAX_ORDER_REPLIES) {
+    if (replies.length >= MAX_ORDER_REPLIES) {
       throw new GatewayError(`order for ${symbol} stuck in confirmation replies (>${MAX_ORDER_REPLIES})`);
     }
-    replies += 1;
-    log(`Confirming order warning for ${symbol} (reply ${replies}): ${(first.message ?? []).join(' ').replace(/<[^>]+>/g, '').slice(0, 80)}…`);
+    const messageIds = Array.isArray(first.messageIds) ? first.messageIds.map(String) : [];
+    const text = promptText(first);
+    const refusal = evaluateReply(messageIds);
+    const refuse = refusal !== null && policy === 'enforce';
+    replies.push({
+      id: String(first.id), messageIds, text, refusal,
+      decision: refuse ? 'refused' : 'confirmed', at: new Date().toISOString(),
+    });
+    if (refuse) {
+      // Not answering is how an order is declined: it never goes live.
+      throw new OrderNotPlacedError(
+        `order for ${symbol} not placed — confirmation prompt refused (${refusal}): ${text.slice(0, 200)}`,
+        replies,
+      );
+    }
+    log(
+      `Confirming order prompt for ${symbol} (reply ${replies.length}, ids ${messageIds.join(',') || 'none'}): ` +
+        `${text.slice(0, 120)}${refusal ? ` — REPLY_POLICY=log; enforce would refuse: ${refusal}` : ''}`,
+    );
     responses = await bezantFetch<SubmitOrderResponse[]>(
       `/v1/api/iserver/reply/${first.id}`,
       { method: 'POST', body: JSON.stringify({ confirmed: true }) },
@@ -662,6 +756,7 @@ async function submitOrder(
     action,
     qty,
     status: (first.order_status ?? first.status ?? 'Submitted') as string,
+    ...(replies.length ? { replies } : {}),
   };
 }
 

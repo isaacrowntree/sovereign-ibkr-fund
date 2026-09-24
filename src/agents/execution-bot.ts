@@ -22,6 +22,7 @@ import {
   placeMidpriceOrder,
   type TradeResult,
   type AdaptivePriority,
+  type OrderReply,
 } from '../connection/gateway.js';
 import { executeQueue, type ExecutorDeps } from '../execution/executor.js';
 import { reconcileExecutions } from '../execution/reconcile.js';
@@ -73,7 +74,9 @@ async function reportRun(outcome: ExecutionOutcome, runAt: string): Promise<void
           ? `Ledger diverged from IBKR — ${a.symbol}`
           : a.kind === 'stream-silent'
             ? 'Order event stream is silent — fills confirmed from executions instead'
-            : `Fill recovered from IBKR — ${a.symbol}`,
+            : a.kind === 'order-refused'
+              ? `Order not placed — IBKR confirmation prompt refused (${a.symbol})`
+              : `Fill recovered from IBKR — ${a.symbol}`,
         body: a.detail,
         fields: [
           { label: 'Symbol', value: a.symbol },
@@ -229,6 +232,26 @@ function watchForShutdown(): void {
   process.on('unhandledRejection', (r) => {
     logError(`Unhandled rejection during "${runPhase?.phase ?? 'unknown'}"`, r, AGENT);
   });
+}
+
+/** Most recent confirmation prompts kept in state (`orderReplyLog`). */
+const REPLY_LOG_CAP = 200;
+
+/**
+ * Keep every confirmation prompt IBKR raised, with its ids and full text. This
+ * is what REPLY_POLICY=log exists for: a couple of weeks of real prompts is how
+ * the allowlist gets its missing ids before REPLY_POLICY=enforce.
+ */
+function recordReplies(order: StagedOrder, replies: OrderReply[] | undefined): void {
+  if (!replies?.length) return;
+  try {
+    const prior = loadStateKey('orderReplyLog');
+    const kept = Array.isArray(prior) ? prior : [];
+    const rows = replies.map(r => ({ ...r, symbol: order.symbol, action: order.action }));
+    mergeState({ orderReplyLog: [...kept, ...rows].slice(-REPLY_LOG_CAP) });
+  } catch (e) {
+    logError('Could not record order confirmation prompts', e, AGENT);
+  }
 }
 
 async function placeOrder(
@@ -657,7 +680,16 @@ async function run(): Promise<void> {
     if (regime === 'unknown') log(`Regime unknown (${String(rawRegime)}) — using Patient urgency`, AGENT);
 
     const deps: ExecutorDeps = {
-      placeOrder,
+      placeOrder: async (order, strategy, urgency) => {
+        try {
+          const result = await placeOrder(order, strategy, urgency);
+          recordReplies(order, result.replies);
+          return result;
+        } catch (e) {
+          recordReplies(order, (e as { replies?: OrderReply[] } | null)?.replies);
+          throw e;
+        }
+      },
       confirmFill: (orderId, opts) => confirmFill(orderId, opts),
       // Fresh USD cash each call — invoked after the sells so their (unsettled)
       // proceeds are counted.

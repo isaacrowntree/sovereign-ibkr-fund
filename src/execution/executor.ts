@@ -164,7 +164,7 @@ export interface ExecutorDeps {
  * see post-run NAV/cash) do the telling.
  */
 export interface ExecutionAnomaly {
-  kind: 'ledger-diverged' | 'fill-recovered' | 'stream-silent';
+  kind: 'ledger-diverged' | 'fill-recovered' | 'stream-silent' | 'order-refused';
   symbol: string;
   detail: string;
   orderId?: string | number;
@@ -616,6 +616,16 @@ export async function executeQueue(
         result = await deps.placeOrder(order, strategy, urgency);
       } catch (err) {
         deps.logError(`Order submission failed: ${order.action} ${order.qty} ${order.symbol}`, err);
+        if ((err as { notPlaced?: unknown } | null)?.notPlaced === true) {
+          // PROVABLY not placed (a confirmation prompt was refused under
+          // REPLY_POLICY=enforce): nothing reached IBKR, so the order stays
+          // queued. Halt — the prompt means something is wrong that a human
+          // should look at before anything else is placed.
+          const msg = err instanceof Error ? err.message : String(err);
+          anomalies.push({ kind: 'order-refused', symbol: order.symbol, detail: msg });
+          halt(`order not placed (${order.symbol}): confirmation prompt refused`);
+          continue;
+        }
         // AMBIGUOUS: a client-side timeout / 5xx can occur AFTER IBKR accepted
         // the order (placement is non-idempotent — no client order id), so
         // requeueing verbatim risks a duplicate. Drop it and halt. Next run's
