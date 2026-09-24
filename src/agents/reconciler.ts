@@ -32,6 +32,7 @@ import { ledgerImpliedShares, formatDriftSignature } from '../execution/orphan-r
 import { notify, type NotifyEvent } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
+import { agentStartup } from '../startup.js';
 
 const AGENT = 'Reconciler';
 
@@ -311,7 +312,11 @@ async function run(): Promise<ReconcileOutcome> {
 if (process.argv.includes('--once')) {
   // A deferral exits 0 on purpose: the unit did its job (it waited, then
   // said so), and a failed unit would page a second time for the same logout.
-  run().then(() => process.exit(0)).catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
+  Promise.resolve()
+    .then(() => agentStartup(AGENT, { config }))
+    .then(() => run())
+    .then(() => process.exit(0))
+    .catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
 }
 
 export { run };

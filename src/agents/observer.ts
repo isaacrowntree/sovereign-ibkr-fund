@@ -26,6 +26,7 @@ import { notify } from '../notify/slack.js';
 import { storeHooks, outboxStore } from '../notify/store-hooks.js';
 import { drainOutbox } from '../notify/outbox.js';
 import { log, logError } from '../log.js';
+import { agentStartup } from '../startup.js';
 
 const AGENT = 'Observer';
 
@@ -454,7 +455,9 @@ export function formatEvent<T>(evt: ObservedEvent<T>): string {
 }
 
 if (process.argv.includes('--once')) {
-  run()
+  Promise.resolve()
+    .then(() => agentStartup(AGENT))
+    .then(() => run())
     .then((r) => {
       log(`done: ${JSON.stringify(r)}`, AGENT);
       process.exit(r.errors > 0 ? 1 : 0);

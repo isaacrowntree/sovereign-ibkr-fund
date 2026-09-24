@@ -15,6 +15,7 @@ import { loadState, mergeState, loadObservedEvents, type ObservedEventState } fr
 import { notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
 import { log, logError } from '../log.js';
+import { agentStartup } from '../startup.js';
 
 const AGENT = 'RiskManager';
 
@@ -131,7 +132,7 @@ export async function run(): Promise<void> {
 
       // Volatility-target leverage — TELEMETRY ONLY. Nothing reads this back
       // into sizing: the strategist's exposure is regimeExposure × drawdown
-      // multiplier, deliberately (see config.strategy.enableVolTargeting).
+      // multiplier, deliberately (vol targeting was never wired into sizing).
       // Logged so a vol spike is visible in the run feed, not so it acts.
       const vol = ewmaVolatility(returns.slice(-60));
       const annVol = annualizeVol(vol);
@@ -375,5 +376,9 @@ export async function run(): Promise<void> {
 }
 
 if (process.argv.includes('--once')) {
-  run().then(() => process.exit(0)).catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
+  Promise.resolve()
+    .then(() => agentStartup(AGENT, { config }))
+    .then(() => run())
+    .then(() => process.exit(0))
+    .catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
 }

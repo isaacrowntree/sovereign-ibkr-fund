@@ -7,6 +7,7 @@ import { TARGET_PORTFOLIO, validateTargets } from '../config.js';
 import { generateCoveredCall, generateProtectivePut, tailRiskPutBudget, CoveredCallParams } from '../hedging/options.js';
 import { loadState, mergeState } from '../state/store.js';
 import { log, logError } from '../log.js';
+import { agentStartup } from '../startup.js';
 
 const AGENT = 'Hedger';
 const IMPLIED_VOL = 0.20; // default, would come from options chain data
@@ -83,5 +84,9 @@ async function run(): Promise<void> {
 }
 
 if (process.argv.includes('--once')) {
-  run().then(() => process.exit(0)).catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
+  Promise.resolve()
+    .then(() => agentStartup(AGENT))
+    .then(() => run())
+    .then(() => process.exit(0))
+    .catch(e => { logError('Fatal', e, AGENT); process.exit(1); });
 }
