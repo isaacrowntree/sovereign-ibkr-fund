@@ -1,20 +1,45 @@
-import { runBacktest, DEFAULT_CONFIG, loadHistoricalData, type BacktestConfig, type Position } from '../src/validation/backtest-engine.js';
+import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { runBacktest, DEFAULT_CONFIG, loadHistoricalData, type BacktestConfig, type Position, type DailyBar } from '../src/validation/backtest-engine.js';
 import { toTradeRecords, evaluateAfterTax } from '../src/validation/after-tax.js';
 import { TARGET_PORTFOLIO } from '../src/config.js';
 
 const CAPITAL = 30000;
 const RATE = 0.47;
+
+// The live book outgrew any single data file: VST, for one, exists only in
+// historical-energy.json, and the study died on `priceOn` reading undefined.
+// Merge every file per symbol (longest series wins) into one gitignored file,
+// and exclude — loudly — any name still without history, instead of crashing.
+const DATA_DIR = resolve(__dirname, '../src/validation/data');
+const MERGED = 'historical-merged.json';
+const merged: Record<string, DailyBar[]> = {};
+for (const f of readdirSync(DATA_DIR).filter(f => f.endsWith('.json') && f !== MERGED)) {
+  const d = JSON.parse(readFileSync(resolve(DATA_DIR, f), 'utf8')) as Record<string, DailyBar[]>;
+  for (const [sym, bars] of Object.entries(d)) {
+    if (!Array.isArray(bars) || bars.length === 0) continue;
+    if (!merged[sym] || bars[0].date < merged[sym][0].date) merged[sym] = bars;
+  }
+}
+writeFileSync(resolve(DATA_DIR, MERGED), JSON.stringify(merged));
+
 // ARM has no history before its 2023 IPO — excluded so the window can reach a
-// bear market. Remaining weights renormalised to 100%.
-const BOOK = TARGET_PORTFOLIO.filter(t => t.symbol !== 'ARM');
+// bear market. Names with no data at all are excluded too. Remaining weights
+// renormalised to 100%.
+const missing = TARGET_PORTFOLIO.filter(t => !merged[t.symbol]).map(t => t.symbol);
+if (missing.length) console.log(`No price history for ${missing.join(', ')} — excluded from the study`);
+const BOOK = TARGET_PORTFOLIO.filter(t => t.symbol !== 'ARM' && merged[t.symbol]);
 const TOT = BOOK.reduce((s, t) => s + t.pct, 0);
 const SYMS = BOOK.map(t => t.symbol);
 
-const data = loadHistoricalData();
-const dates = [...new Set(Object.values(data).flatMap(b => b.map(x => x.date)))].sort();
-const priceOn = (s, d) => { const a = data[s].filter(b => b.date <= d); return (a[a.length-1] ?? data[s][0]).close; };
+const data = loadHistoricalData(MERGED);
+// The window is where EVERY name in the book has data (series start and end
+// on different days across the merged files).
+const dates = [...new Set(Object.values(data).flatMap(b => b.map(x => x.date)))].sort()
+  .filter(d => SYMS.every(s => data[s][0].date <= d && data[s][data[s].length - 1].date >= d));
+const priceOn = (s: string, d: string) => { const a = data[s].filter(b => b.date <= d); return (a[a.length-1] ?? data[s][0]).close; };
 
-const mk = (name, o: Partial<BacktestConfig> = {}): BacktestConfig => ({ ...DEFAULT_CONFIG, name, symbols: SYMS, ...o });
+const mk = (name: string, o: Partial<BacktestConfig> = {}): BacktestConfig => ({ ...DEFAULT_CONFIG, name, symbols: SYMS, dataFile: MERGED, ...o });
 const STATIC_W = BOOK.map(t => t.pct / TOT);
 const GROWTH = { optimizerMethod: 'hrp' as const, lookbackDays: 60, rebalanceDriftPct: 15, rebalanceFreqDays: 60,
   targetVol: 0.20, drawdownLimits: { warningPct: 10, deriskPct: 20, hardStopPct: 30 } };
