@@ -232,6 +232,16 @@ describe('trade dedupe — execId records vs order aggregates', () => {
   });
 });
 
+describe('fx conversions (Division 775 record)', () => {
+  it('records each conversion once, by execId, and keeps them out of the trade ledger', () => {
+    const c = { execId: 'F1', time: '2026-09-01T02:00:00.000Z', pair: 'AUD.USD', baseAmount: 1000 };
+    expect(store.appendFxConversions([c])).toBe(1);
+    expect(store.appendFxConversions([c, { ...c, execId: 'F2' }])).toBe(1);
+    expect(store.loadFxConversions().map(x => x.execId)).toEqual(['F1', 'F2']);
+    expect(store.loadTradeHistory()).toEqual([]);
+  });
+});
+
 describe('legacy JSON migration', () => {
   it('imports a legacy bot-state.json on first open, then retires the file', () => {
     writeFileSync(legacyState(), JSON.stringify({ lastNav: 42000, pendingOrders: [{ symbol: 'NET', qty: 3 }] }));

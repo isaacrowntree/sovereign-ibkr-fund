@@ -34,7 +34,8 @@ import type { StagedOrder } from '../execution/staging.js';
 import type { AlgoPriority, ExecutionPlan as AlgoPlan } from '../execution/algo-orders.js';
 import { isExecutionWindow, describeWindow, EXECUTION_WINDOW } from '../strategy/market-hours.js';
 import { confirmFill } from '../observability/fill-confirmer.js';
-import { loadState, mergeState, appendTrade, appendReconciledTrades, loadTradeHistory } from '../state/store.js';
+import { loadState, mergeState, appendTrade, appendReconciledTrades, appendFxConversions, loadTradeHistory } from '../state/store.js';
+import { getFxConversions } from '../connection/ibkr-history.js';
 import type { WashSaleEntry } from '../tax/harvesting.js';
 import { alert, notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
@@ -375,6 +376,16 @@ async function run(): Promise<void> {
       }
     } catch (err) {
       logError('Execution reconciliation failed (continuing)', err, AGENT);
+    }
+
+    // Record AUD<->USD conversions for the Division 775 export. IBKR forgets
+    // them after a few days, so each run keeps what the session still shows.
+    // Pure bookkeeping: a failure here never touches trading.
+    try {
+      const added = appendFxConversions(await getFxConversions());
+      if (added > 0) log(`Recorded ${added} FX conversion(s) for the Division 775 record`, AGENT);
+    } catch (err) {
+      logError('FX conversion capture failed (continuing)', err, AGENT);
     }
 
     // Self-heal an orphaned queue. reconcileExecutions above works at the FILL

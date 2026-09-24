@@ -23,7 +23,8 @@
  */
 import { getExecutions, connect, disconnect } from '../dist/connection/gateway.js';
 import { reconcileExecutions } from '../dist/execution/reconcile.js';
-import { loadTradeHistory, appendReconciledTrades, loadState, mergeState, closeDb } from '../dist/state/store.js';
+import { loadTradeHistory, appendReconciledTrades, appendFxConversions, loadState, mergeState, closeDb } from '../dist/state/store.js';
+import { getFxConversions } from '../dist/connection/ibkr-history.js';
 
 await connect();
 const execs = await getExecutions();
@@ -43,6 +44,10 @@ if (backfill.length > 0 && !loadState().liveExecutionValidatedAt) {
   mergeState({ liveExecutionValidatedAt: new Date().toISOString(), lastValidationFailure: null });
   console.log('Set liveExecutionValidatedAt (a live fill was confirmed against IBKR).');
 }
+
+// AUD<->USD conversions, for the Division 775 export (idempotent by execId).
+const fx = appendFxConversions(await getFxConversions());
+if (fx > 0) console.log(`Recorded ${fx} FX conversion(s).`);
 
 console.log(`trade-history now has ${after} record(s).`);
 closeDb();

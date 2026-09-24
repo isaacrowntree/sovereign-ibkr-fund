@@ -251,6 +251,10 @@ function openDb(): DatabaseSync {
       'payload TEXT NOT NULL)',
   );
   d.exec('CREATE INDEX IF NOT EXISTS observed_events_topic_id_idx ON observed_events (topic, id)');
+  // Currency conversions (AUD.USD executions), for the Division 775 export.
+  // Kept out of `trades` on purpose: they are not share parcels, and every
+  // share-count check (drift, orphan recovery) sums that table.
+  d.exec('CREATE TABLE IF NOT EXISTS fx_conversions (exec_id TEXT PRIMARY KEY, time TEXT, data TEXT NOT NULL)');
   d.exec(
     'CREATE TABLE IF NOT EXISTS notify_dedupe (' +
       'key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, sent_at INTEGER NOT NULL, expires_at INTEGER)',
@@ -561,6 +565,39 @@ function readTrades(d: DatabaseSync): TradeRecord[] {
 
 export function loadTradeHistory(): TradeRecord[] {
   return readTrades(db());
+}
+
+// ---------- FX conversions (Division 775 record) ----------
+
+/** Structurally an `FxConversion` from connection/ibkr-history; kept loose to avoid a store → gateway import. */
+export interface FxConversionRecord {
+  execId: string;
+  time: string;
+}
+
+/** Record conversions, idempotent on execId. Returns how many were new. */
+export function appendFxConversions<T extends FxConversionRecord>(rows: T[]): number {
+  if (rows.length === 0) return 0;
+  const d = db();
+  let added = 0;
+  tx(d, () => {
+    added = 0;
+    const ins = d.prepare('INSERT OR IGNORE INTO fx_conversions (exec_id, time, data) VALUES (?, ?, ?)');
+    for (const r of rows) {
+      if (!r.execId) continue;
+      added += Number(ins.run(r.execId, r.time ?? null, JSON.stringify(r)).changes);
+    }
+  });
+  return added;
+}
+
+export function loadFxConversions<T extends FxConversionRecord = FxConversionRecord>(): T[] {
+  const rows = db().prepare('SELECT data FROM fx_conversions ORDER BY time, exec_id').all() as Array<{ data: string }>;
+  const out: T[] = [];
+  for (const r of rows) {
+    try { out.push(JSON.parse(r.data) as T); } catch { /* skip */ }
+  }
+  return out;
 }
 
 /** Prune expired dedupe rows on ~1 claim in 64 — see claimAlert. */

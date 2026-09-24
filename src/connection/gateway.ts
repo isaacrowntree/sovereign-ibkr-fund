@@ -98,7 +98,7 @@ function cfAccessHeaders(): Record<string, string> {
   };
 }
 
-async function bezantFetch<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
+export async function bezantFetch<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), config.bezant.timeoutMs);
   try {
@@ -130,7 +130,7 @@ async function bezantFetch<T = unknown>(path: string, init: RequestInit = {}): P
   }
 }
 
-async function resolveAccountId(): Promise<string> {
+export async function resolveAccountId(): Promise<string> {
   if (config.bezant.accountId) return config.bezant.accountId;
   if (cachedAccountId) return cachedAccountId;
   const accounts = await bezantFetch<Array<{ id?: string; accountId?: string }>>('/accounts');
@@ -188,7 +188,7 @@ export function symbolVariants(symbol: string): string[] {
   return out;
 }
 
-async function resolveConid(symbol: string): Promise<number> {
+export async function resolveConid(symbol: string): Promise<number> {
   const cached = conidCache.get(symbol);
   if (cached) return cached;
 
