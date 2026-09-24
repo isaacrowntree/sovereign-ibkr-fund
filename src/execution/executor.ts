@@ -132,6 +132,12 @@ export interface ExecutorDeps {
    * when absent the window is treated as always open (tests, backfills).
    */
   isWindowOpen?(): boolean;
+  /**
+   * Anything else that must stop placement mid-run, checked before every
+   * order: returns why, or null to carry on. Wired to the run lock (a run that
+   * lost its lease must not keep placing). Optional.
+   */
+  placementBlocker?(): string | null;
   log(message: string): void;
   logError(message: string, err: unknown): void;
 }
@@ -535,6 +541,13 @@ export async function executeQueue(
       if (deps.isWindowOpen && !deps.isWindowOpen()) {
         deps.log(`Execution window closed mid-run before ${order.symbol} — halting; ${remaining.length} order(s) stay queued`);
         halt('execution window closed mid-run');
+        return;
+      }
+
+      const blocked = deps.placementBlocker?.() ?? null;
+      if (blocked) {
+        deps.log(`Placement blocked before ${order.symbol}: ${blocked} — halting; ${remaining.length} order(s) stay queued`);
+        halt(blocked);
         return;
       }
 

@@ -30,6 +30,7 @@ import {
   startRun, enterPhase, recordSignal, describeAbandonedRun, RUN_STALE_MS,
   type RunPhase,
 } from '../observability/run-recorder.js';
+import { createRunLock, runLeaseMs, type RunLock } from '../execution/run-lock.js';
 import type { StagedOrder } from '../execution/staging.js';
 import type { AlgoPriority, ExecutionPlan as AlgoPlan } from '../execution/algo-orders.js';
 import { isExecutionWindow, describeWindow, EXECUTION_WINDOW } from '../strategy/market-hours.js';
@@ -170,16 +171,16 @@ const RISK_STALE_MS = (() => {
 })();
 
 /**
- * A run holds the queue in memory and only writes back at the end, so two
- * overlapping runs would double-place. Paperclip already serialises heartbeat
- * runs per agent; this state-file lock is defence-in-depth against a manual
- * invocation overlapping a scheduled run. Considered stale after this long
- * (longer than the worst-case run of 10 Patient confirmations).
+ * Two overlapping runs would double-place, so a run holds a lease on
+ * `executionRunLock` (see execution/run-lock.ts): compare-and-set to take it,
+ * a heartbeat to keep it, and a run that stops renewing loses it within
+ * RUN_LEASE_SEC. Paperclip already serialises heartbeat runs per agent; this is
+ * defence-in-depth against a manual invocation overlapping a scheduled run.
  *
  * The lock doubles as the flight recorder: it carries the phase the run is in,
  * so a run that is killed leaves behind WHERE it died. See run-recorder.ts.
  */
-const RUN_LOCK_STALE_MS = RUN_STALE_MS;
+let runLock: RunLock | null = null;
 
 /**
  * The live run's breadcrumb. Module-scoped because the signal handlers need to
@@ -189,10 +190,10 @@ let runPhase: RunPhase | null = null;
 
 /** Persist where we are, so a SIGKILL still leaves the phase on disk. */
 function phase(name: string): void {
-  if (!runPhase) return;
+  if (!runPhase || !runLock) return;
   runPhase = enterPhase(runPhase, name, new Date(), process.memoryUsage().rss);
   try {
-    mergeState({ executionRunLock: runPhase });
+    runLock.update({ ...runPhase });
   } catch (e) {
     logError('Could not persist run phase', e, AGENT);
   }
@@ -210,7 +211,7 @@ function watchForShutdown(): void {
       log(`Received ${sig} during "${runPhase?.phase ?? 'unknown'}" — recording before exit`, AGENT);
       if (runPhase) {
         runPhase = recordSignal(runPhase, sig, new Date());
-        try { mergeState({ executionRunLock: runPhase }); } catch { /* best effort */ }
+        try { runLock?.update({ ...runPhase }); } catch { /* best effort */ }
       }
       process.exit(143);
     });
@@ -219,7 +220,7 @@ function watchForShutdown(): void {
     logError(`Uncaught exception during "${runPhase?.phase ?? 'unknown'}"`, e, AGENT);
     if (runPhase) {
       runPhase = recordSignal(runPhase, `uncaughtException: ${e instanceof Error ? e.message : String(e)}`, new Date());
-      try { mergeState({ executionRunLock: runPhase }); } catch { /* best effort */ }
+      try { runLock?.update({ ...runPhase }); } catch { /* best effort */ }
     }
     process.exit(1);
   });
@@ -278,25 +279,35 @@ async function run(): Promise<void> {
     return;
   }
 
-  // Defence-in-depth run lock: refuse to start if another run is holding the
-  // lock and it isn't stale.
-  const existingLock = state.executionRunLock as RunPhase | undefined;
-  if (existingLock && Date.now() - new Date(existingLock.at).getTime() < RUN_LOCK_STALE_MS) {
+  // Defence-in-depth run lock: take the lease, or refuse to start if another
+  // run holds a live one. A lock from the previous build ({at, pid}, no lease)
+  // is honoured by the old 35-minute rule so a deploy mid-run is safe.
+  runPhase = startRun(new Date(), process.pid, process.memoryUsage().rss);
+  runLock = createRunLock({
+    leaseMs: runLeaseMs(),
+    legacyStaleMs: RUN_STALE_MS,
+    onError: (msg, err) => logError(msg, err, AGENT),
+  });
+  const lease = runLock.acquire({ ...runPhase });
+  if (!lease.acquired) {
+    const other = lease.previous as Partial<RunPhase> & { leaseUntil?: string } | null;
     log(
-      `Another execution run holds the lock (pid ${existingLock.pid}, since ${existingLock.at}) — skipping to avoid double-execution`,
+      `Another execution run holds the lock (since ${other?.at ?? '?'}, lease until ${other?.leaseUntil ?? 'n/a'}) — ` +
+        'skipping to avoid double-execution',
       AGENT,
     );
+    runLock = null;
+    runPhase = null;
     return;
   }
 
   // The previous run left a lock behind, which means it was killed rather than
   // finishing — the `finally` that releases it never ran. It cannot report its
   // own death, so we report it: this is the only place the cause ever surfaces.
-  const postMortem = describeAbandonedRun(
-    existingLock ?? null,
-    new Date(),
-    (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } },
-  );
+  // Its lease had lapsed (or we could not have taken it), so it is not alive
+  // whatever its pid now points at.
+  const existingLock = (lease.previous ?? null) as RunPhase | null;
+  const postMortem = describeAbandonedRun(existingLock, new Date(), () => false);
   if (postMortem) {
     log(postMortem.detail, AGENT);
     await notify(
@@ -318,8 +329,6 @@ async function run(): Promise<void> {
   }
 
   watchForShutdown();
-  runPhase = startRun(new Date(), process.pid, process.memoryUsage().rss);
-  mergeState({ executionRunLock: runPhase });
 
   // Floor for fill-confirmation event matching: only consider order events
   // at/after the cursor the observer has already reached, so a recycled
@@ -593,6 +602,7 @@ async function run(): Promise<void> {
       loadTradeHistory,
       appendTrade,
       isWindowOpen: isExecutionWindow,
+      placementBlocker: () => (runLock?.held() ? null : 'run lock lost (another run took it over)'),
       log: (msg) => log(msg, AGENT),
       logError: (msg, err) => logError(msg, err, AGENT),
       // The window between placing an order and confirming its fill is where
@@ -673,8 +683,9 @@ async function run(): Promise<void> {
   } finally {
     if (connected) disconnect();
     // Always release the run lock — even if connect() threw — so the next
-    // scheduled run can proceed.
-    mergeState({ executionRunLock: null });
+    // scheduled run can proceed. Only our own: a lease we lost is not ours.
+    runLock?.release();
+    runLock = null;
   }
 }
 

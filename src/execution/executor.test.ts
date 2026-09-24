@@ -852,3 +852,16 @@ describe('executeQueue — fill provenance', () => {
     expect(trades[0].commission).toBe(1);
   });
 });
+
+describe('executeQueue — placementBlocker', () => {
+  it('stops placing the moment the blocker speaks, and keeps the rest queued', async () => {
+    const { deps, calls } = makeDeps();
+    let checks = 0;
+    deps.placementBlocker = () => (++checks > 1 ? 'run lock lost (another run took it over)' : null);
+    const outcome = await executeQueue(MIXED_QUEUE, ctx(), deps);
+    expect(calls.filter(c => c.startsWith('place:'))).toEqual(['place:SELL:BRK-B']);
+    expect(outcome.halted).toBe(true);
+    expect(outcome.haltReason).toBe('run lock lost (another run took it over)');
+    expect(outcome.requeue.map(o => o.symbol)).toEqual(['NET', 'AVGO', 'GLD']);
+  });
+});
