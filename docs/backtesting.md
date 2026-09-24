@@ -59,6 +59,25 @@ configuration never measured.
 In production it is also the honest way to disable the optimizer, instead of
 setting `HRP_MIN_DAYS` absurdly high to jam the gate shut.
 
+**Studies never read ambient env (2026-09-24).** `DEFAULT_CONFIG` is a literal
+of the code defaults, and `LIVE_CONFIG` extends it from `LIVE_KNOBS`, a
+sanitised snapshot of the production switches (static targets, regime off,
+drift 10, 45-day cooldown, $200 minimum trade, 1% buffer, greedy fills, an
+AUD 500 cash-flow reserve, a 30-day rebuy guard). Before this, a study run on
+the workstation (live `.env` loaded) and the same study in CI (code defaults)
+answered different questions without saying so. Update `LIVE_KNOBS` when the
+live `.env` changes. A `startDate` inside the optimizer warm-up now throws
+instead of silently starting later.
+
+**The live path is expressible.** Opt-in engine options model what production
+actually does: `dividendsFile` pays cash dividends net of 15% US withholding on
+raw closes (one price basis — combining it with total-return prices is
+refused), `deposits` + `fxDataFile` add AUD flows at that day's rate (daily
+returns are flow-adjusted), `missedRunRate` skips a seeded fraction of days,
+`commissionModel: 'ibkr-fixed'` charges IBKR's fixed schedule, `initialLots`
+seeds dated lots, and `gate: 'bands'` runs the F1 tolerance-band gate. The
+inputs come from `FETCH_EXTRAS=1 pnpm fetch-data`.
+
 ## Two traps this harness has already hit
 
 **Silent no-ops.** `static` originally returned an empty covariance matrix, and
@@ -117,6 +136,15 @@ from this universe as inflated; only comparisons *within* the same universe
 are meaningful.
 
 ## Walk-forward (src/validation/walk-forward.test.ts)
+
+> **Stale — do not cite (annotated 2026-09-24, review G8).** This section was
+> measured on the pre-audit engine: HRP rather than the `static` targets
+> production runs, no urgent path or cash-flow deployment, a cooldown counted
+> in trading days, total-return prices, and a `DEFAULT_CONFIG` read from
+> whatever `.env` was loaded. Its "drift 5% won 5 of 6 folds" was withdrawn by
+> the AMENDMENT below, and its 7-name universe is not the fund's. It is kept
+> for the method (rolling train/test folds), not the numbers. For the gate
+> question use the 2026-09-24 G6 section at the end of this file.
 
 Rolling 300-trading-day train / 150-day test folds over the long dataset,
 27-config grid (drift 5/10/15% × cadence 30/45/60d × vol target 15/20/25%),
@@ -317,3 +345,133 @@ and the guard is what makes the overlay actually deliver it. Leave the
 dead-band off. Keep drift at 10% (unchanged conclusion). If enabled, watch
 the first weeks around the cash-flow path: with the guard active, recently
 trimmed names will sit in cash longer by design.
+
+## The regime overlay is retired (2026-09-24, review F2)
+
+The overlay stays OFF (`ENABLE_REGIME=false`) and is not being fixed. A fair
+test needs bear markets the live book's history does not contain; every
+de-risking sell it triggers is a short-term taxable disposal; and the model's
+hedge sleeve already does the job. The sections above that discuss it
+(the churn study's "restores the overlay's protective function", the hedge
+studies) are historical. The hedger, which keyed off the overlay, is retired
+with it.
+
+**The Oct-2 review brief no longer relies on the overlay.** It should report,
+instead: the band gate's live shadow record (`state.bandsShadow`, and the
+strategist's `bands gate would: …` log lines, from deploy onwards), the G6
+result below, and the rebuy-guard month review. The scheduled routine itself
+lives outside this repo and is not changed here.
+
+## G6 (2026-09-24): legacy drift gate vs tolerance bands — pre-registered
+
+`scripts/g6-gate-study.ts`, harness `src/validation/gate-study.ts`. The rule
+below was committed (41c5e1b) before any result was computed; the script
+prints it first.
+
+### Decision rule (registered before the runs)
+
+- **M1**: after-tax AUD liquidation return at a 47% marginal rate — the whole
+  book is sold on the last day, CGT computed in AUD (cost base and proceeds at
+  each trade date's rate, discount iff held a year and a day, losses to
+  non-discount gains first, carried forward), dividends taxed gross less the
+  US withholding offset.
+- **M2**: maximum drawdown of the daily AUD unit price.
+- **Uncertainty**: stationary block bootstrap (mean block 20 trading days,
+  5,000 resamples, fixed seed) of the paired daily AUD unit-return differences,
+  bands − legacy; the one-sided 95% lower bound of the annualised mean.
+- **Bands is non-inferior** — and a switch-on is supported, subject to the
+  live shadow record — iff ALL hold: (1) on W1 (2022-01 → 2026-09) the M1
+  difference is ≥ −1.0pp; (2) on W1 the bootstrap lower bound is ≥ −1.0% a
+  year; (3) on W1 M2(bands) ≤ M2(legacy) + 2.0pp; (4) on W2 (2022) the M1
+  difference is ≥ −1.0pp and M2(bands) ≤ M2(legacy) + 2.0pp. Anything else: do
+  not switch on. Everything else (the 32% rate, turnover, disposals inside 12
+  months, the deposit and missed-run pairs, the ablations) is reported, not
+  decisive.
+
+### Setup
+
+Book with the live shape and no account figures: the model's 19 names and
+2–8% targets, synthetic USD 30,000, the growth sleeve 40% under target at the
+start (the shape the 2026-08-18 rebalance left behind), 1% cash, and two dated
+lots per name (60% bought ~15 months before the start, 40% bought 200 days
+before, so part of every position reaches its CGT discount date inside the
+window). Live path throughout: static targets and `LIVE_CONFIG` knobs, raw
+closes with cash dividends net of 15% withholding, IBKR fixed brokerage, 5 bps
+slippage a side, 5% of days missed (same seeded days in both arms). The band
+gate runs with the plan's parameters exactly (`PLAN_BANDS`). Eight arms.
+
+### Results
+
+W1 — full window, 2022-01 → 2026-09 (bear, recovery, bull). Disposal counts
+are CGT parcels and include the terminal liquidation:
+
+| arm | after-tax % (47) | after-tax % (32) | max DD % | trades | sells | turnover % | disposals <12m | ≥12m |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Legacy gate (live knobs) | 202.6 | 225.0 | 22.2 | 102 | 5 | 33 | 10 | 124 |
+| Band gate (plan F1) | 190.3 | 211.9 | 21.8 | 346 | 77 | 96 | 47 | 316 |
+| Band gate, no CGT guard | 190.9 | 212.5 | 21.4 | 363 | 78 | 94 | 48 | 332 |
+| Legacy gate, drift 5% | 172.3 | 192.3 | 22.6 | 347 | 78 | 161 | 47 | 309 |
+| Legacy + AUD 5k deposits / 6 mo | 155.0 | 171.6 | 23.2 | 167 | 4 | 37 | 25 | 175 |
+| Bands + AUD 5k deposits / 6 mo | 150.2 | 166.8 | 22.3 | 419 | 64 | 108 | 65 | 374 |
+| Legacy, 20% missed runs | 202.5 | 225.0 | 22.3 | 101 | 5 | 32 | 11 | 122 |
+| Bands, 20% missed runs | 190.9 | 212.2 | 21.9 | 362 | 83 | 97 | 41 | 334 |
+
+W2 — the 2022 bear:
+
+| arm | after-tax % (47) | max DD % | sells | disposals <12m |
+|---|---:|---:|---:|---:|
+| Legacy gate (live knobs) | −2.9 | 14.6 | 0 | 31 |
+| Band gate (plan F1) | −8.0 | 14.8 | 30 | 73 |
+| Legacy gate, drift 5% | −8.1 | 13.6 | 27 | 98 |
+
+W3 — 2024-01 → 2026-09: legacy 115.1% after tax (max DD 20.8%), bands 117.8%
+(22.1%).
+
+Paired, bands − legacy:
+
+| pair | ΔM1 pp (47) | ΔM1 pp (32) | ΔM2 pp | Δ annualised | one-sided 95% lower bound |
+|---|---:|---:|---:|---:|---:|
+| W1 | −12.23 | −13.09 | −0.37 | −0.91%/yr | −4.64%/yr |
+| W2 | −5.13 | −5.65 | +0.29 | −6.82%/yr | −16.77%/yr |
+| W3 | +2.69 | +3.17 | +1.34 | +0.58%/yr | −1.69%/yr |
+| W1, with deposits | −4.76 | −4.77 | −0.95 | −0.67%/yr | −3.07%/yr |
+| W1, 20% missed runs | −11.66 | −12.77 | −0.38 | −0.94%/yr | −4.82%/yr |
+| W1, CGT guard on − off | −0.59 | −0.53 | +0.42 | −0.03%/yr | −0.59%/yr |
+
+### Verdict under the registered rule: NOT non-inferior — do not switch on
+
+(1) FAIL (−12.2pp), (2) FAIL (−4.6%/yr), (3) pass (−0.4pp), (4) FAIL (−5.1pp).
+`DRIFT_GATE` stays `legacy`.
+
+### Reading it (after the verdict, not part of it)
+
+- **The band gate trims winners early, and this universe is made of winners.**
+  A post-hoc diagnostic (not one of the registered arms) started the same book
+  AT target instead of with the residue: bands still lost ~28pp after tax on W1
+  (−3pp on W2, +0.4pp on W3). So the gap is the gate's mechanics — trimming
+  every out-of-band overweight to target + half its band, every 45 days — not
+  the one-off repair of the residue. Legacy, with 2–8% targets against a 10pp
+  threshold, almost never sells (5 sells in 4.7 years), which is exactly what
+  pays in a survivorship-selected universe of names chosen partly because they
+  ran. That bias works against ANY rebalancing rule; it is why the plan
+  defers a random-book history test and asks for a live shadow record.
+- **Drawdown did not improve.** The band gate's premise includes risk control;
+  here max drawdown is within half a point either way (it fails nothing on M2).
+- **The CGT guard barely binds** (0.6pp, within noise): with 45-day sell
+  cooldowns, few trims land in a lot's last 60 days before its discount date.
+- **Robustness pairs agree in sign**: deposits shrink the gap (fresh cash
+  fills underweights for both), missed runs change nothing material.
+- **Legacy at drift 5% is worse still** (−30pp vs drift 10 on W1): tighter
+  thresholds are not the fix either.
+
+### Recommendation
+
+Keep `DRIFT_GATE=legacy`. Keep the band gate dark and its shadow running: the
+live `bands gate would:` record is the only out-of-sample evidence that is
+free of this universe's survivorship tilt, and the Oct-2 review should read it
+(how often it would have traded, and whether its trims were followed by
+further rises or by falls). Revisit only with (a) that record, and (b) the
+random-book history test, both judged against a rule registered beforehand.
+The residue itself (the growth sleeve under target) is a model-conformance
+decision to take deliberately, not something to hand to a gate.
+
