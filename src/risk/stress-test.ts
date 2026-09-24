@@ -57,11 +57,13 @@ export function correlationStressTest(
     );
   }
 
-  const baselineVar = quadraticForm(weights, covMatrix);
+  // Clamped: a pairwise-complete covariance (F5) need not be PSD, and a tiny
+  // negative variance would make the volatility NaN.
+  const baselineVar = Math.max(0, quadraticForm(weights, covMatrix));
   const baselineVol = Math.sqrt(baselineVar);
 
   const stressedCov = shockCorrelationMatrix(covMatrix, targetCorrelation);
-  const stressedVar = quadraticForm(weights, stressedCov);
+  const stressedVar = Math.max(0, quadraticForm(weights, stressedCov));
   const stressedVol = Math.sqrt(stressedVar);
 
   const z = normalInvCDF(confidence);

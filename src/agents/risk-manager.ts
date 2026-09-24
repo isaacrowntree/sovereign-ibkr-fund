@@ -8,7 +8,7 @@ import { historicalVaR, conditionalVaR } from '../risk/var.js';
 import { assessDrawdown, maxDrawdown, type DrawdownLimits, type DrawdownState } from '../risk/drawdown.js';
 import { ewmaVolatility, annualizeVol, volTargetLeverage } from '../risk/volatility.js';
 import { correlationStressTest } from '../risk/stress-test.js';
-import { sampleCovMatrix } from '../portfolio/covariance.js';
+import { buildStressInputs } from '../risk/stress-inputs.js';
 import { marketDate } from '../quant/price-history.js';
 import { computeIntradayDrawdownFromEvents } from '../observability/intraday-pnl.js';
 import { loadState, mergeState, loadObservedEvents, type ObservedEventState } from '../state/store.js';
@@ -33,6 +33,8 @@ function worseDrawdownLevel(a: DrawdownState['level'], b: DrawdownState['level']
   return DD_RANK[a] >= DD_RANK[b] ? a : b;
 }
 const TARGET_VOL = config.risk.targetVol;
+/** Daily returns a name needs before the stress test includes it (F5). */
+const STRESS_MIN_OBS = 60;
 const DD_LIMITS: DrawdownLimits = {
   warningPct: config.risk.drawdownWarningPct,
   deriskPct: config.risk.drawdownDeriskPct,
@@ -145,34 +147,37 @@ export async function run(): Promise<void> {
         realizedVol: annVol * 100,
         volTargetLeverage: leverage,
       };
+    } else {
+      log(`VaR/vol skipped: ${navHistory.length} daily NAV samples (need 20)`, AGENT);
+    }
 
-      // Correlation stress test using portfolio weights and covariance
-      const historicalReturns = state.historicalReturns as number[][] | undefined;
-      // Keyed by weightSource since 2026-08-19, so `static` appears here when the
-      // optimizer is gated off. Stress the weights the fund is ACTUALLY targeting
-      // — a static book is just as stressable, and reading only `hrp` meant the
-      // test silently stopped running whenever the gate closed.
-      // Prefer HRP — backtest shows Risk Parity degenerates with high vol dispersion
+    // Correlation stress test (F5, 2026-09-24): per-name returns from each
+    // holding's own price history, pairwise covariance, and names with under
+    // 60 daily returns EXCLUDED rather than shortening everyone. Every skip is
+    // logged — it used to vanish silently whenever a new holding was added.
+    //
+    // Keyed by weightSource since 2026-08-19, so `static` appears here when the
+    // optimizer is gated off. Stress the weights the fund is ACTUALLY targeting.
+    // Prefer HRP — backtest shows Risk Parity degenerates with high vol dispersion
+    {
       const optimizedWeights = state.optimizedWeights as
         { hrp?: number[] | null; riskParity?: number[] | null; static?: number[] | null } | undefined;
       const weights = optimizedWeights?.hrp || optimizedWeights?.riskParity || optimizedWeights?.static;
-
-      // `historicalReturns.length` is the ASSET count, not the observation count —
-      // this used to build a 17x17 covariance from 3 observations, exactly the
-      // input portfolio-strategist now refuses.
-      const stressObs = historicalReturns?.[0]?.length ?? 0;
-      const STRESS_MIN_OBS = Math.max(30, symbols.length * 2);
-
-      // A reweight changes the model's asset count immediately; historicalReturns
-      // only catches up as the observer accumulates the new names. Skipping for a
-      // few cycles is right — dying is not, and silently stressing mismatched
-      // vectors would be worse than either.
-      if (weights && historicalReturns && weights.length !== historicalReturns.length) {
-        log(`Stress test skipped: ${weights.length} model weights vs `
-          + `${historicalReturns.length} assets of return history (model recently changed)`, AGENT);
-      } else if (historicalReturns && historicalReturns.length >= 2 && stressObs >= STRESS_MIN_OBS && weights) {
-        const cov = sampleCovMatrix(historicalReturns);
-        const stress = correlationStressTest(weights, cov, account.netLiquidation);
+      const built = buildStressInputs(
+        symbols, weights, state.priceHistory as Record<string, number[]> | undefined, STRESS_MIN_OBS,
+      );
+      if (!built.ok) {
+        log(`Stress test skipped: ${built.reason}`, AGENT);
+      } else {
+        const { inputs } = built;
+        if (inputs.excluded.length > 0) {
+          log(
+            `Stress test excludes ${inputs.excluded.map(e => `${e.symbol}(${e.observations}d)`).join(', ')} — ` +
+              `under ${STRESS_MIN_OBS} daily returns; ${(inputs.excludedWeight * 100).toFixed(1)}% of model weight not stressed`,
+            AGENT,
+          );
+        }
+        const stress = correlationStressTest(inputs.weights, inputs.cov, account.netLiquidation);
         log(`Stress test: baseline VaR $${stress.baselineVaR.toFixed(2)} → stressed VaR $${stress.stressedVaR.toFixed(2)} (corr=0.9)`, AGENT);
         state.stressTest = {
           baselineVol: stress.baselineVol,
@@ -180,6 +185,8 @@ export async function run(): Promise<void> {
           baselineVaR: stress.baselineVaR,
           stressedVaR: stress.stressedVaR,
           portfolioValue: stress.portfolioValue,
+          excludedSymbols: inputs.excluded.map(e => e.symbol),
+          excludedWeight: inputs.excludedWeight,
           timestamp: (stressComputedAt = new Date().toISOString()),
         };
       }
