@@ -567,6 +567,62 @@ export function loadTradeHistory(): TradeRecord[] {
   return readTrades(db());
 }
 
+// ---------- One-way ledger migration ----------
+
+/** Trades with their row ids, in insertion order. */
+export function loadTradeRows(): Array<{ id: number; trade: TradeRecord }> {
+  const rows = db().prepare('SELECT id, data FROM trades ORDER BY id').all() as Array<{ id: number; data: string }>;
+  const out: Array<{ id: number; trade: TradeRecord }> = [];
+  for (const r of rows) {
+    try { out.push({ id: r.id, trade: JSON.parse(r.data) as TradeRecord }); } catch { /* skip */ }
+  }
+  return out;
+}
+
+export interface LedgerMigration {
+  /** The ledger the plan was computed from: row count and highest id. */
+  expect: { count: number; maxId: number };
+  insert: TradeRecord[];
+  patches: Array<{ id: number; set: Partial<TradeRecord>; unset?: Array<keyof TradeRecord> }>;
+  /** State keys written in the same transaction (e.g. the drift baseline). */
+  state: Record<string, unknown>;
+}
+
+/**
+ * Apply a planned migration in ONE transaction: new rows, field patches to
+ * existing rows, and state keys. Either all of it lands or none of it does —
+ * a zeroed drift baseline without its opening lots (or the reverse) would
+ * make orphan recovery misread every pre-ledger share.
+ *
+ * Refuses (throws, nothing written) if the ledger changed since the plan was
+ * made: the plan was verified against positions for THAT ledger.
+ */
+export function applyLedgerMigration(m: LedgerMigration): void {
+  const d = db();
+  tx(d, () => {
+    const now = d.prepare('SELECT COUNT(*) AS n, COALESCE(MAX(id), 0) AS maxId FROM trades').get() as { n: number; maxId: number };
+    if (now.n !== m.expect.count || now.maxId !== m.expect.maxId) {
+      throw new Error(
+        `ledger changed since the plan was made (rows ${m.expect.count}->${now.n}, max id ${m.expect.maxId}->${now.maxId}) — re-run`,
+      );
+    }
+    const get = d.prepare('SELECT data FROM trades WHERE id = ?');
+    const upd = d.prepare('UPDATE trades SET data = ? WHERE id = ?');
+    for (const p of m.patches) {
+      const row = get.get(p.id) as { data: string } | undefined;
+      if (!row) throw new Error(`patch for missing trade row ${p.id}`);
+      const t = { ...(JSON.parse(row.data) as TradeRecord), ...p.set } as unknown as Record<string, unknown>;
+      for (const k of p.unset ?? []) delete t[k];
+      upd.run(JSON.stringify(t), p.id);
+    }
+    for (const t of m.insert) insertTrade(d, t);
+    const put = d.prepare(
+      'INSERT INTO state_kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value',
+    );
+    for (const [k, v] of Object.entries(m.state)) put.run(k, JSON.stringify(v));
+  });
+}
+
 // ---------- FX conversions (Division 775 record) ----------
 
 /** Structurally an `FxConversion` from connection/ibkr-history; kept loose to avoid a store → gateway import. */
