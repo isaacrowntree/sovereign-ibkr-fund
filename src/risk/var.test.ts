@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { historicalVaR, parametricVaR, conditionalVaR, portfolioVaR, normalInvCDF, normalCDF, quadraticForm } from './var';
+import { historicalVaR, parametricVaR, conditionalVaR, tailCount, portfolioVaR, normalInvCDF, normalCDF, quadraticForm } from './var';
 
 describe('VaR', () => {
   const returns = [-0.05, -0.03, -0.02, -0.01, 0.0, 0.01, 0.02, 0.03, 0.04, 0.05,
@@ -8,10 +8,25 @@ describe('VaR', () => {
   // Sorted returns: [-0.05, -0.04, -0.03, -0.02, -0.02, -0.01, -0.01, 0.0, 0.0, 0.01,
   //   0.01, 0.01, 0.02, 0.02, 0.02, 0.03, 0.03, 0.04, 0.04, 0.05]
 
-  it('historicalVaR returns exact 5th percentile loss', () => {
-    // idx = floor(0.05 * 20) = 1, sorted[1] = -0.04, VaR = -(-0.04) = 0.04
+  it('historicalVaR is the least-bad observation of the 5% tail', () => {
+    // k = ceil(0.05 * 20) = 1 → the tail is the single worst day, -0.05.
+    // (It used to read sorted[1] = -0.04: the first day OUTSIDE the tail.)
     const var95 = historicalVaR(returns, 0.95);
-    expect(var95).toBe(0.04);
+    expect(var95).toBe(0.05);
+  });
+
+  it('VaR and CVaR cut the tail at the same place', () => {
+    // 100 samples, -1%..-100% worst-first: the 5% tail is the 5 worst.
+    const r = Array.from({ length: 100 }, (_, i) => -(i + 1) / 100);
+    expect(tailCount(100, 0.95)).toBe(5);
+    expect(historicalVaR(r, 0.95)).toBeCloseTo(0.96, 10); // 5th worst
+    expect(conditionalVaR(r, 0.95)).toBeCloseTo((1 + 0.99 + 0.98 + 0.97 + 0.96) / 5, 10);
+  });
+
+  it('tailCount does not round a float artefact up a whole observation', () => {
+    expect(tailCount(20, 0.95)).toBe(1);
+    expect(tailCount(21, 0.95)).toBe(2);
+    expect(tailCount(3, 0.95)).toBe(1);
   });
 
   it('historicalVaR at lower confidence is smaller', () => {
@@ -25,7 +40,7 @@ describe('VaR', () => {
   });
 
   it('conditionalVaR equals exact average of tail below VaR', () => {
-    // cutoffIdx = floor(0.05 * 20) = 1, tail = sorted.slice(0, 1) = [-0.05]
+    // k = 1, tail = [-0.05]
     // avg = -0.05, CVaR = -(-0.05) = 0.05
     const cvar = conditionalVaR(returns, 0.95);
     expect(cvar).toBe(0.05);

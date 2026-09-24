@@ -52,6 +52,14 @@ export function ledoitWolfShrinkage(returns: number[][]): {
   const n = returns.length;
   const t = returns[0]?.length || 0;
   if (n === 0 || t < 2) return { shrunk: [], shrinkageIntensity: 0 };
+  // NaN guard (2026-09-24 review, F9). One NaN/Infinity return — a zero price in
+  // the history, a ragged row — poisons every entry of the matrix, and
+  // downstream that became NaN weights and NaN drift, which the gate reads as
+  // "within threshold". An empty result is the documented "no estimate" answer
+  // every caller already handles (static targets, equal-weight fallback).
+  if (returns.some(r => r.length !== t || r.some(v => !Number.isFinite(v)))) {
+    return { shrunk: [], shrinkageIntensity: 0 };
+  }
 
   const sample = sampleCovMatrix(returns);
   const mu = trace(sample) / n; // average variance
@@ -80,7 +88,11 @@ export function ledoitWolfShrinkage(returns: number[][]): {
     }
   }
 
-  const delta = Math.max(0, Math.min(1, (pi / t) / gammaSum));
+  // gammaSum = 0 means the sample already IS the scaled identity (e.g. identical
+  // flat series): 0/0 used to make delta NaN and the whole matrix NaN. Any delta
+  // gives the same matrix there, so take 0.
+  const rawDelta = (pi / t) / gammaSum;
+  const delta = Number.isFinite(rawDelta) ? Math.max(0, Math.min(1, rawDelta)) : 0;
   const shrunk = matAdd(matScale(target, delta), matScale(sample, 1 - delta));
 
   return { shrunk, shrinkageIntensity: delta };

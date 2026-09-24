@@ -2,12 +2,26 @@
  * Value at Risk (VaR) and Conditional VaR (Expected Shortfall)
  */
 
-/** Historical VaR: sort returns, take the α-percentile loss */
+/**
+ * Number of observations in the (1 - confidence) tail: ceil(α·n), at least 1.
+ *
+ * VaR and CVaR used to cut the tail in two different places (2026-09-24
+ * review, F9): VaR read `sorted[floor(α·n)]` — the first observation OUTSIDE
+ * the tail — while CVaR averaged `sorted[0 .. floor(α·n))`. With 20 samples at
+ * 95% that made VaR the second-worst day and CVaR the worst one, i.e. two
+ * different tails. Both now use the same k worst observations: VaR is the
+ * least-bad of them, CVaR their mean, so CVaR >= VaR by construction. The
+ * epsilon stops (1 - 0.95)·20 = 1.0000000000000009 rounding up to 2.
+ */
+export function tailCount(n: number, confidence: number): number {
+  return Math.max(1, Math.ceil((1 - confidence) * n - 1e-9));
+}
+
+/** Historical VaR: the least-bad observation in the α tail, as a positive loss. */
 export function historicalVaR(returns: number[], confidence: number = 0.95): number {
   if (returns.length === 0) return 0;
   const sorted = [...returns].sort((a, b) => a - b);
-  const idx = Math.floor((1 - confidence) * sorted.length);
-  return -sorted[Math.max(idx, 0)];
+  return -sorted[tailCount(sorted.length, confidence) - 1];
 }
 
 /** Parametric VaR assuming normal distribution */
@@ -16,15 +30,12 @@ export function parametricVaR(mean: number, stdDev: number, confidence: number =
   return -(mean - z * stdDev);
 }
 
-/** CVaR (Expected Shortfall): average loss beyond VaR threshold */
+/** CVaR (Expected Shortfall): mean of the same α tail VaR is read from. */
 export function conditionalVaR(returns: number[], confidence: number = 0.95): number {
   if (returns.length === 0) return 0;
   const sorted = [...returns].sort((a, b) => a - b);
-  const cutoffIdx = Math.floor((1 - confidence) * sorted.length);
-  if (cutoffIdx <= 0) return -sorted[0];
-  const tail = sorted.slice(0, cutoffIdx);
-  const avg = tail.reduce((s, v) => s + v, 0) / tail.length;
-  return -avg;
+  const tail = sorted.slice(0, tailCount(sorted.length, confidence));
+  return -(tail.reduce((s, v) => s + v, 0) / tail.length);
 }
 
 /** Portfolio VaR given weights and covariance matrix */
