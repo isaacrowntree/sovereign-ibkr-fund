@@ -428,9 +428,24 @@ export function mergeState(updates: Partial<FundState>): MergeStateResult {
  * Append a trade — IDEMPOTENT. The same fill can be surfaced twice (once by
  * the WS confirmation path with no execId, once by the executions-reconcile
  * path with an execId), so the store itself guarantees a fill is recorded at
- * most once. Keyed by IBKR's `execId` when present, else by the natural fill
- * signature (orderId + action + symbol + qty). A duplicate is silently
- * dropped, so callers never need their own dedup.
+ * most once. A duplicate is silently dropped, so callers never need their own
+ * dedup.
+ *
+ * The rule depends on what the incoming record carries:
+ *
+ * - **With an execId** (one IBKR execution): a duplicate if that execId is
+ *   already recorded; otherwise compared by signature (orderId + action +
+ *   symbol + qty) ONLY against rows WITHOUT an execId, i.e. the executor's
+ *   per-order aggregate. It used to be compared against every row, so the
+ *   second of two equal partials (50 + 50, distinct execIds) matched the first
+ *   and was dropped: a real fill lost from the tax ledger.
+ * - **Without an execId** (an executor aggregate): a duplicate if any row has
+ *   the same signature, or if the executions already recorded for that order
+ *   add up to at least its quantity (executions landed first, aggregate second).
+ *
+ * The signature fallback is a guard for a caller that did no accounting of
+ * its own. Executions reconciled against the ledger go through
+ * `appendReconciledTrades`, which must not be second-guessed by it.
  */
 export function appendTrade(trade: TradeRecord): void {
   const d = db();
@@ -443,28 +458,86 @@ export function appendTrade(trade: TradeRecord): void {
   //
   // Callers must NOT already hold a transaction (nested BEGIN IMMEDIATE throws).
   tx(d, () => {
-    if (trade.execId) {
-      const dup = d.prepare("SELECT 1 FROM trades WHERE json_extract(data,'$.execId') = ? LIMIT 1").get(trade.execId);
-      if (dup) return;
-    }
-    if (trade.orderId) {
-      const dup = d.prepare(
-        "SELECT 1 FROM trades WHERE json_extract(data,'$.orderId') = ? AND json_extract(data,'$.action') = ? " +
-          "AND json_extract(data,'$.symbol') = ? AND json_extract(data,'$.qty') = ? LIMIT 1",
-      ).get(trade.orderId, trade.action, trade.symbol, trade.qty);
-      if (dup) return;
-    }
-    d.prepare('INSERT INTO trades (ts, data) VALUES (?, ?)').run(trade.timestamp ?? null, JSON.stringify(trade));
+    if (!isDuplicateTrade(d, trade, { signatureFallback: true })) insertTrade(d, trade);
   });
 }
 
-export function loadTradeHistory(): TradeRecord[] {
-  const rows = db().prepare('SELECT data FROM trades ORDER BY id').all() as Array<{ data: string }>;
+/**
+ * Append the output of a reconciliation atomically with the history it was
+ * computed from.
+ *
+ * `compute` runs INSIDE the write transaction and receives the ledger as it
+ * stands at that instant, so nothing can be recorded between reading the
+ * history and writing the backfill — a concurrent executor aggregate cannot
+ * slip in and be double-counted.
+ *
+ * Records with an execId are deduped on the execId alone. The signature
+ * fallback in appendTrade must not apply here: `reconcileExecutions` has
+ * already charged each execution against its order's aggregate, in time
+ * order, and what it returns is precisely the part the aggregate does NOT
+ * cover. Re-checking by signature would drop it a second time — an aggregate
+ * of 50 with executions 50 + 50 would lose the second 50 outright.
+ *
+ * Returns the records actually inserted.
+ */
+export function appendReconciledTrades(compute: (history: TradeRecord[]) => TradeRecord[]): TradeRecord[] {
+  const d = db();
+  let inserted: TradeRecord[] = [];
+  tx(d, () => {
+    inserted = [];
+    const history = readTrades(d);
+    for (const t of compute(history)) {
+      if (isDuplicateTrade(d, t, { signatureFallback: !t.execId })) continue;
+      insertTrade(d, t);
+      inserted.push(t);
+    }
+  });
+  return inserted;
+}
+
+function insertTrade(d: DatabaseSync, trade: TradeRecord): void {
+  d.prepare('INSERT INTO trades (ts, data) VALUES (?, ?)').run(trade.timestamp ?? null, JSON.stringify(trade));
+}
+
+function isDuplicateTrade(d: DatabaseSync, trade: TradeRecord, opts: { signatureFallback: boolean }): boolean {
+  if (trade.execId) {
+    const dup = d.prepare("SELECT 1 FROM trades WHERE json_extract(data,'$.execId') = ? LIMIT 1").get(trade.execId);
+    if (dup) return true;
+  }
+  if (!opts.signatureFallback || !trade.orderId) return false;
+
+  const sameOrder =
+    "json_extract(data,'$.orderId') = ? AND json_extract(data,'$.action') = ? AND json_extract(data,'$.symbol') = ?";
+  if (trade.execId) {
+    // Only against aggregates: another execution of the same order with the
+    // same size is a different fill, not this one.
+    return !!d.prepare(
+      `SELECT 1 FROM trades WHERE ${sameOrder} AND json_extract(data,'$.qty') = ? ` +
+        "AND json_extract(data,'$.execId') IS NULL LIMIT 1",
+    ).get(trade.orderId, trade.action, trade.symbol, trade.qty);
+  }
+  if (d.prepare(`SELECT 1 FROM trades WHERE ${sameOrder} AND json_extract(data,'$.qty') = ? LIMIT 1`)
+    .get(trade.orderId, trade.action, trade.symbol, trade.qty)) {
+    return true;
+  }
+  const row = d.prepare(
+    `SELECT COALESCE(SUM(json_extract(data,'$.qty')), 0) AS q FROM trades WHERE ${sameOrder} ` +
+      "AND json_extract(data,'$.execId') IS NOT NULL",
+  ).get(trade.orderId, trade.action, trade.symbol) as { q: number };
+  return row.q > 0 && row.q >= trade.qty;
+}
+
+function readTrades(d: DatabaseSync): TradeRecord[] {
+  const rows = d.prepare('SELECT data FROM trades ORDER BY id').all() as Array<{ data: string }>;
   const out: TradeRecord[] = [];
   for (const r of rows) {
     try { out.push(JSON.parse(r.data) as TradeRecord); } catch { /* skip */ }
   }
   return out;
+}
+
+export function loadTradeHistory(): TradeRecord[] {
+  return readTrades(db());
 }
 
 /** Prune expired dedupe rows on ~1 claim in 64 — see claimAlert. */

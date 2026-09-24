@@ -165,6 +165,73 @@ describe('trade history', () => {
   });
 });
 
+describe('trade dedupe — execId records vs order aggregates', () => {
+  const agg = (orderId: number, qty: number) => ({
+    timestamp: '2026-09-01T14:00:05Z', symbol: 'NET', action: 'BUY' as const, qty,
+    estimatedValue: qty * 100, fillPrice: 100, orderId, status: 'filled', reason: 'rebalance',
+  });
+  const ex = (orderId: number, qty: number, execId: string) => ({ ...agg(orderId, qty), execId, reason: 'reconciled_from_ibkr' });
+  const qtyOf = () => store.loadTradeHistory().reduce((s, t) => s + t.qty, 0);
+
+  it('keeps two equal partials of one order — they are different executions', () => {
+    // The old rule compared by signature against EVERY row, so the second 50
+    // matched the first and a real fill was lost.
+    store.appendTrade(ex(7, 50, 'E1'));
+    store.appendTrade(ex(7, 50, 'E2'));
+    expect(qtyOf()).toBe(100);
+  });
+
+  it('multi-partial: re-appending the same partials is still a no-op (execId)', () => {
+    for (let i = 0; i < 2; i++) {
+      store.appendTrade(ex(7, 30, 'E1'));
+      store.appendTrade(ex(7, 30, 'E2'));
+      store.appendTrade(ex(7, 40, 'E3'));
+    }
+    expect(store.loadTradeHistory()).toHaveLength(3);
+    expect(qtyOf()).toBe(100);
+  });
+
+  it('executions first, aggregate second: the aggregate is recognised as covered', () => {
+    store.appendTrade(ex(7, 30, 'E1'));
+    store.appendTrade(ex(7, 70, 'E2'));
+    store.appendTrade(agg(7, 100));
+    expect(qtyOf()).toBe(100);
+  });
+
+  it('an aggregate is not swallowed by a smaller execution of its order', () => {
+    store.appendTrade(ex(7, 30, 'E1'));
+    store.appendTrade(agg(7, 100));
+    expect(qtyOf()).toBe(130); // reconcile's job to sort out, never the store's to drop a fill
+  });
+
+  it('aggregate first, then its split executions via reconcile: nothing added', async () => {
+    const { reconcileExecutions } = await import('../execution/reconcile');
+    store.appendTrade(agg(7, 100));
+    const execs = [30, 30, 40].map((q, i) => ({
+      execId: `E${i}`, symbol: 'NET', action: 'BUY' as const, qty: q, price: 100,
+      time: `2026-09-01T14:00:0${i}Z`, orderId: 7,
+    }));
+    const added = store.appendReconciledTrades(h => reconcileExecutions(h, execs));
+    expect(added).toEqual([]);
+    expect(qtyOf()).toBe(100);
+  });
+
+  it('a partial aggregate (50) with executions 50 + 50 records the second 50 exactly once', async () => {
+    // reconcileExecutions charges E1 to the aggregate and returns E2. The old
+    // store then re-checked E2 by signature, matched the aggregate, and dropped
+    // it: the fill the reconcile existed to find was lost.
+    const { reconcileExecutions } = await import('../execution/reconcile');
+    store.appendTrade(agg(7, 50));
+    const execs = ['E1', 'E2'].map((id, i) => ({
+      execId: id, symbol: 'NET', action: 'BUY' as const, qty: 50, price: 100,
+      time: `2026-09-01T14:00:0${i}Z`, orderId: 7,
+    }));
+    expect(store.appendReconciledTrades(h => reconcileExecutions(h, execs)).map(t => t.execId)).toEqual(['E2']);
+    expect(store.appendReconciledTrades(h => reconcileExecutions(h, execs))).toEqual([]);
+    expect(qtyOf()).toBe(100);
+  });
+});
+
 describe('legacy JSON migration', () => {
   it('imports a legacy bot-state.json on first open, then retires the file', () => {
     writeFileSync(legacyState(), JSON.stringify({ lastNav: 42000, pendingOrders: [{ symbol: 'NET', qty: 3 }] }));

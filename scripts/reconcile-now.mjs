@@ -23,25 +23,23 @@
  */
 import { getExecutions, connect, disconnect } from '../dist/connection/gateway.js';
 import { reconcileExecutions } from '../dist/execution/reconcile.js';
-import { loadTradeHistory, appendTrade, loadState, mergeState, closeDb } from '../dist/state/store.js';
+import { loadTradeHistory, appendReconciledTrades, loadState, mergeState, closeDb } from '../dist/state/store.js';
 
 await connect();
 const execs = await getExecutions();
 
-const before = loadTradeHistory().length;
-const backfill = reconcileExecutions(loadTradeHistory(), execs);
-// appendTrade is itself idempotent (execId / order signature), so a concurrent
-// execution-bot reconcile cannot make this double-record either.
-for (const t of backfill) appendTrade(t);
+// Computed inside the write transaction against the ledger as it stands, so a
+// concurrent execution-bot run cannot record the same fill in between.
+const backfill = appendReconciledTrades((history) => reconcileExecutions(history, execs));
 const after = loadTradeHistory().length;
 
-console.log(`Reconciled ${after - before} execution(s) into the ledger (${backfill.length} candidate(s)):`);
+console.log(`Reconciled ${backfill.length} execution(s) into the ledger:`);
 for (const r of backfill) {
   console.log(`  ${r.timestamp} ${r.action} ${r.qty} ${r.symbol} @ $${r.fillPrice} | execId ${r.execId}`);
 }
 
 // A live fill occurred, so validation is genuinely proven.
-if (after > before && !loadState().liveExecutionValidatedAt) {
+if (backfill.length > 0 && !loadState().liveExecutionValidatedAt) {
   mergeState({ liveExecutionValidatedAt: new Date().toISOString(), lastValidationFailure: null });
   console.log('Set liveExecutionValidatedAt (a live fill was confirmed against IBKR).');
 }

@@ -34,7 +34,7 @@ import type { StagedOrder } from '../execution/staging.js';
 import type { AlgoPriority, ExecutionPlan as AlgoPlan } from '../execution/algo-orders.js';
 import { isExecutionWindow, describeWindow, EXECUTION_WINDOW } from '../strategy/market-hours.js';
 import { confirmFill } from '../observability/fill-confirmer.js';
-import { loadState, mergeState, appendTrade, loadTradeHistory } from '../state/store.js';
+import { loadState, mergeState, appendTrade, appendReconciledTrades, loadTradeHistory } from '../state/store.js';
 import type { WashSaleEntry } from '../tax/harvesting.js';
 import { alert, notify } from '../notify/slack.js';
 import { storeHooks } from '../notify/store-hooks.js';
@@ -346,8 +346,8 @@ async function run(): Promise<void> {
     try {
       phase('reconcile-executions');
       const execs = await getExecutions();
-      const backfill = reconcileExecutions(loadTradeHistory(), execs);
-      for (const t of backfill) appendTrade(t);
+      // Computed and written in one transaction, against the ledger as it stands.
+      const backfill = appendReconciledTrades(history => reconcileExecutions(history, execs));
       if (backfill.length > 0) {
         const detail = backfill.map(t => `${t.action} ${t.qty} ${t.symbol}`).join(', ');
         log(`Reconciled ${backfill.length} IBKR execution(s) missing from the ledger: ${detail}`, AGENT);
