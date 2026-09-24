@@ -49,7 +49,10 @@ const SCHEDULE: AgentSchedule[] = [
   // buffer; falling behind means gaps, which are unrecoverable.
   { name: 'observer',             script: 'observer.js',             intervalSec: sec('SCHED_OBSERVER_SEC', 300) },
   { name: 'tax-optimizer',        script: 'tax-optimizer.js',        intervalSec: sec('SCHED_TAX_SEC', 86_400) },
-  { name: 'hedger',               script: 'hedger.js',               intervalSec: sec('SCHED_HEDGER_SEC', 86_400) },
+  // hedger: RETIRED 2026-09-24 (review F7). Its covered-call / protective-put
+  // suggestions keyed off the regime overlay, which is itself retired, and the
+  // fund's long-only spot mandate never executed them. The agent now only
+  // clears its stale output; remove its paperclip schedule too.
   { name: 'research-scout',       script: 'research-scout.js',       intervalSec: sec('SCHED_SCOUT_SEC', 86_400) },
   // The digest is date-keyed and idempotent, so a coarse interval here is safe;
   // the systemd timer in deploy/digest/ is the accurate, market-close-anchored

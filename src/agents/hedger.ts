@@ -1,6 +1,16 @@
 /**
- * Hedger
- * Manages options overlay: covered calls, protective puts, collars, tail risk.
+ * Hedger — RETIRED 2026-09-24 (review F7).
+ *
+ * It proposed covered calls and protective puts from the regime overlay's
+ * state. The overlay is retired (F2), the mandate is long-only spot with no
+ * options execution path, and the only consumer of its output was a "Hedge
+ * suggestions" block in the digest that described trades nobody could place.
+ * The 14% hedge sleeve (TLT/GLD/defensives in the model) does this job.
+ *
+ * Kept as a no-op rather than deleted so a scheduler that still invokes it
+ * (the paperclip schedule, until it is removed) gets a clean exit instead of
+ * a missing module. The run clears the last suggestions it wrote, so the
+ * digest stops repeating them. `runLegacyAnalysis` is the old body, unused.
  */
 import { connect, disconnect, getAccountSummary, getMarketPrices , requestDelayedData } from '../connection/gateway.js';
 import { TARGET_PORTFOLIO, validateTargets } from '../config.js';
@@ -11,7 +21,12 @@ import { log, logError } from '../log.js';
 const AGENT = 'Hedger';
 const IMPLIED_VOL = 0.20; // default, would come from options chain data
 
-async function run(): Promise<void> {
+export async function run(): Promise<void> {
+  log('Hedger is retired (review F7, 2026-09-24) — clearing stale hedge suggestions; nothing else runs', AGENT);
+  mergeState({ hedgeActions: [], lastHedgeAt: new Date().toISOString() });
+}
+
+export async function runLegacyAnalysis(): Promise<void> {
   log('Hedge analysis starting', AGENT);
   validateTargets();
   await connect();

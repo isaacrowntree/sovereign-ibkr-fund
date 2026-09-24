@@ -19,7 +19,6 @@
     "agent:quant": "node dist/agents/quant-analyst.js --once",
     "agent:tax": "node dist/agents/tax-optimizer.js --once",
     "agent:risk": "node dist/agents/risk-manager.js --once",
-    "agent:hedger": "node dist/agents/hedger.js --once",
     "agent:exec": "node dist/agents/execution-bot.js --once",
     "agent:scout": "node dist/agents/research-scout.js --once",
     "agent:observer": "node dist/agents/observer.js --once",
