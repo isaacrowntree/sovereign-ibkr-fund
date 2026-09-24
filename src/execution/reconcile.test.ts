@@ -22,6 +22,13 @@ describe('reconcileExecutions', () => {
     expect(out[0].reason).toBe('reconciled_from_ibkr');
   });
 
+  it('keeps the commission IBKR reported on the execution', () => {
+    const out = reconcileExecutions([], [{ ...exec('E1', 'NET', 'BUY', 10, 50), commission: 1.02 }]);
+    expect(out[0].commission).toBe(1.02);
+    // None reported: absent, not zero — an unknown cost is not a free trade.
+    expect(reconcileExecutions([], [exec('E2', 'NET', 'BUY', 10, 50)])[0]).not.toHaveProperty('commission');
+  });
+
   it('skips an execution already recorded by execId (idempotent)', () => {
     const history = [rec({ execId: 'E1', symbol: 'NET', qty: 45 })];
     expect(reconcileExecutions(history, [exec('E1', 'NET', 'SELL', 45, 242)])).toEqual([]);
