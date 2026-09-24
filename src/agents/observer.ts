@@ -23,7 +23,8 @@ import {
 import type { EventsStatus, GapEvent, ObservedEvent } from '../observability/event-types.js';
 import { loadState, mergeState, appendObservedEvents, type ObservedEventState } from '../state/store.js';
 import { notify } from '../notify/slack.js';
-import { storeHooks } from '../notify/store-hooks.js';
+import { storeHooks, outboxStore } from '../notify/store-hooks.js';
+import { drainOutbox } from '../notify/outbox.js';
 import { log, logError } from '../log.js';
 
 const AGENT = 'Observer';
@@ -51,7 +52,10 @@ interface RunResult {
 
 async function run(): Promise<RunResult> {
   if (!OBSERVER_ENABLED) {
-    log('OBSERVER_ENABLED=0 — skipping', AGENT);
+    log('OBSERVER_ENABLED=0 — skipping the poll', AGENT);
+    // Still the outbox's drainer: switching the poll off must not also
+    // strand every queued alert.
+    await drainAlerts();
     return { topicsPolled: 0, totalEvents: 0, gaps: 0, errors: 0 };
   }
 
@@ -103,12 +107,24 @@ async function run(): Promise<RunResult> {
   });
 
   await reportStreamHealth(gaps);
+  // Last, after every write of this run has committed: the drainer must never
+  // sit inside a transaction, and it runs here — the one 5-minute process —
+  // so there is exactly one of it.
+  await drainAlerts();
 
   log(
     `Observer poll complete — topics=${STATIC_TOPICS.length} events=${totalEvents} gaps=${gaps} errors=${errors}`,
     AGENT,
   );
   return { topicsPolled: STATIC_TOPICS.length, totalEvents, gaps, errors };
+}
+
+/** Retry alerts that failed to reach Slack (notify/outbox.ts). Never throws. */
+async function drainAlerts(): Promise<void> {
+  const r = await drainOutbox(outboxStore);
+  if (r.delivered || r.retried || r.dropped) {
+    log(`outbox: delivered=${r.delivered} retried=${r.retried} dropped=${r.dropped}`, AGENT);
+  }
 }
 
 /**

@@ -232,6 +232,14 @@ function openDb(): DatabaseSync {
     'CREATE TABLE IF NOT EXISTS notify_dedupe (' +
       'key TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, sent_at INTEGER NOT NULL, expires_at INTEGER)',
   );
+  // Alerts that failed to deliver, waiting for the observer to retry them. Keyed
+  // on the dedupe key, so a newer state of the same condition REPLACES an older
+  // undelivered one rather than queueing behind it. See notify/outbox.ts.
+  d.exec(
+    'CREATE TABLE IF NOT EXISTS notify_outbox (' +
+      'key TEXT PRIMARY KEY, event TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, ' +
+      'created_at INTEGER NOT NULL, next_at INTEGER NOT NULL, last_error TEXT)',
+  );
   return d;
 }
 
@@ -674,4 +682,100 @@ function migrateObservedEventsOn(d: DatabaseSync, cap: number = OBSERVED_EVENTS_
     d.prepare("DELETE FROM state_kv WHERE key = 'observedEvents'").run();
   });
   return moved;
+}
+
+// ---------- Notify outbox ----------
+//
+// The persistence half of notify/outbox.ts. Every function here is its own
+// short transaction and none is ever called from inside another one: the
+// outbox is written by notify() AFTER a trading write has committed, and read
+// by exactly one drainer (the observer), so an alert can never hold the write
+// lock a trade is waiting on.
+
+export interface OutboxRow {
+  key: string;
+  /** The NotifyEvent, serialised. Kept opaque here so the store stays notify-agnostic. */
+  event: string;
+  attempts: number;
+  createdAt: number;
+  nextAt: number;
+  lastError: string | null;
+}
+
+/**
+ * Queue (or replace) an undelivered alert. A newer event under the same key
+ * supersedes the old one and starts its retry schedule afresh — delivering a
+ * state the condition has already left would be worse than delivering nothing.
+ */
+export function outboxEnqueue(key: string, event: string, now: number = Date.now()): void {
+  const d = db();
+  tx(d, () => {
+    d.prepare(
+      'INSERT INTO notify_outbox (key, event, attempts, created_at, next_at, last_error) VALUES (?, ?, 0, ?, ?, NULL) ' +
+        'ON CONFLICT(key) DO UPDATE SET event = excluded.event, attempts = 0, ' +
+        'created_at = excluded.created_at, next_at = excluded.next_at, last_error = NULL',
+    ).run(key, event, now, now);
+  });
+}
+
+/** Rows whose retry is due, oldest first. */
+export function outboxDue(now: number = Date.now(), limit = 20): OutboxRow[] {
+  const rows = db()
+    .prepare(
+      'SELECT key, event, attempts, created_at, next_at, last_error FROM notify_outbox ' +
+        'WHERE next_at <= ? ORDER BY created_at ASC LIMIT ?',
+    )
+    .all(now, limit) as Array<{
+      key: string; event: string; attempts: number; created_at: number; next_at: number; last_error: string | null;
+    }>;
+  return rows.map((r) => ({
+    key: r.key, event: r.event, attempts: r.attempts,
+    createdAt: r.created_at, nextAt: r.next_at, lastError: r.last_error,
+  }));
+}
+
+/** Every pending row, for diagnostics and tests. */
+export function outboxAll(): OutboxRow[] {
+  return outboxDue(Number.MAX_SAFE_INTEGER, 10_000);
+}
+
+/**
+ * Take a due row for delivery — a compare-and-set on (created_at, attempts),
+ * pushing next_at out to `leaseUntil`. Returns false when the row changed
+ * underneath us (superseded, delivered, or leased by another drainer), in which
+ * case the caller must not send it.
+ */
+export function outboxLease(row: OutboxRow, leaseUntil: number, now: number = Date.now()): boolean {
+  const d = db();
+  let ok = false;
+  tx(d, () => {
+    const r = d.prepare(
+      'UPDATE notify_outbox SET next_at = ? WHERE key = ? AND created_at = ? AND attempts = ? AND next_at <= ?',
+    ).run(leaseUntil, row.key, row.createdAt, row.attempts, now);
+    ok = Number(r.changes) === 1;
+  });
+  return ok;
+}
+
+/** Record a failed retry. Scoped to the version that was attempted. */
+export function outboxReschedule(row: OutboxRow, nextAt: number, error: string): void {
+  const d = db();
+  tx(d, () => {
+    d.prepare(
+      'UPDATE notify_outbox SET attempts = attempts + 1, next_at = ?, last_error = ? WHERE key = ? AND created_at = ?',
+    ).run(nextAt, error.slice(0, 500), row.key, row.createdAt);
+  });
+}
+
+/**
+ * Remove a row. With `createdAt`, only that version — so a delivery of an old
+ * version never deletes a newer one that was queued while it was in flight.
+ */
+export function outboxDelete(key: string, createdAt?: number): void {
+  const d = db();
+  if (createdAt === undefined) {
+    d.prepare('DELETE FROM notify_outbox WHERE key = ?').run(key);
+  } else {
+    d.prepare('DELETE FROM notify_outbox WHERE key = ? AND created_at = ?').run(key, createdAt);
+  }
 }
