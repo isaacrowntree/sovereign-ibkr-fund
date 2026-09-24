@@ -19,3 +19,11 @@ export const BACKTEST_DATA_AVAILABLE = existsSync(
 export const LONG_DATA_AVAILABLE = existsSync(
   resolve(__dirname, 'data', 'historical-long.json'),
 );
+
+/**
+ * The live-path study inputs (2026-09-24, G3/G4): the 35-name energy dataset
+ * (all 19 live-shape names, 2020-09 →), AUD/USD and cash dividends. Built with
+ * `FETCH_EXTRAS=1 pnpm fetch-data` (plus the energy dataset fetch).
+ */
+export const LIVE_STUDY_DATA_AVAILABLE = ['historical-energy.json', 'fx-audusd.json', 'dividends.json']
+  .every(f => existsSync(resolve(__dirname, 'data', f)));
