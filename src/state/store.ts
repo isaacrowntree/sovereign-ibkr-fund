@@ -366,6 +366,28 @@ export function loadStateKey(key: string): unknown {
   try { return JSON.parse(row.value) as unknown; } catch { return undefined; }
 }
 
+/**
+ * Read-modify-write one key inside a single transaction. `fn` gets the current
+ * value (undefined when absent) and returns the next one, or undefined to
+ * leave it as it is. For the writers that must not clobber a concurrent
+ * change — e.g. pruning the queue while the executor is shrinking it.
+ * Returns what was written, or undefined when nothing was.
+ */
+export function updateStateKey<T>(key: string, fn: (current: unknown) => T | undefined): T | undefined {
+  const d = db();
+  let out: T | undefined;
+  tx(d, () => {
+    const row = d.prepare('SELECT value FROM state_kv WHERE key = ?').get(key) as { value?: string } | undefined;
+    let current: unknown;
+    try { current = row?.value === undefined ? undefined : JSON.parse(row.value); } catch { current = undefined; }
+    const next = fn(current);
+    if (next === undefined) return;
+    writeKv(d, key, next);
+    out = next;
+  });
+  return out;
+}
+
 export function saveState(state: FundState): void {
   const d = db();
   tx(d, () => {

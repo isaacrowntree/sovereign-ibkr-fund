@@ -193,6 +193,43 @@ export function isInWindow(now: Date, window: TradingWindow, env: NodeJS.Process
   return clock.minutes >= startMins && clock.minutes < endMins;
 }
 
+const REGULAR_OPEN_MINS = 9 * 60 + 30;
+
+/** Minutes ET is behind UTC on `date` (240 in EDT, 300 in EST), read at noon — after any 2am DST switch. */
+function etOffsetMinutes(date: string): number {
+  const noonUtc = new Date(`${date}T12:00:00Z`);
+  return 12 * 60 - etClock(noonUtc).minutes;
+}
+
+/**
+ * NYSE trading time between two instants, in ms: the overlap of [from, to]
+ * with each session's 9:30–close, holidays and early closes honoured. How
+ * stale a staged order is — a Friday-afternoon order is barely older by
+ * Monday morning. An uncovered weekday counts as a regular session (the
+ * conservative way for an age). Scans at most 400 days.
+ */
+export function tradingMsBetween(from: Date, to: Date): number {
+  const start = from.getTime();
+  const end = to.getTime();
+  if (!(end > start)) return 0;
+  let total = 0;
+  let date = etClock(from).date;
+  const last = etClock(to).date;
+  for (let i = 0; i < 400 && date <= last; i++) {
+    const s = nyseSession(date);
+    if (s.kind === 'regular' || s.kind === 'early-close' || s.kind === 'unknown') {
+      const base = Date.parse(`${date}T00:00:00Z`) + etOffsetMinutes(date) * 60_000;
+      const open = base + REGULAR_OPEN_MINS * 60_000;
+      const close = base + (s.closeMinutes ?? REGULAR_CLOSE_MINS) * 60_000;
+      total += Math.max(0, Math.min(close, end) - Math.max(open, start));
+    }
+    const next = new Date(`${date}T12:00:00Z`);
+    next.setUTCDate(next.getUTCDate() + 1);
+    date = next.toISOString().slice(0, 10);
+  }
+  return total;
+}
+
 /** True during 9:30-16:00 ET on NYSE trading days. Used by Portfolio Strategist. */
 export function isStrategistWindow(now: Date = new Date()): boolean {
   return isInWindow(now, STRATEGIST_WINDOW);

@@ -35,7 +35,7 @@ import {
   type RunPhase,
 } from '../observability/run-recorder.js';
 import { createRunLock, runLeaseMs, type RunLock } from '../execution/run-lock.js';
-import type { StagedOrder } from '../execution/staging.js';
+import { partitionExpired, stagedOrderTtlMs, type StagedOrder } from '../execution/staging.js';
 import type { AlgoPriority, ExecutionPlan as AlgoPlan } from '../execution/algo-orders.js';
 import { isExecutionWindow, describeWindow, EXECUTION_WINDOW, calendarCoverage, calendarFailOpen } from '../strategy/market-hours.js';
 import { executionDisabledReason, runBudgetMs } from '../execution/kill-switches.js';
@@ -619,8 +619,32 @@ async function run(): Promise<void> {
     // next run agree on what drift is already accepted.
     mergeState({ ledgerDriftBaseline: recovery.baseline });
 
+    // Expiry: an order was sized against the book at the time it was staged.
+    // Past STAGED_ORDER_TTL_TRADING_HOURS of trading time that is a guess
+    // about a book that has moved — drop it; the strategist restages from
+    // live positions if the trade is still wanted. Directed deposits and
+    // orders from before createdAt existed never expire.
+    const { live: fresh, expired } = partitionExpired(queue, new Date(), stagedOrderTtlMs());
+    if (expired.length > 0) {
+      queue = fresh;
+      mergeState({ pendingOrders: queue });
+      const detail = expired.map(o => `${o.action} ${o.qty} ${o.symbol} (staged ${o.createdAt})`).join(', ');
+      log(`Dropped ${expired.length} expired order(s): ${detail}`, AGENT);
+      await notify(
+        {
+          severity: 'info',
+          title: `Dropped ${expired.length} stale staged order${expired.length === 1 ? '' : 's'}`,
+          body: `Older than ${stagedOrderTtlMs() / 3_600_000} trading hours, so sized against a book that has moved: ${detail}. ` +
+            'The strategist restages from live positions if the trade is still wanted.',
+          agent: AGENT,
+          dedupe: { key: 'exec:expired-orders', fingerprint: detail },
+        },
+        storeHooks,
+      );
+    }
+
     if (queue.length === 0) {
-      log('Queue was entirely orphaned fills — nothing left to execute', AGENT);
+      log('Queue was entirely orphaned fills or expired orders — nothing left to execute', AGENT);
       mergeState({ lastExecutionAt: new Date().toISOString() });
       return;
     }

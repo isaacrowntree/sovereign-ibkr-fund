@@ -113,3 +113,21 @@ process.stdout.write(r.acquired ? 'WON' : 'LOST');
     expect(results.filter(r => r === 'LOST')).toHaveLength(7);
   }, 60_000);
 });
+
+describe('updateStateKey', () => {
+  it('reads and writes one key in one transaction; undefined leaves it alone', () => {
+    store.mergeState({ pendingOrders: [{ symbol: 'A' }, { symbol: 'B' }] });
+    const out = store.updateStateKey<Array<{ symbol: string }>>('pendingOrders', (cur) =>
+      (cur as Array<{ symbol: string }>).filter(o => o.symbol !== 'A'));
+    expect(out).toEqual([{ symbol: 'B' }]);
+    expect(store.loadState().pendingOrders).toEqual([{ symbol: 'B' }]);
+    expect(store.updateStateKey('pendingOrders', () => undefined)).toBeUndefined();
+    expect(store.loadState().pendingOrders).toEqual([{ symbol: 'B' }]);
+  });
+
+  it('gets undefined for a missing key', () => {
+    let seen: unknown = 'x';
+    store.updateStateKey('nope', (cur) => { seen = cur; return undefined; });
+    expect(seen).toBeUndefined();
+  });
+});

@@ -12,6 +12,7 @@ import {
   calendarFailOpen,
   etClock,
   NYSE_CALENDAR,
+  tradingMsBetween,
 } from './market-hours';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -241,5 +242,33 @@ describe('NYSE calendar — importable without a build step', () => {
     const raw = JSON.parse(readFileSync(join(__dirname, 'nyse-calendar.json'), 'utf8'));
     expect(raw.validThrough).toBe(NYSE_CALENDAR.validThrough);
     expect(Object.keys(raw.holidays).length).toBeGreaterThan(20);
+  });
+});
+
+describe('tradingMsBetween', () => {
+  const H = 3600_000;
+  it('counts only session time: Friday 15:00 to Monday 10:30 ET is 2 h', () => {
+    // 2026-09-18 is a Friday, 2026-09-21 a Monday (EDT).
+    expect(tradingMsBetween(etDate(2026, 9, 18, 15, 0, 'EDT'), etDate(2026, 9, 21, 10, 30, 'EDT'))).toBe(2 * H);
+  });
+
+  it('a full regular session is 6.5 h', () => {
+    expect(tradingMsBetween(etDate(2026, 9, 22, 0, 0, 'EDT'), etDate(2026, 9, 23, 0, 0, 'EDT'))).toBe(6.5 * H);
+  });
+
+  it('skips holidays and stops at an early close', () => {
+    // Wed 25 Nov → Mon 30 Nov 2026: Wed full (6.5), Thu Thanksgiving (0), Fri 9:30-13:00 (3.5).
+    expect(tradingMsBetween(etDate(2026, 11, 25, 0, 0, 'EST'), etDate(2026, 11, 28, 0, 0, 'EST'))).toBe(10 * H);
+  });
+
+  it('is DST-correct across the November switch', () => {
+    // Fri 30 Oct (EDT) and Mon 2 Nov 2026 (EST): two full sessions.
+    expect(tradingMsBetween(etDate(2026, 10, 30, 0, 0, 'EDT'), etDate(2026, 11, 3, 0, 0, 'EST'))).toBe(13 * H);
+  });
+
+  it('is zero for a reversed or empty interval', () => {
+    const t = etDate(2026, 9, 22, 11, 0, 'EDT');
+    expect(tradingMsBetween(t, t)).toBe(0);
+    expect(tradingMsBetween(t, new Date(t.getTime() - H))).toBe(0);
   });
 });
