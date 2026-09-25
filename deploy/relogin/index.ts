@@ -55,6 +55,8 @@ import { promisify } from 'node:util';
 import { chromium, type Browser } from 'playwright';
 import { planRecovery } from './recovery-plan.js';
 import { feed } from '../lib/ops-feed.js';
+import { mayPage, type PageCategory } from '../lib/slack-policy.mjs';
+import { markPagedOutage } from '../lib/paged-outage.js';
 import { acquire, describeHolder } from '../lib/session-lock.js';
 import { isQuietHours } from '../lib/quiet-hours.js';
 import {
@@ -442,10 +444,16 @@ function log(msg: string): void {
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
- * Best-effort alert to an optional webhook (Slack/Discord/ntfy `{"text"}`).
- * No-op when IBKR_FUND_ALERT_WEBHOOK is unset.
+ * Best-effort Slack page to an optional webhook (Slack/Discord/ntfy `{"text"}`).
+ * No-op when IBKR_FUND_ALERT_WEBHOOK is unset. Only for a category the
+ * 2026-09-24 paging policy allows (../lib/slack-policy.mjs); everything this
+ * script pages is 'fund-disconnect', and everything else is a feed() line.
  */
-async function alert(text: string): Promise<void> {
+async function alert(text: string, page: PageCategory): Promise<void> {
+  if (!mayPage(page)) {
+    log(`not paging (category ${page} is not allowed): ${text}`);
+    return;
+  }
   if (!ALERT_WEBHOOK) return;
   try {
     await fetch(ALERT_WEBHOOK, {
@@ -520,17 +528,26 @@ async function finalizeFailure(outcome: LoginOutcome | 'terminated', reason: str
       `Hit ${MAX_CONSECUTIVE_FAILURES} consecutive failure(s) (last outcome: ${outcome}) — ` +
         `disabling further automatic attempts. Manual reset required (see top-of-file comment).`,
     );
-    // Both of these are the feed's, not Slack's. They read as emergencies, but
-    // they are not ones you can act on from a notification: the fix is a login
-    // you have to be present for, and pi.lan/ibkr shows this state whenever you
-    // open it. Waking someone at 03:00 for a fund that will stay logged out
-    // until they are awake anyway bought nothing but the habit of ignoring the
-    // channel.
+    // A parked relogin is a fund disconnection, one of the three things the
+    // 2026-09-24 paging policy lets reach Slack: the fund is logged out and
+    // stays so until someone logs in. So it pages (once — the park stops the
+    // 5-minute retries), leaves the paged-outage marker so the watchdog sends
+    // the paired "restored" page when the session is back, and records the
+    // detail on the feed.
     //
     // A challenge still gets its own wording: clearing the sentinel and
     // re-running relogin cannot fix it, because relogin has no way to type a
     // response code. Saying "tap a push" here is what made this failure a
     // surprise twice.
+    await alert(
+      outcome === 'challenge'
+        ? 'IBKR asked for a challenge code, not a push — auto-relogin is parked and the fund is logged out. ' +
+            'Start a login from the IBKR page and answer it there.'
+        : `Re-login failed (${outcome}) — auto-relogin is parked and the fund is logged out. ` +
+            'Start a login from the IBKR page when you can tap an IB Key push.',
+      'fund-disconnect',
+    );
+    markPagedOutage(`relogin parked (${outcome})`);
     if (outcome === 'challenge') {
       feed({
         source: 'relogin',
@@ -668,10 +685,12 @@ async function main(): Promise<void> {
   if (process.env.RELOGIN_PUSH_ALERT === 'already-sent') {
     log('push notice suppressed — the caller has already announced it');
   } else await alert(
+    // Needs an IB Key tap: fund disconnection, and it pages.
     `:key: *IBKR session expired — logging in now.* An IB Key push is on its way; ` +
       `*tap Approve*. (Automatic re-login, triggered by ${process.env.INVOCATION_ID ? 'the relogin timer' : 'a manual run'} ` +
       `at ${new Date().toLocaleTimeString('en-AU', { timeZone: 'Australia/Sydney' })}.) ` +
       `If you did NOT expect this, do not approve it.`,
+    'fund-disconnect',
   );
 
   const browser = await chromium.launch({ headless: true });

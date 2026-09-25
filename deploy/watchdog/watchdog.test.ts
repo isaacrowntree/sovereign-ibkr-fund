@@ -11,6 +11,7 @@ import { startFakeBezant } from './test/fake-bezant.mjs';
 import { tick, DEFAULT_THRESHOLDS, type WatchdogConfig, type RestartMode } from './watchdog.js';
 import { acquire, currentHolder } from '../lib/session-lock.js';
 import type { FeedEvent } from '../lib/ops-feed.js';
+import { markPagedOutage, readPagedOutage } from '../lib/paged-outage.js';
 
 // 12:00 and 02:00 Sydney (AEST, +10) on 2026-09-24.
 const DAY = '2026-09-24T02:00:00Z';
@@ -34,6 +35,8 @@ let clock: number;
 let restarts: string[];
 let feedLog: FeedEvent[];
 let alerts: string[];
+let pages: string[]; // the category each alert() named
+let restartOk: boolean;
 let logs: string[];
 let restartSeesLock: (string | undefined)[];
 
@@ -58,10 +61,10 @@ const deps = (c: WatchdogConfig) => ({
   restart: async () => {
     restarts.push(new Date(clock).toISOString());
     restartSeesLock.push(currentHolder(c.lockDir)?.owner);
-    return true;
+    return restartOk;
   },
   feed: (e: FeedEvent) => void feedLog.push(e),
-  alert: async (t: string) => void alerts.push(t),
+  alert: async (t: string, page: string) => { alerts.push(t); pages.push(page); },
   log: (m: string) => void logs.push(m),
   sleep: async () => {},
 });
@@ -91,6 +94,8 @@ beforeEach(() => {
   restarts = [];
   feedLog = [];
   alerts = [];
+  pages = [];
+  restartOk = true;
   logs = [];
   restartSeesLock = [];
 });
@@ -206,23 +211,25 @@ describe('WATCHDOG_RESTART=dry-run', () => {
 });
 
 describe('upstream failing (gateway up, api.ibkr.com down)', () => {
-  it('never restarts, even on a 5xx, and alerts once after the limit', async () => {
+  it('never restarts, even on a 5xx, and records it once after the limit — feed, not Slack', async () => {
     fake.set({ health: { status: 503, body: { upstream_failing: true, code: 'upstream_failing' } } });
     await ticks(14); // up to 780s
     expect(alerts).toEqual([]);
     await ticks(60);
     expect(restarts).toEqual([]);
-    expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toContain('api.ibkr.com');
+    // Feed-only under the 2026-09-24 paging policy.
+    expect(alerts).toEqual([]);
+    expect(feedLog.filter((e) => e.severity === 'critical' && e.title.includes("IBKR's API"))).toHaveLength(1);
   });
-  it('bezant\'s gateway_upstream_failing code: never restarts, even on a 5xx, and alerts once after the limit', async () => {
+  it('bezant\'s gateway_upstream_failing code: never restarts, even on a 5xx, and records it once after the limit — feed, not Slack', async () => {
     fake.set({ health: { status: 503, body: { code: 'gateway_upstream_failing', gateway_reachable: true, upstream_status: 503 } } });
     await ticks(14); // up to 780s
     expect(alerts).toEqual([]);
     await ticks(60);
     expect(restarts).toEqual([]);
-    expect(alerts).toHaveLength(1);
-    expect(alerts[0]).toContain('api.ibkr.com');
+    // Feed-only under the 2026-09-24 paging policy.
+    expect(alerts).toEqual([]);
+    expect(feedLog.filter((e) => e.severity === 'critical' && e.title.includes("IBKR's API"))).toHaveLength(1);
   });
 
   it('says so when it recovers', async () => {
@@ -243,7 +250,7 @@ describe('upstream failing (gateway up, api.ibkr.com down)', () => {
 describe('silent event stream — never a restart', () => {
   const silent = { streamFresh: false, stream: { status: 200, body: { connected: true, last_message_at: '2026-01-01T00:00:00Z' } } };
 
-  it('reconnects at 10 min, reauthenticates 5 min later, alerts at 30 min, never restarts', async () => {
+  it('reconnects at 10 min, reauthenticates 5 min later, records at 30 min, never restarts', async () => {
     fake.set(silent);
     await ticks(10); // 0..540s
     expect(posted('/events/_reconnect')).toBe(0);
@@ -255,9 +262,11 @@ describe('silent event stream — never a restart', () => {
     await ticks(1); // 900
     expect(posted('/v1/api/iserver/reauthenticate')).toBe(1);
     await ticks(15); // ..1800
-    expect(alerts).toHaveLength(1);
+    // Feed-only under the 2026-09-24 paging policy (the observer pages a DISCONNECTED stream).
+    expect(alerts).toEqual([]);
+    expect(feedLog.filter((e) => e.severity === 'critical' && e.title.includes('Event stream silent'))).toHaveLength(1);
     await ticks(120);
-    expect(alerts).toHaveLength(1);
+    expect(feedLog.filter((e) => e.severity === 'critical' && e.title.includes('Event stream silent'))).toHaveLength(1);
     expect(restarts).toEqual([]);
     expect(posted('/events/_reconnect')).toBe(1);
   });
@@ -285,7 +294,8 @@ describe('silent event stream — never a restart', () => {
   it('a disconnected stream counts too, and recovery resets the ladder', async () => {
     fake.set({ stream: { status: 200, body: { connected: false } } });
     await ticks(35);
-    expect(alerts).toHaveLength(1);
+    expect(alerts).toEqual([]);
+    expect(feedLog.some((e) => e.severity === 'critical' && e.title.includes('Event stream silent'))).toBe(true);
     fake.reset();
     await ticks(1);
     expect(feedLog.some((e) => e.severity === 'recovery' && e.title.includes('event stream'))).toBe(true);
@@ -347,11 +357,62 @@ describe('state', () => {
     expect((s as unknown as Record<string, unknown>).consecutiveServerErrors).toBeUndefined();
   });
 
-  it('logged out 30 min with relogin parked lands on the feed, once per 6h', async () => {
+  it('logged out 30 min with relogin parked pages (fund disconnection) and lands on the feed, once per 6h', async () => {
     parkIt();
     fake.set({ health: { status: 401, body: {} } });
     await ticks(40);
     expect(feedLog.filter((e) => e.title.includes('auto-relogin is parked'))).toHaveLength(1);
+    expect(alerts).toHaveLength(1);
+    expect(pages).toEqual(['fund-disconnect']);
+    await ticks(6 * 60, cfg(), 60); // six more hours, still down: one re-page
+    expect(alerts).toHaveLength(2);
+  });
+
+  it('the session coming back after that page sends one paired recovery page', async () => {
+    parkIt();
+    fake.set({ health: { status: 401, body: {} } });
+    await ticks(40);
+    fake.reset();
+    await ticks(3);
+    expect(alerts).toHaveLength(2);
+    expect(alerts[1]).toContain('restored');
+    expect(pages).toEqual(['fund-disconnect', 'fund-disconnect']);
+    expect(feedLog.some((e) => e.severity === 'recovery' && e.title.includes('restored'))).toBe(true);
+  });
+
+  it('a session coming back with no page before it sends no recovery page', async () => {
+    fake.set({ health: { status: 401, body: {} } });
+    await ticks(40); // logged out, but relogin is not parked — no page
+    fake.reset();
+    await ticks(3);
+    expect(alerts).toEqual([]);
+  });
+
+  it('a state file with a stale lastDownAlertAt and no marker sends no recovery page', async () => {
+    const c = cfg();
+    fs.mkdirSync(path.dirname(c.stateFile), { recursive: true });
+    fs.writeFileSync(c.stateFile, JSON.stringify({ lastDownAlertAt: new Date(clock - 86_400_000).toISOString() }));
+    await ticks(3, c);
+    expect(alerts).toEqual([]);
+  });
+
+  it('pairs the recovery with a page another program sent (relogin parked, assisted login failed)', async () => {
+    const c = cfg();
+    markPagedOutage('relogin parked', c.lockDir);
+    await ticks(2, c);
+    expect(alerts).toHaveLength(1);
+    expect(alerts[0]).toContain('restored');
+    expect(pages).toEqual(['fund-disconnect']);
+    expect(readPagedOutage(c.lockDir)).toBeNull();
+  });
+
+  it('a failed auto-restart of a dead gateway pages (fund disconnection)', async () => {
+    restartOk = false;
+    fake.set({ health: { status: 502, body: { code: 'upstream_unreachable' } } });
+    await ticks(7);
+    expect(restarts.length).toBeGreaterThan(0);
+    expect(alerts[0]).toContain('auto-restart FAILED');
+    expect(pages[0]).toBe('fund-disconnect');
   });
 });
 

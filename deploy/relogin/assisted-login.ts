@@ -57,6 +57,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { feed } from '../lib/ops-feed.js';
+import { mayPage, type PageCategory } from '../lib/slack-policy.mjs';
+import { markPagedOutage } from '../lib/paged-outage.js';
 import { acquire, describeHolder } from '../lib/session-lock.js';
 
 const HEALTH_URL = process.env.BEZANT_HEALTH_URL ?? 'http://localhost:8080/health';
@@ -124,10 +126,20 @@ async function announcePush(text: string): Promise<void> {
     log('push notice suppressed — the caller has already announced it');
     return;
   }
-  await alert(text);
+  await alert(text, 'fund-disconnect');
 }
 
-async function alert(text: string): Promise<void> {
+/**
+ * Every page this script sends is a fund disconnection — a login that needs a
+ * tap or a code, or one that ended with the fund still logged out — which the
+ * 2026-09-24 paging policy (../lib/slack-policy.mjs) allows. The category is
+ * named at each call and checked here anyway, so the policy has one gate.
+ */
+async function alert(text: string, page: PageCategory): Promise<void> {
+  if (!mayPage(page)) {
+    log(`not paging (category ${page} is not allowed): ${text}`);
+    return;
+  }
   if (!ALERT_WEBHOOK) return;
   try {
     await fetch(ALERT_WEBHOOK, {
@@ -718,6 +730,7 @@ async function run(browser: Browser): Promise<boolean> {
           `${WEB_URL} (open it on your phone).\n` +
           `Or, from a terminal: ssh your-pi 'echo <RESPONSE> > ${RESPONSE_FILE}'\n` +
           `This login is holding the page open for it.`,
+        'fund-disconnect',
       );
       log('Enter it in IBKR Mobile (Avatar -> Two-Factor Authentication) and write the');
       log(`response code to: ${RESPONSE_FILE}`);
@@ -807,7 +820,9 @@ async function run(browser: Browser): Promise<boolean> {
   await alert(
     ':x: *IBKR assisted login ended without a session* — the push was not approved and no working ' +
       'response code arrived. The fund is still logged out.',
+    'fund-disconnect',
   );
+  markPagedOutage('assisted login ended without a session');
   feed({
     source: 'relogin',
     severity: 'critical',
@@ -873,7 +888,8 @@ async function main(): Promise<void> {
     // silently. The operator is by definition waiting on a phone at this point.
     const why = String((e as Error).stack ?? e).split('\n')[0];
     log(`FATAL: ${why}`);
-    await alert(`:x: *IBKR assisted login crashed* — \`${why}\`. The fund is still logged out.`);
+    await alert(`:x: *IBKR assisted login crashed* — \`${why}\`. The fund is still logged out.`, 'fund-disconnect');
+    markPagedOutage('assisted login crashed');
     feed({
       source: 'relogin',
       severity: 'critical',

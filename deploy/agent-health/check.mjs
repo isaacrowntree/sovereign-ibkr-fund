@@ -28,12 +28,13 @@
  * gates whether an event is worth a line in the log. Both files are written
  * every run regardless.
  *
- * ONE THING DOES PUSH: the fund not trading. On an NYSE trading day, no
- * successful Portfolio Strategist run in 24h or Execution Bot run in 48h goes
- * to Slack, once per New York day. Every agent can be "healthy" by the tests
- * above while that pair has stopped completing, and a fund that has quietly
- * stopped trading is the one state nobody discovers from a page they do not
- * open.
+ * The fund not trading gets its own line: on an NYSE trading day, no
+ * successful Portfolio Strategist run in 24h or Execution Bot run in 48h is a
+ * `critical` feed line, once per New York day. Every agent can be "healthy" by
+ * the tests above while that pair has stopped completing. It used to be the one
+ * Slack push here; since the 2026-09-24 paging policy (../lib/slack-policy.mjs:
+ * Slack is only for IP disconnection, IBKR fund disconnection and the database
+ * upload) nothing in this script posts to Slack.
  *
  * The fund is counted apart from the other paperclip companies on the same
  * instance (the crypto SwingTrader), which appear under `others`.
@@ -45,11 +46,10 @@
  *   AGENT_HEALTH_SILENT_FACTOR multiple of an agent's own interval before it is
  *                              considered silent (default 2)
  *   AGENT_HEALTH_FUND_COMPANY  paperclip company that IS the fund (default "IBKR Fund")
- *   AGENT_HEALTH_TRADING_PUSH  0 = no "fund isn't trading" push (default 1)
+ *   AGENT_HEALTH_TRADING_PUSH  0 = no "fund isn't trading" line (default 1)
  *   AGENT_HEALTH_STRATEGIST / AGENT_HEALTH_EXECUTOR   agent names
  *                              (default "Portfolio Strategist" / "Execution Bot")
  *   AGENT_HEALTH_STRATEGIST_MAX_H / AGENT_HEALTH_EXECUTOR_MAX_H  (24 / 48)
- *   IBKR_FUND_ALERT_WEBHOOK    where the push goes; unset = feed line only
  *   AGENT_HEALTH_DRY_RUN=1     print, write nothing
  */
 import { readFileSync, writeFileSync, mkdirSync, appendFileSync } from 'node:fs';
@@ -58,7 +58,6 @@ import { createRequire } from 'node:module';
 import { globSync } from 'node:fs';
 import { summariseStderr } from './stderr.mjs';
 import { splitByCompany, etDate, readCalendar, tradingStall, pushDue } from './verdict.mjs';
-import { postWebhook } from '../lib/webhook.mjs';
 
 const DB = process.env.PAPERCLIP_DATABASE_URL;
 const STATE_DIR = process.env.AGENT_HEALTH_STATE_DIR || '/fund-state/state';
@@ -72,7 +71,6 @@ const STALL_LIMITS = {
   [STRATEGIST]: Number(process.env.AGENT_HEALTH_STRATEGIST_MAX_H || 24) * 3600,
   [EXECUTOR]: Number(process.env.AGENT_HEALTH_EXECUTOR_MAX_H || 48) * 3600,
 };
-const WEBHOOK = process.env.IBKR_FUND_ALERT_WEBHOOK;
 // Shipped with the fund (src/ is rsynced by deploy-to-pi.sh), resolved from
 // this file so the working directory does not matter.
 const CALENDAR_URL = new URL('../../src/strategy/nyse-calendar.json', import.meta.url);
@@ -139,7 +137,7 @@ async function checkTradingStall() {
   return tradingStall({ date: etDate(new Date()), calendar, lastOk, limits: STALL_LIMITS });
 }
 
-/** Push a stall once per New York day; the feed gets the same line. */
+/** Record a stall on the ops feed once per New York day. Feed-only (policy 2026-09-24). */
 async function pushStall(stall) {
   if (!stall) return;
   const pushPath = join(STATE_DIR, 'agent-health-push.json');
@@ -147,17 +145,14 @@ async function pushStall(stall) {
   try { prev = JSON.parse(readFileSync(pushPath, 'utf8')); } catch { /* never pushed */ }
   const date = etDate(new Date());
   if (!pushDue(prev, date)) {
-    console.log(`[agent-health] fund not trading (${stall.key}) — already pushed for ${date}`);
+    console.log(`[agent-health] fund not trading (${stall.key}) — already recorded for ${date}`);
     return;
   }
-  // One feed line per day; a push that failed is retried hourly without another.
   if (prev?.date !== date) feed({ severity: 'critical', title: stall.title, detail: stall.detail });
-  const sent = await postWebhook(WEBHOOK, { text: `:rotating_light: *${stall.title}*\n${stall.detail}` },
-    { log: (m) => console.error(`[agent-health] ${m}`) });
   try {
-    writeFileSync(pushPath, JSON.stringify({ date, key: stall.key, pushed: sent || !WEBHOOK, at: new Date().toISOString() }));
-  } catch { /* the worst case is one more push tomorrow-equivalent */ }
-  console.log(`[agent-health] fund not trading (${stall.key}) — ${sent ? 'pushed' : WEBHOOK ? 'push FAILED, will retry' : 'no webhook, feed only'}`);
+    writeFileSync(pushPath, JSON.stringify({ date, key: stall.key, pushed: true, at: new Date().toISOString() }));
+  } catch { /* the worst case is one more feed line */ }
+  console.log(`[agent-health] fund not trading (${stall.key}) — recorded on the ops feed`);
 }
 
 try {

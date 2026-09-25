@@ -41,6 +41,7 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { feed } from '../lib/ops-feed.js';
 import { postWebhook } from '../lib/webhook.mjs';
+import { mayPage, type PageCategory } from '../lib/slack-policy.mjs';
 import { defaultLockDir } from '../lib/session-lock.js';
 import { tick, DEFAULT_THRESHOLDS, type WatchdogConfig, type RestartMode } from './watchdog.js';
 
@@ -64,7 +65,16 @@ function log(msg: string): void {
   console.log(`[${new Date().toISOString()}] [watchdog] ${msg}`);
 }
 
-async function alert(text: string): Promise<void> {
+/**
+ * A Slack page — only for a category the 2026-09-24 policy allows
+ * (../lib/slack-policy.mjs). Anything else is refused here and left to the
+ * feed line its caller also writes.
+ */
+async function alert(text: string, page: PageCategory): Promise<void> {
+  if (!mayPage(page)) {
+    log(`not paging (category ${page} is not allowed): ${text}`);
+    return;
+  }
   if (!ALERT_WEBHOOK) return;
   // Retries a 5xx / 429 / dropped connection twice. It used to be one POST
   // whose status was never even read, so a Slack blip lost the one page that

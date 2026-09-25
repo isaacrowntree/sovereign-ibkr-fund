@@ -45,6 +45,8 @@ import path from 'node:path';
 import { acquire, currentHolder, describeHolder, type Holder } from '../lib/session-lock.js';
 import { isQuietHours } from '../lib/quiet-hours.js';
 import type { FeedEvent } from '../lib/ops-feed.js';
+import type { PageCategory } from '../lib/slack-policy.mjs';
+import { clearPagedOutage, markPagedOutage, readPagedOutage } from '../lib/paged-outage.js';
 
 export type HealthState =
   | 'authenticated'
@@ -103,7 +105,12 @@ export interface WatchdogDeps {
   /** Run the container restart. Resolves true when the command succeeded. */
   restart(): Promise<boolean>;
   feed(ev: FeedEvent): void;
-  alert(text: string): Promise<void>;
+  /**
+   * A Slack page. Only for the categories in ../lib/slack-policy.mjs (the
+   * 2026-09-24 policy); every page here is 'fund-disconnect', and each also
+   * writes its own feed line. Everything else this file says goes to feed().
+   */
+  alert(text: string, page: PageCategory): Promise<void>;
   log(msg: string): void;
   sleep(ms: number): Promise<void>;
 }
@@ -405,7 +412,8 @@ export async function tick(cfg: WatchdogConfig, deps: WatchdogDeps): Promise<Wat
     if (forS >= T.upstreamAlertAfterS && !state.upstreamAlertedAt) {
       state.upstreamAlertedAt = nowIso;
       const mins = Math.round(forS / 60);
-      await deps.alert(`IBKR's API (api.ibkr.com) has been failing for ${mins} min. bezant is up; a restart cannot fix this and is not being attempted.`);
+      // Feed-only (policy 2026-09-24): the gateway is up and nothing here can
+      // fix IBKR's side; a session that drops as a result pages on its own.
       deps.feed({
         source: 'watchdog',
         severity: 'critical',
@@ -427,6 +435,13 @@ export async function tick(cfg: WatchdogConfig, deps: WatchdogDeps): Promise<Wat
   const notAuthFor = secsSince(state.notAuthSince, nowMs);
   if (state.notAuthSince && notAuthFor >= T.notAuthAlertAfterS && parked) {
     if (secsSince(state.lastDownAlertAt, nowMs) >= T.downAlertIntervalS || !state.lastDownAlertAt) {
+      // Fund disconnection that is staying down: pages, and re-pages at most
+      // every downAlertIntervalS while it lasts.
+      await deps.alert(
+        `IBKR fund logged out ~${Math.round(notAuthFor / 60)}+ min and auto-relogin is parked. ` +
+          'Start a login from the IBKR page when you can tap an IB Key push.',
+        'fund-disconnect',
+      );
       deps.feed({
         source: 'watchdog',
         severity: 'critical',
@@ -434,6 +449,24 @@ export async function tick(cfg: WatchdogConfig, deps: WatchdogDeps): Promise<Wat
         detail: 'Start a login from pi.lan/ibkr when you can tap an IB Key push. The nightly pre-market re-key will also unpark and try once.',
       });
       state.lastDownAlertAt = nowIso;
+      markPagedOutage('logged out and relogin parked', cfg.lockDir);
+    }
+  }
+
+  // ---- the paired recovery: one "restored" page per outage that paged ----
+  // Whoever paged (this file, relogin, the assisted login) left the marker;
+  // whoever logged the fund back in, this is where it is seen first.
+  if (health.state === 'authenticated') {
+    const paged = readPagedOutage(cfg.lockDir);
+    if (paged) {
+      const mins = paged.at ? Math.round(secsSince(paged.at, nowMs) / 60) : null;
+      await deps.alert(
+        `IBKR fund session restored — logged in and connected again${mins !== null ? ` (${mins} min after the page)` : ''}.`,
+        'fund-disconnect',
+      );
+      deps.feed({ source: 'watchdog', severity: 'recovery', title: 'IBKR session restored after a paged outage' });
+      clearPagedOutage(cfg.lockDir);
+      state.lastDownAlertAt = null;
     }
   }
 
@@ -515,7 +548,11 @@ async function doRestart(
           (cleared ? '; relogin was unparked and will pick it up.' : '; the 5-minute re-login picks it up unless it is parked.'),
       });
     } else {
-      await deps.alert(`🚨 IBKR fund: bezant down (${restart.reason}) and the auto-restart FAILED — manual intervention needed on the Pi.`);
+      await deps.alert(
+        `🚨 IBKR fund: bezant down (${restart.reason}) and the auto-restart FAILED — manual intervention needed on the Pi.`,
+        'fund-disconnect',
+      );
+      markPagedOutage('gateway down and the auto-restart failed', cfg.lockDir);
       deps.feed({
         source: 'watchdog',
         severity: 'critical',
@@ -571,10 +608,8 @@ async function remedyStream(
   if (wedgedFor >= T.streamAlertAfterS && !state.streamAlertedAt) {
     state.streamAlertedAt = nowIso;
     const mins = Math.round(wedgedFor / 60);
-    await deps.alert(
-      `The order/P&L event stream has been silent for ${mins} min (${detail}) and reconnect/reauthenticate did not bring it back. ` +
-        'Not restarting (a restart logs the fund out). Fills are confirmed from /trades meanwhile.',
-    );
+    // Feed-only (policy 2026-09-24): the session is up and fills are confirmed
+    // from /trades meanwhile; the observer pages a DISCONNECTED stream itself.
     deps.feed({
       source: 'watchdog',
       severity: 'critical',

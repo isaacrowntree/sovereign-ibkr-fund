@@ -25,11 +25,10 @@ EnvironmentFile=%h/sovereign-ibkr-fund/deploy/agent-health/.env
 # so the value read is the container's own DATABASE_URL. One source of truth:
 # this check now cannot address a different database than paperclip does.
 # -e VAR with no value forwards the host's (from the EnvironmentFile): the
-# webhook is for the one push this check makes — the fund not trading on a
-# trading day — and the AGENT_HEALTH_* knobs are documented in check.mjs.
+# AGENT_HEALTH_* knobs are documented in check.mjs. No webhook: since the
+# 2026-09-24 paging policy this check never posts to Slack, only to the feed.
 ExecStart=/usr/bin/docker exec -u node \
   -e AGENT_HEALTH_STATE_DIR=/fund-state/state \
-  -e IBKR_FUND_ALERT_WEBHOOK \
   -e AGENT_HEALTH_TRADING_PUSH \
   -e AGENT_HEALTH_FUND_COMPANY \
   -w /paperclip/instances/default/projects/COMPANY_ID/PROJECT_ID/sovereign-ibkr-fund \

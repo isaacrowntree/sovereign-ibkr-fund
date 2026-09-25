@@ -13,11 +13,15 @@ the SSO bridge. The decisions live in `watchdog.ts`; `index.ts` wires them up.
 |---|---|---|---|
 | `/health` 5xx or unreachable — the gateway is dead | 300 s | restart; clear relogin's park | restart yes, park **not** cleared |
 | logged out and `ssodh/init` 5xx — SSO bridge wedged | 300 s | restart (park untouched) | no restart |
-| `/health` carries `upstream_failing: true` — bezant up, api.ibkr.com failing | 900 s | **never restart**; alert once | same |
+| `/health` carries `upstream_failing: true` — bezant up, api.ibkr.com failing | 900 s | **never restart**; ops-feed entry once | same |
 | authenticated but the event stream is silent/disconnected | 600 s | `POST /events/_reconnect` (debug token; 404 = older bezant, skip) | same |
 | ...still silent | +300 s | `POST /iserver/reauthenticate` | same |
-| ...still silent | 1800 s total | alert once; **never restart** | same |
-| logged out 30 min with relogin parked | 1800 s | ops-feed entry, ≤ every 6 h | same |
+| ...still silent | 1800 s total | ops-feed entry once; **never restart** | same |
+| logged out 30 min with relogin parked | 1800 s | **Slack page** + ops-feed entry, ≤ every 6 h; one paired "restored" page when it logs back in | same |
+| a dead-gateway restart that FAILS | — | **Slack page** + ops-feed entry | same |
+
+Slack pages follow the 2026-09-24 paging policy (`../lib/slack-policy.mjs`):
+only fund disconnection pages here; everything else is an ops-feed line.
 
 Thresholds are elapsed seconds since the condition was first seen. A gap of
 more than 180 s between probes (Pi off, timer stopped) resets every streak.
