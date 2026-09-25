@@ -196,15 +196,15 @@ describe('planStreamAlert — a blip is a record, an outage is a page', () => {
   it('an outage that outlasts the threshold pages once, then leaves re-nags to the dedupe ttl', () => {
     let mem = planStreamAlert({}, down, t0, BLIP).next;
     const page = planStreamAlert(mem, down, at(10), BLIP);
-    expect(page.action).toEqual({ kind: 'page', reason: 'disconnected' });
+    expect(page.action).toEqual({ kind: 'page', reason: 'disconnected', slack: true });
     mem = page.next;
     expect(planStreamAlert(mem, down, at(15), BLIP).action).toBeNull();
-    expect(planStreamAlert(mem, up, at(20), BLIP).action).toEqual({ kind: 'recover-page', minutes: 20 });
+    expect(planStreamAlert(mem, up, at(20), BLIP).action).toEqual({ kind: 'recover-page', minutes: 20, slack: true });
   });
 
   it('a SECOND outage within 24h pages at once, however short', () => {
     const mem: StreamMemory = { lastStreamOutageEndedAt: at(-60 * 23).toISOString() };
-    expect(planStreamAlert(mem, down, t0, BLIP).action).toEqual({ kind: 'page', reason: 'disconnected' });
+    expect(planStreamAlert(mem, down, t0, BLIP).action).toEqual({ kind: 'page', reason: 'disconnected', slack: true });
   });
 
   it('…but one a day later is a fresh first outage', () => {
@@ -212,9 +212,29 @@ describe('planStreamAlert — a blip is a record, an outage is a page', () => {
     expect(planStreamAlert(mem, down, t0, BLIP).action?.kind).toBe('record');
   });
 
-  it('a refused orders subscription is an outage too', () => {
+  it('a refused orders subscription is an outage too — escalated on the feed, never Slack (policy 2026-09-24)', () => {
     const refused = judgeStream({ connected: true, subscriptions: { orders: 'refused' } }, 0);
-    expect(planStreamAlert({}, refused, t0, 0).action).toEqual({ kind: 'page', reason: 'orders-refused' });
+    const r = planStreamAlert({}, refused, t0, 0);
+    expect(r.action).toEqual({ kind: 'page', reason: 'orders-refused', slack: false });
+    // …and its recovery is not a Slack message either: nothing paged to pair it with.
+    expect(planStreamAlert(r.next, up, at(30), 0).action).toEqual({ kind: 'recover-page', minutes: 30, slack: false });
+  });
+
+  it('an orders-refused outage that becomes a DISCONNECT escalates again, to Slack this time', () => {
+    const refused = judgeStream({ connected: true, subscriptions: { orders: 'refused' } }, 0);
+    const first = planStreamAlert({}, refused, t0, 0);
+    const worse = planStreamAlert(first.next, down, at(5), 0);
+    expect(worse.action).toEqual({ kind: 'page', reason: 'disconnected', slack: true });
+    expect(planStreamAlert(worse.next, down, at(10), 0).action).toBeNull();
+    expect(planStreamAlert(worse.next, up, at(20), 0).action).toEqual({ kind: 'recover-page', minutes: 20, slack: true });
+  });
+
+  it('state written before the policy (no `slack` flag) pairs the recovery by reason', () => {
+    const since = t0.toISOString();
+    expect(planStreamAlert({ streamOutage: { since, reason: 'disconnected', paged: true } }, up, at(15), BLIP).action)
+      .toEqual({ kind: 'recover-page', minutes: 15, slack: true });
+    expect(planStreamAlert({ streamOutage: { since, reason: 'orders-refused', paged: true } }, up, at(15), BLIP).action)
+      .toEqual({ kind: 'recover-page', minutes: 15, slack: false });
   });
 
   it('a gap is not an outage (it stays a record of its own)', () => {

@@ -253,15 +253,15 @@ export async function run(): Promise<void> {
       // movers, VaR, alpha — is already on pi.lan/fund, live and sorted and
       // clickable, which a 30-line chat message can never be. As a daily
       // notification it was the largest single thing in the channel and the
-      // least likely to be acted on.
-      channel: 'ops',
+      // least likely to be acted on. No `page` category: feed-only (policy.ts).
     },
     storeHooks,
   );
 
   if (digest.stale) {
-    // The digest itself goes to the page, which nobody is prompted to open —
-    // so a stale one would be stale in silence. This is the push.
+    // Its own line on the ops feed, so a stale digest is not stale in silence.
+    // Feed-only since the 2026-09-24 paging policy (notify/policy.ts): a stale
+    // snapshot is not one of the three things that may page.
     const age = snapshotAgeHours(state, now);
     await notify(
       {

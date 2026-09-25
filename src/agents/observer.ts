@@ -137,7 +137,15 @@ async function drainAlerts(): Promise<void> {
 export interface StreamOutage {
   since: string;
   reason: string;
+  /** The outage outlasted the blip threshold and was escalated (feed, and Slack if `slack`). */
   paged: boolean;
+  /**
+   * The escalation actually went to Slack. Only a DISCONNECTED stream may
+   * (notify/policy.ts, 2026-09-24); an orders-refused outage escalates on the
+   * feed alone. Absent in state written before that — read as "was the
+   * outage a disconnect", which is what would have paged.
+   */
+  slack?: boolean;
 }
 
 export interface StreamMemory {
@@ -146,9 +154,14 @@ export interface StreamMemory {
 }
 
 export type StreamAction =
-  | { kind: 'page' | 'record'; reason: string }
-  | { kind: 'recover-page' | 'recover-record'; minutes: number }
+  | { kind: 'page'; reason: string; slack: boolean }
+  | { kind: 'record'; reason: string }
+  | { kind: 'recover-page'; minutes: number; slack: boolean }
+  | { kind: 'recover-record'; minutes: number }
   | null;
+
+/** The one stream condition the paging policy lets reach Slack: a fund disconnection. */
+const pagesSlack = (reason: string | undefined): boolean => reason === 'disconnected';
 
 /**
  * Minutes an outage must last before it pages. 0 pages at once (the old
@@ -170,7 +183,10 @@ export function blipMinutes(): number {
  *   - a SECOND outage within 24h of the last one pages immediately — flapping
  *     is worth a look even when each drop is short;
  *   - the end of an outage sends a recovery through the same channel the
- *     outage used.
+ *     outage used;
+ *   - of the escalations, only a DISCONNECTED stream goes to Slack (`slack`);
+ *     an orders-refused one escalates on the feed alone. If an outage that
+ *     escalated feed-only becomes a disconnect, that escalates again to Slack.
  * Gaps stay what they were: a record, handled by judgeStream's 'ops' verdict.
  */
 export function planStreamAlert(
@@ -185,19 +201,34 @@ export function planStreamAlert(
   if (!down) {
     if (!cur) return { action: null, next: mem };
     const minutes = Math.max(0, Math.round((now.getTime() - Date.parse(cur.since)) / 60_000));
+    const slack = cur.slack ?? pagesSlack(cur.reason);
     return {
-      action: { kind: cur.paged ? 'recover-page' : 'recover-record', minutes },
+      action: cur.paged ? { kind: 'recover-page', minutes, slack } : { kind: 'recover-record', minutes },
       next: { streamOutage: undefined, lastStreamOutageEndedAt: now.toISOString() },
     };
   }
 
   const outage: StreamOutage = cur ?? { since: now.toISOString(), reason: verdict.reason, paged: false };
-  if (outage.paged) return { action: null, next: { ...mem, streamOutage: outage } }; // dedupe re-nags
+  if (outage.paged) {
+    const slack = outage.slack ?? pagesSlack(outage.reason);
+    if (!slack && pagesSlack(verdict.reason)) {
+      // Escalated feed-only (orders refused) and has since become a disconnect.
+      return {
+        action: { kind: 'page', reason: verdict.reason, slack: true },
+        next: { ...mem, streamOutage: { ...outage, slack: true } },
+      };
+    }
+    return { action: null, next: { ...mem, streamOutage: outage } }; // dedupe re-nags
+  }
   const lasted = now.getTime() - Date.parse(outage.since);
   const lastEnd = mem.lastStreamOutageEndedAt ? Date.parse(mem.lastStreamOutageEndedAt) : NaN;
   const repeat = Number.isFinite(lastEnd) && now.getTime() - lastEnd < 24 * 3_600_000;
   if (lasted >= blipMs || repeat) {
-    return { action: { kind: 'page', reason: verdict.reason }, next: { ...mem, streamOutage: { ...outage, paged: true } } };
+    const slack = pagesSlack(verdict.reason);
+    return {
+      action: { kind: 'page', reason: verdict.reason, slack },
+      next: { ...mem, streamOutage: { ...outage, paged: true, slack } },
+    };
   }
   // Recorded once per outage — the first poll that sees it.
   return { action: cur ? null : { kind: 'record', reason: verdict.reason }, next: { ...mem, streamOutage: outage } };
@@ -247,7 +278,7 @@ async function reportStreamHealth(gaps: number, state: Record<string, unknown>):
   // Gaps are a record on their own terms (see judgeStream), outage or not.
   if (verdict && verdict.channel === 'ops') {
     await notify(
-      { severity: 'warn', channel: 'ops', title: verdict.title, body: verdict.body, fields, agent: AGENT,
+      { severity: 'warn', title: verdict.title, body: verdict.body, fields, agent: AGENT,
         dedupe: { key: 'observer:stream-health', fingerprint: verdict.reason } },
       storeHooks,
     );
@@ -265,6 +296,7 @@ async function reportStreamHealth(gaps: number, state: Record<string, unknown>):
           { label: 'Down since', value: next.streamOutage?.since ?? now.toISOString() },
         ],
         agent: AGENT,
+        ...(action.slack ? { page: 'fund-disconnect' as const } : {}),
         // Coarse: reconnectCount and uptime change constantly, so fingerprinting
         // on them would alert every poll. This is one condition — "the stream is
         // unhealthy" — that re-nags on its ttl until it clears.
@@ -276,7 +308,6 @@ async function reportStreamHealth(gaps: number, state: Record<string, unknown>):
     await notify(
       {
         severity: 'warn',
-        channel: 'ops',
         title: `${verdict.title} (watching — pages after ${blipMinutes()} min)`,
         body: verdict.body,
         fields,
@@ -289,7 +320,8 @@ async function reportStreamHealth(gaps: number, state: Record<string, unknown>):
     await notify(
       {
         severity: 'recovery',
-        ...(action.kind === 'recover-record' ? { channel: 'ops' as const } : {}),
+        // Pages only as the other half of an outage that paged.
+        ...(action.kind === 'recover-page' && action.slack ? { page: 'fund-disconnect' as const } : {}),
         title: `Event stream healthy again after ${action.minutes} min`,
         agent: AGENT,
         dedupe: action.kind === 'recover-page'

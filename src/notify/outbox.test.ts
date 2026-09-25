@@ -25,7 +25,7 @@ function fakeStore(rows: OutboxRow[]) {
 }
 
 const NOW = 1_800_000_000_000;
-const ev = (title: string): string => JSON.stringify({ severity: 'critical', title } satisfies NotifyEvent);
+const ev = (title: string): string => JSON.stringify({ severity: 'critical', page: 'fund-disconnect', title } satisfies NotifyEvent);
 const row = (key: string, over: Partial<OutboxRow> = {}): OutboxRow => ({
   key, event: ev(key), attempts: 0, createdAt: NOW - 60_000, nextAt: NOW - 1, lastError: null, ...over,
 });
@@ -73,6 +73,15 @@ describe('drainOutbox', () => {
     const r = await drainOutbox(store, { now: NOW, send: async () => { calls++; return true; } });
     expect(calls).toBe(0);
     expect(r.dropped).toBe(1);
+    expect(store.rows).toEqual([]);
+  });
+
+  it('never delivers a queued event the paging policy does not allow — it is dropped, unsent', async () => {
+    const store = fakeStore([row('risk', { event: JSON.stringify({ severity: 'critical', title: 'risk' }) })]);
+    let calls = 0;
+    const r = await drainOutbox(store, { now: NOW, send: async () => { calls++; return true; } });
+    expect(calls).toBe(0);
+    expect(r).toEqual({ delivered: 0, retried: 0, dropped: 1 });
     expect(store.rows).toEqual([]);
   });
 

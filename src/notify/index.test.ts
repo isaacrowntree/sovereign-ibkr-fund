@@ -80,13 +80,13 @@ describe('a malformed webhook URL must not leak the credential into logs', () =>
     ['unsupported scheme', 'ftp://hooks.slack.com/services/T01/B02/SuperSecretTokenXYZ'],
   ])('refuses to send to a %s URL rather than letting fetch throw with it', async (_label, url) => {
     process.env.IBKR_FUND_ALERT_WEBHOOK = url;
-    await expect(alert('x')).resolves.toBeUndefined();
+    await expect(alert('x', 'fund-disconnect')).resolves.toBeUndefined();
     expect(fetchSpy, 'never hand an unparseable URL to fetch').not.toHaveBeenCalled();
   });
 
   it('accepts a well-formed https webhook', async () => {
     process.env.IBKR_FUND_ALERT_WEBHOOK = HOOK;
-    await alert('x');
+    await alert('x', 'fund-disconnect');
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });
@@ -112,7 +112,7 @@ describe('getNotifier precedence', () => {
 
   it('webhook selected but URL unset → logs suppressed and posts NOTHING', async () => {
     process.env.NOTIFIER = 'webhook';
-    await alert('hi');
+    await alert('hi', 'fund-disconnect');
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 });
@@ -121,12 +121,12 @@ describe('alert() posts exactly {text}, exactly once', () => {
   beforeEach(() => { process.env.IBKR_FUND_ALERT_WEBHOOK = HOOK; });
 
   it('sends the bare {text} shape — no blocks, no attachments', async () => {
-    await alert('🚨 IBKR fund HARD STOP');
+    await alert('🚨 IBKR fund HARD STOP', 'fund-disconnect');
     expect(bodies()).toEqual([{ text: '🚨 IBKR fund HARD STOP' }]);
   });
 
   it('sets content-type and an abort signal', async () => {
-    await alert('x');
+    await alert('x', 'fund-disconnect');
     const init = fetchSpy.mock.calls[0][1] as RequestInit;
     expect((init.headers as Record<string, string>)['Content-Type']).toBe('application/json');
     expect(init.signal).toBeDefined();
@@ -137,7 +137,7 @@ describe('alert() posts exactly {text}, exactly once', () => {
   // would carry {text} — so assert the CALL COUNT.
   it.each([400, 403, 404, 410])('does not retry on %i — exactly one POST', async (s) => {
     respond(status(s, 'err'));
-    await alert('x');
+    await alert('x', 'fund-disconnect');
     expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
@@ -145,13 +145,13 @@ describe('alert() posts exactly {text}, exactly once', () => {
   // key and so no outbox to fall back on, and before this one Slack 5xx lost it.
   it.each([429, 500, 503])('retries a transient %i twice, then gives up', async (s) => {
     respond(status(s), status(s), status(s), ok());
-    await alert('x');
+    await alert('x', 'fund-disconnect');
     expect(fetchSpy).toHaveBeenCalledTimes(3);
   });
 
   it('retries a dropped connection and stops at the first success', async () => {
     respond(new Error('ECONNRESET'), ok(), ok());
-    await alert('x');
+    await alert('x', 'fund-disconnect');
     expect(fetchSpy).toHaveBeenCalledTimes(2);
     expect(bodies()).toEqual([{ text: 'x' }, { text: 'x' }]);
   });
@@ -162,25 +162,25 @@ describe('alert() never throws — it is on the hard-stop path', () => {
 
   it('resolves on a 500', async () => {
     respond(status(500, 'boom'));
-    await expect(alert('x')).resolves.toBeUndefined();
+    await expect(alert('x', 'fund-disconnect')).resolves.toBeUndefined();
   });
 
   it('resolves when fetch rejects', async () => {
     respond(new Error('ECONNREFUSED'));
-    await expect(alert('x')).resolves.toBeUndefined();
+    await expect(alert('x', 'fund-disconnect')).resolves.toBeUndefined();
   });
 
   it('resolves on an abort (the 10s timeout)', async () => {
     const e = new Error('The operation was aborted');
     e.name = 'AbortError';
     respond(e);
-    await expect(alert('x')).resolves.toBeUndefined();
+    await expect(alert('x', 'fund-disconnect')).resolves.toBeUndefined();
   });
 
   it('resolves when the error body itself fails to read', async () => {
     const bad = { status: 500, ok: false, text: () => Promise.reject(new Error('stream broke')) };
     fetchSpy.mockImplementation(async () => bad as unknown as Response);
-    await expect(alert('x')).resolves.toBeUndefined();
+    await expect(alert('x', 'fund-disconnect')).resolves.toBeUndefined();
   });
 });
 
@@ -232,13 +232,13 @@ describe('notify() HTTP handling', () => {
 describe('noop notifier', () => {
   it('never touches the network', async () => {
     process.env.NOTIFIER = 'noop';
-    await alert('x');
-    await notify({ severity: 'info', title: 'y' });
+    await alert('x', 'fund-disconnect');
+    await notify({ page: 'fund-disconnect', severity: 'info', title: 'y' });
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it('reports not-delivered, so a claim would be released rather than stuck', async () => {
-    await expect(noopNotifier.notify({ severity: 'info', title: 'y' })).resolves.toBe(false);
+    await expect(noopNotifier.notify({ page: 'fund-disconnect', severity: 'info', title: 'y' })).resolves.toBe(false);
   });
 });
 
@@ -263,7 +263,7 @@ describe('notify() never throws', () => {
     };
     respond(ok());
     await expect(
-      notify({ severity: 'critical', title: 'HARD STOP', dedupe: { key: 'k' } }, hooks),
+      notify({ page: 'fund-disconnect', severity: 'critical', title: 'HARD STOP', dedupe: { key: 'k' } }, hooks),
     ).resolves.toBeUndefined();
     expect(fetchSpy, 'a dedupe failure must never be why you did not hear').toHaveBeenCalledTimes(1);
   });
@@ -274,7 +274,7 @@ describe('notify() never throws', () => {
       release: () => { throw new Error('db locked'); },
     };
     respond(status(500));
-    await expect(notify({ severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks)).resolves.toBeUndefined();
+    await expect(notify({ page: 'fund-disconnect', severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks)).resolves.toBeUndefined();
   });
 });
 
@@ -293,7 +293,7 @@ describe('notify() claim lifecycle', () => {
 
   it("channel:'ops' records the event but sends nothing", async () => {
     const { hooks } = spyHooks();
-    await notify({ severity: 'info', title: 'digest', channel: 'ops', dedupe: { key: 'k' } }, hooks);
+    await notify({ severity: 'info', title: 'digest', dedupe: { key: 'k' } }, hooks);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
@@ -305,27 +305,27 @@ describe('notify() claim lifecycle', () => {
     // every night — which is the exact false alarm it was fixed for once
     // already.
     const { hooks, claimed } = spyHooks();
-    await notify({ severity: 'info', title: 'digest', channel: 'ops',
+    await notify({ severity: 'info', title: 'digest',
                    dedupe: { key: 'digest:2026-09-02' } }, hooks);
     expect(claimed.map((c) => c[0])).toEqual(['digest:2026-09-02']);
   });
 
   it("channel:'ops' respects a suppressed claim", async () => {
     const { hooks } = spyHooks(false);
-    await notify({ severity: 'info', title: 'digest', channel: 'ops', dedupe: { key: 'k' } }, hooks);
+    await notify({ severity: 'info', title: 'digest', dedupe: { key: 'k' } }, hooks);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it('suppressed claim → no POST at all', async () => {
     const { hooks } = spyHooks(false);
-    await notify({ severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
   it('successful send keeps the claim', async () => {
     const { hooks, released } = spyHooks();
     respond(ok());
-    await notify({ severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);
     expect(released).toEqual([]);
   });
 
@@ -333,37 +333,37 @@ describe('notify() claim lifecycle', () => {
   it.each([500, 503, 429, 404])('failed send (%i) RELEASES the claim so it retries', async (s) => {
     const { hooks, released } = spyHooks();
     respond(status(s));
-    await notify({ severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);
     expect(released).toEqual(['k']);
   });
 
   it('transport failure releases the claim', async () => {
     const { hooks, released } = spyHooks();
     respond(new Error('down'));
-    await notify({ severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);
     expect(released).toEqual(['k']);
   });
 
   it('400-then-fallback-ok keeps the claim (it was delivered)', async () => {
     const { hooks, released } = spyHooks();
     respond(status(400), ok());
-    await notify({ severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'info', title: 'x', dedupe: { key: 'k' } }, hooks);
     expect(released).toEqual([]);
   });
 
   it('no hooks → always sends, never dedupes', async () => {
     respond(ok(), ok());
-    await notify({ severity: 'info', title: 'x', dedupe: { key: 'k' } });
-    await notify({ severity: 'info', title: 'x', dedupe: { key: 'k' } });
+    await notify({ page: 'fund-disconnect', severity: 'info', title: 'x', dedupe: { key: 'k' } });
+    await notify({ page: 'fund-disconnect', severity: 'info', title: 'x', dedupe: { key: 'k' } });
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
   it('applies a severity default ttl, and an explicit ttl overrides it', async () => {
     const { hooks, claimed } = spyHooks();
     respond(ok(), ok(), ok());
-    await notify({ severity: 'critical', title: 'a', dedupe: { key: 'k1' } }, hooks);
-    await notify({ severity: 'warn', title: 'b', dedupe: { key: 'k2' } }, hooks);
-    await notify({ severity: 'info', title: 'c', dedupe: { key: 'k3', ttlMs: 999 } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'critical', title: 'a', dedupe: { key: 'k1' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'warn', title: 'b', dedupe: { key: 'k2' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'info', title: 'c', dedupe: { key: 'k3', ttlMs: 999 } }, hooks);
 
     expect(claimed[0][2]).toBe(12 * 60 * 60 * 1000);
     expect(claimed[1][2]).toBe(24 * 60 * 60 * 1000);
@@ -373,8 +373,8 @@ describe('notify() claim lifecycle', () => {
   it('passes the fingerprint through, defaulting to empty', async () => {
     const { hooks, claimed } = spyHooks();
     respond(ok(), ok());
-    await notify({ severity: 'warn', title: 'a', dedupe: { key: 'k', fingerprint: 'stopped' } }, hooks);
-    await notify({ severity: 'warn', title: 'b', dedupe: { key: 'k2' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'warn', title: 'a', dedupe: { key: 'k', fingerprint: 'stopped' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'warn', title: 'b', dedupe: { key: 'k2' } }, hooks);
     expect(claimed[0][1]).toBe('stopped');
     expect(claimed[1][1]).toBe('');
   });
@@ -399,7 +399,7 @@ describe('notify() with the outbox (NOTIFY_OUTBOX)', () => {
   it('is off by default — a failed send still releases, nothing is queued', async () => {
     const { hooks, released, queued } = outboxHooks();
     respond(status(503));
-    await notify({ severity: 'critical', title: 'x', dedupe: { key: 'k' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'critical', title: 'x', dedupe: { key: 'k' } }, hooks);
     expect(released).toEqual(['k']);
     expect(queued).toEqual([]);
   });
@@ -408,7 +408,7 @@ describe('notify() with the outbox (NOTIFY_OUTBOX)', () => {
     process.env.NOTIFY_OUTBOX = '1';
     const { hooks, released, queued } = outboxHooks();
     respond(status(503));
-    await notify({ severity: 'critical', title: 'HARD STOP', dedupe: { key: 'k' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'critical', title: 'HARD STOP', dedupe: { key: 'k' } }, hooks);
     expect(released).toEqual([]);
     expect(queued.map(([k, e]) => [k, e.title])).toEqual([['k', 'HARD STOP']]);
   });
@@ -417,7 +417,7 @@ describe('notify() with the outbox (NOTIFY_OUTBOX)', () => {
     process.env.NOTIFY_OUTBOX = '1';
     const { hooks, queued } = outboxHooks();
     respond(new Error('down'));
-    await notify({ severity: 'warn', title: 'x' }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'warn', title: 'x' }, hooks);
     expect(queued).toHaveLength(1);
     expect(queued[0][0]).toMatch(/^nokey:/);
   });
@@ -426,7 +426,7 @@ describe('notify() with the outbox (NOTIFY_OUTBOX)', () => {
     process.env.NOTIFY_OUTBOX = '1';
     const { hooks, settled, queued } = outboxHooks();
     respond(ok());
-    await notify({ severity: 'warn', title: 'x', dedupe: { key: 'k' } }, hooks);
+    await notify({ page: 'fund-disconnect', severity: 'warn', title: 'x', dedupe: { key: 'k' } }, hooks);
     expect(settled).toEqual(['k']);
     expect(queued).toEqual([]);
   });
@@ -435,14 +435,14 @@ describe('notify() with the outbox (NOTIFY_OUTBOX)', () => {
     process.env.NOTIFY_OUTBOX = '1';
     const { hooks, released } = outboxHooks({ enqueueThrows: true });
     respond(status(500));
-    await expect(notify({ severity: 'critical', title: 'x', dedupe: { key: 'k' } }, hooks)).resolves.toBeUndefined();
+    await expect(notify({ page: 'fund-disconnect', severity: 'critical', title: 'x', dedupe: { key: 'k' } }, hooks)).resolves.toBeUndefined();
     expect(released).toEqual(['k']);
   });
 
   it("on: channel:'ops' events never touch the outbox", async () => {
     process.env.NOTIFY_OUTBOX = '1';
     const { hooks, queued } = outboxHooks();
-    await notify({ severity: 'info', title: 'digest', channel: 'ops', dedupe: { key: 'k' } }, hooks);
+    await notify({ severity: 'info', title: 'digest', dedupe: { key: 'k' } }, hooks);
     expect(queued).toEqual([]);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
@@ -451,7 +451,7 @@ describe('notify() with the outbox (NOTIFY_OUTBOX)', () => {
     process.env.NOTIFY_OUTBOX = '1';
     const released: string[] = [];
     respond(status(503));
-    await notify({ severity: 'warn', title: 'x', dedupe: { key: 'k' } },
+    await notify({ page: 'fund-disconnect', severity: 'warn', title: 'x', dedupe: { key: 'k' } },
       { claim: () => true, release: (k) => { released.push(k); } });
     expect(released).toEqual(['k']);
   });

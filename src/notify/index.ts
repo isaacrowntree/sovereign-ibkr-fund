@@ -20,8 +20,10 @@
 import { log, logError } from '../log.js';
 import { renderText, renderSlackPayload, type NotifyEvent, type RenderMeta } from './blocks.js';
 import { feed } from './feed.js';
+import { mayPage, type PageCategory } from './policy.js';
 
 export type { NotifyEvent, NotifyField, RenderMeta, Severity } from './blocks.js';
+export { PAGE_CATEGORIES, mayPage, type PageCategory } from './policy.js';
 
 const AGENT = 'Alert';
 const TIMEOUT_MS = 10_000;
@@ -178,9 +180,21 @@ export function getNotifier(): Notifier {
   return process.env.IBKR_FUND_ALERT_WEBHOOK ? webhookNotifier : noopNotifier;
 }
 
-/** Best-effort alert via the active notifier. Never throws. */
-export function alert(text: string): Promise<void> {
-  return getNotifier().alert(text);
+/**
+ * Best-effort plain-text alert. Never throws.
+ *
+ * Under the paging policy (./policy.ts) a bare string is feed-only: it is
+ * recorded on the ops feed as a `warn` and posted to Slack only when the caller
+ * names an allowed category.
+ */
+export async function alert(text: string, page?: PageCategory): Promise<void> {
+  try {
+    feed({ severity: 'warn', title: text, agent: 'fund' });
+    if (!mayPage(page)) return;
+    await getNotifier().alert(text);
+  } catch (err) {
+    logError('alert failed', err, AGENT);
+  }
 }
 
 /**
@@ -265,14 +279,15 @@ export async function notify(event: NotifyEvent, hooks?: DedupeHooks): Promise<v
     }
 
     // The ops feed is the record; Slack is an interruption layer on top of it,
-    // and `channel: 'ops'` means record-only. Both sit BELOW the dedupe claim
+    // and only an event carrying an allowed `page` category reaches it (see
+    // ./policy.ts — the 2026-09-24 allowlist). Both sit BELOW the dedupe claim
     // rather than above it, which matters more than it looks: the daily
     // digest's claim row (`digest:<date>`) is what the nightly backup reads to
     // prove the digest agent ran at all. Short-circuiting before the claim
     // would have left that row unwritten and the backup crying wolf every
     // night — the exact false alarm it was fixed for in the first place.
     feed(event);
-    if (event.channel === 'ops') return;
+    if (!mayPage(event.page)) return;
 
     const delivered = await getNotifier().notify(event);
     const outbox = outboxEnabled() && hooks?.enqueue ? hooks : null;

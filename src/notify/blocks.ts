@@ -23,6 +23,8 @@
  * was rendering.
  */
 
+import type { PageCategory } from './policy.js';
+
 export type Severity = 'info' | 'warn' | 'critical' | 'recovery';
 
 export interface NotifyField {
@@ -43,19 +45,18 @@ export interface NotifyEvent {
   /** Dedupe policy. Omit to always send. */
   dedupe?: { key: string; fingerprint?: string; ttlMs?: number };
   /**
-   * Where this event is allowed to interrupt.
+   * Whether this event may ALSO page Slack, and under which allowed category.
    *
-   * Every event is recorded on the ops feed and shows up at pi.lan/ops. This
-   * says whether it ALSO buzzes a phone. Default 'slack' — the events that
-   * predate this field are fills, hard stops and reconcile breaks, and those
-   * are exactly what a notification is for. Set 'ops' for the ones that are
-   * only ever read after the fact: the daily digest is state, not news, and it
-   * is already on the page in a form a chat message cannot match.
+   * Every event is recorded on the ops feed and shows up at the ops page. Slack
+   * is an allowlist (see ./policy.ts, set 2026-09-24): an event pages only when
+   * it names one of those categories. Omitted — the default for everything —
+   * means feed-only. That default is deliberate: a new call site cannot start
+   * buzzing a phone by forgetting a field.
    *
    * Rendering ignores this entirely; it is a routing decision, and blocks.ts
    * stays pure.
    */
-  channel?: 'slack' | 'ops';
+  page?: PageCategory;
 }
 
 export interface RenderMeta {

@@ -14,7 +14,9 @@ import { log } from './log.js';
  *
  * getNotifier() falls back to noop whenever IBKR_FUND_ALERT_WEBHOOK is absent,
  * so a typo in the variable NAME degrades this fund to /dev/null without a
- * single error — you'd find out when a hard stop didn't reach you.
+ * single error — you'd find out when a disconnection page didn't reach you.
+ * (Since the 2026-09-24 paging policy, notify/policy.ts, that is the only
+ * kind of message the agents send to Slack; everything else is on the feed.)
  *
  * It used to run only in the daemon (src/index.ts), which production never
  * starts: every agent there is a `--once` process, so the check guarded nothing.
@@ -28,8 +30,8 @@ export function assertNotifierConfigured(env: NodeJS.ProcessEnv = process.env): 
   const explicitNoop = (env.NOTIFIER || '').toLowerCase() === 'noop';
   if (live && !explicitNoop && getNotifier() === noopNotifier) {
     throw new Error(
-      'TRADING_MODE=live but no notifier is configured — every alert, including the ' +
-        'drawdown hard stop, would be silently dropped. Set IBKR_FUND_ALERT_WEBHOOK, ' +
+      'TRADING_MODE=live but no notifier is configured — a fund-disconnection page (the ' +
+        'one thing the fund still sends to Slack) would be silently dropped. Set IBKR_FUND_ALERT_WEBHOOK, ' +
         'or set NOTIFIER=noop to silence alerts deliberately.',
     );
   }

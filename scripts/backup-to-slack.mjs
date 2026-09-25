@@ -7,6 +7,10 @@
  * uploads it to the Slack channel via the files API. Scheduled by a host
  * systemd timer that invokes it with `docker exec`.
  *
+ * Slack category: db-upload — one of the three the 2026-09-24 paging policy
+ * allows (src/notify/policy.ts). The digest line below rides on the upload
+ * message; it is not a separate post.
+ *
  * Env:
  *   IBKR_FUND_SLACK_BOT_TOKEN        xoxb- token with files:write
  *   IBKR_FUND_BACKUP_SLACK_CHANNEL   channel id (C0...)

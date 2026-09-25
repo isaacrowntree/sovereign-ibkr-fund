@@ -33,7 +33,7 @@ Nine single-purpose agents, each a plain `--once` process (no LLM calls — dete
 | Hedger | Options overlay (covered calls / protective puts) | daily |
 | Research Scout | Price monitoring, significant-move detection | daily |
 | Observer | WS fill/event stream ingestion, stream-health alerts | 5m |
-| Daily Summary | Post-close digest to Slack (NAV, fills, drift, movers, advisories) | daily (21:30 UTC) |
+| Daily Summary | Post-close digest to the ops feed (NAV, fills, drift, movers, advisories) | daily (21:30 UTC) |
 
 Includes a backtest engine (HRP, risk-parity, Black-Litterman, Ledoit-Wolf covariance, regime overlay, vol targeting) validated against historical data you fetch yourself.
 
@@ -67,16 +67,15 @@ The agents are just `node dist/agents/<name>.js --once`. Anything can schedule t
 
 ## Alerting
 
-One Slack incoming webhook, one channel (`IBKR_FUND_ALERT_WEBHOOK`). Severity is carried by colour and emoji rather than by routing, so a hard stop is distinguishable from a fill while scrolling.
+Every event is recorded on the ops feed (`ops-feed.jsonl`, rendered by the host's ops page). Slack (`IBKR_FUND_ALERT_WEBHOOK`) is an **allowlist** — since 2026-09-24 only three categories may page, and an event names its category explicitly (`NotifyEvent.page`; the default is feed-only). The list lives in [`src/notify/policy.ts`](src/notify/policy.ts):
 
-**Real-time** — reserved for things needing a human:
-
-| | |
+| Category | What pages |
 |---|---|
-| 🚨 critical | Hard stop; execution blocked on a drawdown stop; **ledger diverged from IBKR after a real fill** |
-| ⚠️ warn | Drawdown warning (7%) and de-risking (15%); run halted early; validation trade failed; fill recovered after the stream misreported it; suspect NAV/prices; NAV-history reset; event stream disconnected |
-| ✅ recovery | Drawdown back to normal — the gate lifting, which self-clears |
-| ℹ️ info | One coalesced summary per execution run |
+| `fund-disconnect` | The IBKR session is lost and relogin is parked or failed; a login needs an IB Key tap or a challenge code; the gateway is dead and its restart failed; the event stream is DISCONNECTED. Plus one "restored" message for an outage that paged. |
+| `db-upload` | The nightly ledger backup (`scripts/backup-to-slack.mjs`). |
+| `ip-disconnect` | Not used by the fund (a sibling bot's exchange IP whitelist). |
+
+Everything else — hard stops, drawdown and drift warnings, fills and order summaries, reconcile breaks, a stale digest, agent health — is feed-only, at its own severity (🚨 critical, ⚠️ warn, ✅ recovery, ℹ️ info).
 
 **Daily digest** (`deploy/digest/`, 21:30 UTC — after the US close in both EST and EDT) carries everything advisory: NAV, cash, drawdown, VaR, the day's fills with realised P&L, worst drift, movers, harvest candidates, hedge suggestions.
 

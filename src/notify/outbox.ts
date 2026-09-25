@@ -24,6 +24,7 @@
  */
 import { log, logError } from '../log.js';
 import { feed } from './feed.js';
+import { mayPage } from './policy.js';
 import { getNotifier, outboxEnabled, type NotifyEvent } from './index.js';
 import type { OutboxRow } from '../state/store.js';
 
@@ -91,6 +92,15 @@ export async function drainOutbox(store: OutboxStore, opts: DrainOptions = {}): 
         store.remove(row.key, row.createdAt);
         result.dropped++;
         logError(`outbox row ${row.key} is unreadable — dropped`, '', AGENT);
+        continue;
+      }
+
+      // Queued before the 2026-09-24 paging policy, or by a caller that has
+      // since been demoted: the feed already has it (notify() writes the feed
+      // before it queues), so there is nothing left to deliver.
+      if (!mayPage(event.page)) {
+        store.remove(row.key, row.createdAt);
+        result.dropped++;
         continue;
       }
 
