@@ -87,13 +87,20 @@ the only surface these units could reach, and the result was about nine
 messages a day of which roughly none could be acted on at the hour they
 arrived. A channel you have learned to scroll past is not monitoring.
 
-So Slack keeps exactly what a page cannot do — carry the backup archive off the
-Pi, and buzz a phone when a login needs a thumb inside two minutes — and
-everything else appends to `ops-feed.jsonl`, which the hub renders at
-`pi.lan/ops`. `lib/ops-feed.ts` is the writer and documents the line format;
-`src/notify/feed.ts` is the same contract for the agents, wired into `notify()`
-so **every** structured event is recorded whether or not it also reaches Slack.
-`NotifyEvent.channel: 'ops'` is what says "record it, don't interrupt".
+Since 2026-09-24 Slack is an explicit allowlist of three categories — IP
+disconnection (the sibling crypto bot), **IBKR fund disconnection** and the
+**database upload** (the nightly backup) — and everything else appends to
+`ops-feed.jsonl`, which the hub renders at `pi.lan/ops`. The list lives in
+`src/notify/policy.ts` (agents) and `lib/slack-policy.mjs` (these daemons); a
+test keeps them equal. `lib/ops-feed.ts` is the writer and documents the line
+format; `src/notify/feed.ts` is the same contract for the agents, wired into
+`notify()` so **every** structured event is recorded whether or not it also
+reaches Slack. An event reaches Slack only when it names an allowed
+`NotifyEvent.page` category; the default is feed-only. A recovery pages only
+as the other half of an outage that paged (`lib/paged-outage.ts`).
+
+The feed keeps 30 days: a daily retention timer on the host (in the Pi's own
+repo) drops older lines. The writers' byte cap is an 8 MB safety net only.
 
 The feed and its status files live in `/fund-state/state` inside the container,
 which is `/var/lib/sovereign-fund/state` on the host — the one directory both

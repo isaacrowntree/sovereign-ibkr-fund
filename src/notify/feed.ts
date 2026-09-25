@@ -31,8 +31,16 @@ import type { NotifyEvent } from './blocks.js';
 const EXPLICIT_DIR = process.env.PI_OPS_DIR;
 const DIR = EXPLICIT_DIR ?? '/fund-state/state';
 const FILE = path.join(DIR, 'ops-feed.jsonl');
-const MAX_BYTES = 256 * 1024;
-const TRIM_KEEP = 400;
+/**
+ * A SAFETY cap, not the retention policy. History is kept for 30 days by the
+ * host's daily ops-feed retention job (the pi repo's `ops-feed-retention`
+ * timer); this only stops a runaway writer filling the disk if that job is not
+ * running. At ~250 bytes a line, 8 MB is ~30k events — months at the normal
+ * rate — so it never cuts the 30 days short. Past it, the newest half is kept.
+ * (Was 256 KB / 400 lines, which on a busy week held only a few days.)
+ */
+const MAX_BYTES = 8 * 1024 * 1024;
+const TRIM_KEEP_BYTES = MAX_BYTES / 2;
 
 /** Append one event to the ops feed. Never throws. */
 export function feed(event: NotifyEvent): void {
@@ -67,9 +75,17 @@ function trim(): void {
     if (fs.statSync(FILE).size <= MAX_BYTES) return;
     const lines = fs.readFileSync(FILE, 'utf8').split('\n').filter(Boolean);
     const tmp = `${FILE}.tmp`;
-    fs.writeFileSync(tmp, lines.slice(-TRIM_KEEP).join('\n') + '\n');
+    fs.writeFileSync(tmp, newestWithin(lines, TRIM_KEEP_BYTES).join('\n') + '\n');
     fs.renameSync(tmp, FILE);
   } catch {
     /* a feed that cannot be trimmed is still a feed */
   }
+}
+
+/** The newest lines whose total size fits in `budget` bytes. */
+function newestWithin(lines: string[], budget: number): string[] {
+  let used = 0;
+  let i = lines.length;
+  while (i > 0 && used + Buffer.byteLength(lines[i - 1]) + 1 <= budget) used += Buffer.byteLength(lines[--i]) + 1;
+  return lines.slice(i);
 }

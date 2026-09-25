@@ -7,8 +7,8 @@
  * you could consult. That page is `pi.lan/ops`, and this is how the unattended
  * half of the Pi talks to it.
  *
- * Slack keeps exactly two jobs now: the nightly backup (it carries the archive,
- * which is the off-Pi copy) and the pushes that need a thumb inside two minutes.
+ * Slack keeps exactly three jobs now (the 2026-09-24 policy, ./slack-policy.mjs):
+ * IP disconnection, IBKR fund disconnection, and the nightly database upload.
  * Everything else appends here.
  *
  * One JSON object per line, append-only:
@@ -48,9 +48,16 @@ export type Severity = 'critical' | 'warn' | 'recovery' | 'info';
 const DIR = process.env.PI_OPS_DIR ?? '/var/lib/sovereign-fund/state';
 const FILE = path.join(DIR, 'ops-feed.jsonl');
 
-/** Trim when the file passes this, keeping the newest TRIM_KEEP lines. */
-const MAX_BYTES = 256 * 1024;
-const TRIM_KEEP = 400;
+/**
+ * A SAFETY cap, not the retention policy. History is kept for 30 days by the
+ * host's daily ops-feed retention job (the pi repo's `ops-feed-retention`
+ * timer); this only stops a runaway writer filling the disk if that job is not
+ * running. At ~250 bytes a line, 8 MB is ~30k events — months at the normal
+ * rate — so it never cuts the 30 days short. Past it, the newest half is kept.
+ * (Was 256 KB / 400 lines, which on a busy week held only a few days.)
+ */
+const MAX_BYTES = 8 * 1024 * 1024;
+const TRIM_KEEP_BYTES = MAX_BYTES / 2;
 
 export interface FeedEvent {
   source: string;
@@ -80,9 +87,17 @@ function trim(): void {
     // Rename into place so a reader never sees a half-written file — the
     // truncate-then-write it replaces had a window where the feed was empty.
     const tmp = `${FILE}.tmp`;
-    fs.writeFileSync(tmp, lines.slice(-TRIM_KEEP).join('\n') + '\n');
+    fs.writeFileSync(tmp, newestWithin(lines, TRIM_KEEP_BYTES).join('\n') + '\n');
     fs.renameSync(tmp, FILE);
   } catch {
     /* a feed that cannot be trimmed is still a feed */
   }
+}
+
+/** The newest lines whose total size fits in `budget` bytes. */
+function newestWithin(lines: string[], budget: number): string[] {
+  let used = 0;
+  let i = lines.length;
+  while (i > 0 && used + Buffer.byteLength(lines[i - 1]) + 1 <= budget) used += Buffer.byteLength(lines[--i]) + 1;
+  return lines.slice(i);
 }
