@@ -1,2 +1,3 @@
 allowBuilds:
   bezant-client: true
+minimumReleaseAge: 1440
