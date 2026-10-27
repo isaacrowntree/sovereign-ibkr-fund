@@ -52,7 +52,12 @@ done
 for f in "$TMP"/installed/*; do
   [ -f "$f" ] || continue
   name="$(basename "$f")"
-  [ -f "$TMP/repo/$name" ] || { echo "[units] NOT IN REPO: $name"; changed=1; }
+  [ -f "$TMP/repo/$name" ] && continue
+  # A host can own fund-adjacent units from its own config repo. It says so with
+  # X-Managed-By= in [Unit] (systemd ignores X- keys), and they are not drift.
+  owner="$(sed -nE 's/^X-Managed-By=(.+)$/\1/p' "$f" | head -1)"
+  if [ -n "$owner" ]; then echo "[units] managed by $owner: $name"; continue; fi
+  echo "[units] NOT IN REPO: $name"; changed=1
 done
 [ "$changed" = 0 ] && echo "[units] installed units match the repo"
 echo "[units] (report only — install with cp + systemctl --user daemon-reload; see deploy/README.md)"

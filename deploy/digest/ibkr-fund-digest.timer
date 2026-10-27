@@ -2,7 +2,7 @@
 Description=Daily IBKR fund summary to Slack (after the US close)
 
 [Timer]
-# Anchored in UTC, deliberately — NOT host-local like the backup timer.
+# Anchored in UTC, deliberately — NOT host-local.
 #
 # The US close (16:00 ET) is 20:00 UTC on EDT and 21:00 UTC on EST, so 21:30 UTC
 # is after the close in both halves of the year. Expressing it in UTC makes this
@@ -10,8 +10,6 @@ Description=Daily IBKR fund summary to Slack (after the US close)
 #
 # Host-local would be wrong here: the Pi runs AEST, where 22:00 local is ~08:00
 # ET — pre-market — so a local-time digest would summarise the PREVIOUS session.
-# (The backup timer's "22:00 local (after US market close)" comment has the same
-# problem; it matters less for a backup than for a summary.)
 #
 # Mon..Fri: no US session at the weekend, and the digest's date-keyed dedupe
 # means a weekend run would just post an empty summary.

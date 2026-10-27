@@ -81,7 +81,7 @@ Everything else — hard stops, drawdown and drift warnings, fills and order sum
 
 Alerts are deduped in SQLite (`notify_dedupe`), so a stuck condition re-nags on a schedule rather than repeating every run, and transitions (warning → de-risking → stopped → normal) each alert once. Delivery failures release the claim so the alert retries rather than being lost.
 
-The daily backup (`deploy/backup/`) reports whether the digest was sent. It authenticates with a **different** credential (a bot token), so it still lands if the webhook is revoked — a backup saying "NO DIGEST" means the alert path is dead.
+The daily backup (`scripts/backup-to-slack.mjs`, run from the host's backup job) reports whether the digest was sent. It authenticates with a **different** credential (a bot token), so it still lands if the webhook is revoked — a backup saying "NO DIGEST" means the alert path is dead.
 
 ## Your own portfolio
 

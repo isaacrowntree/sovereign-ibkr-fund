@@ -7,12 +7,11 @@ harvest candidates and hedge suggestions.
 Reads `bot-state.db` only — no IBKR connection, no recomputation — so it works
 even when the gateway is down, and it can't perturb trading.
 
-## Why UTC, and why not 22:00 like the backup
+## Why UTC, not host-local time
 
 `OnCalendar` follows the **system** clock. The Pi runs AEST, where 22:00 local
 is ~08:00 ET — *pre*-market. A local-time digest would summarise the *previous*
-session. (`deploy/backup/ibkr-fund-backup.timer` has the same issue; it matters
-less for a backup than for a summary.)
+session.
 
 The US close (16:00 ET) is 20:00 UTC on EDT and 21:00 UTC on EST, so **21:30
 UTC** is after the close in both halves of the year, regardless of either
@@ -49,15 +48,14 @@ journalctl --user -u ibkr-fund-digest -f
 
 ## Notes
 
-- **`ExecStart` hardcodes the paperclip project path**, mirroring
-  `deploy/backup/`. It must match the fund's working directory — that's what
-  makes both read the same `bot-state.db`. If you move the project, update both
-  units.
+- **`ExecStart` hardcodes the paperclip project path.** It must match the fund's
+  working directory, so the digest reads the same `bot-state.db` as the agents.
+  If you move the project, update the unit.
 - **Safe to run twice.** The digest claims `digest:<trading-date>` with no
   expiry, so a second run the same day is a no-op rather than a duplicate post.
   That's also why `Persistent=true` is safe: a missed run fires on next boot and
   either posts the day's summary or does nothing.
-- **The backup reports whether this ran.** `deploy/backup/` authenticates with a
+- **The backup reports whether this ran.** `scripts/backup-to-slack.mjs` authenticates with a
   bot token, not the webhook, so it still lands if the webhook is revoked — a
   backup saying `⚠️ NO DIGEST` means the alert path is dead. That's the only
   liveness check on the webhook, since the fund, watchdog and relogin all share

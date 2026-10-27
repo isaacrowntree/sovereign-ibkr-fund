@@ -10,7 +10,7 @@ your own host.
 | `ibkr-fund-relogin` | re-authenticates the IBKR session (Playwright) | ~5 min |
 | `ibkr-fund-observer` | polls the bezant event stream; the only writer of `state.observedEvents` | ~5 min |
 | `ibkr-fund-digest` | daily summary to the ops feed | Mon–Fri |
-| `ibkr-fund-backup` | uploads the SQLite ledger to Slack | daily |
+| *(no unit)* `scripts/backup-to-slack.mjs` | uploads the SQLite ledger to Slack. Schedule it from the host's own backup job; no unit ships here | daily |
 | `ibkr-fund-agent-health` | reports failing **or silent** agents to the ops feed; pushes when the fund isn't trading | hourly |
 | `ibkr-fund-reconciler` | checks IBKR's positions against the model and the ledger | 07:15 / 19:15 |
 | `ibkr-fund-db-retention` | redacts old run blobs in paperclip's DB | weekly |
