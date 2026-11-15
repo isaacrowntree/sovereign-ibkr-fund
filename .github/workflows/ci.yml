@@ -18,7 +18,7 @@ jobs:
       # this repo was created died here, before a single test executed.
       - uses: pnpm/action-setup@v4
         with:
-          version: 9 # lockfileVersion 9.0
+          version: 10 # lockfileVersion 9.0; 9 rejects a settings-only pnpm-workspace.yaml
 
       # Node 22, not 20: store.ts imports `node:sqlite`, which does not exist in
       # Node 20. Under the old pin every store test failed with
