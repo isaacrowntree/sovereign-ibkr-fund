@@ -30,7 +30,7 @@
     "fetch-data": "tsx src/validation/fetch-data.ts"
   },
   "dependencies": {
-    "@stoqey/ib": "^1.6.13",
+    "@stoqey/ib": "^1.6.15",
     "dotenv": "^16.6.1"
   },
   "devDependencies": {
@@ -38,6 +38,6 @@
     "bezant-client": "github:isaacrowntree/bezant#path:/clients/typescript",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.5"
+    "vitest": "^5.1.0"
   }
 }
