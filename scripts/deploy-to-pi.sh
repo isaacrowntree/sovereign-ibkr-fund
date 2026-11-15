@@ -161,7 +161,7 @@ ssh "$HOST" "cd '$REMOTE' && \
      echo '[deploy] FAIL: runtime deps missing on the host (no node_modules/dotenv).'; \
      echo '[deploy] node_modules is never rsynced, so a fresh clone has none.'; \
      echo '[deploy] Fix on the host, in the container, from the repo root:'; \
-     echo '[deploy]   pnpm install --prod --frozen-lockfile'; \
+     echo '[deploy]   npx -y pnpm@latest install --prod --frozen-lockfile'; \
      echo '[deploy] (--prod skips the bezant-client git dep, which cannot build there.)'; \
      exit 1; }; \
   test -f src/portfolios/local.ts || { \

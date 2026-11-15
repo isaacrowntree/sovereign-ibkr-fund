@@ -17,8 +17,8 @@ jobs:
       # bezant-client dep (pnpm syntax) until npm 11.13 — so every CI run since
       # this repo was created died here, before a single test executed.
       - uses: pnpm/action-setup@v4
-        # No `version:` — the action reads `packageManager` from package.json,
-        # so CI, the laptop and the Pi (corepack) all run the same pnpm.
+        with:
+          version: latest # nothing pins pnpm; fix forward if a release breaks the install
 
       # Node 22, not 20: store.ts imports `node:sqlite`, which does not exist in
       # Node 20. Under the old pin every store test failed with
@@ -26,7 +26,7 @@ jobs:
       # Matches the Dockerfile (node:22-bookworm-slim / nodesource setup_22.x).
       - uses: actions/setup-node@v4
         with:
-          node-version: '24'
+          node-version: lts/*
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
