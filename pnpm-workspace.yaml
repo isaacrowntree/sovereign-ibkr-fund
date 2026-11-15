@@ -1,3 +1,8 @@
 allowBuilds:
-  bezant-client: true
+  # pnpm 11+ only lets a git-hosted package run its build (`prepare`) when
+  # allowBuilds names its full resolved spec; no wildcard is accepted. When
+  # bezant-client moves to a new commit, pnpm fails with the new key to paste
+  # here (or run `pnpm approve-builds`).
+  "bezant-client@https://codeload.github.com/isaacrowntree/bezant/tar.gz/7a9827d3ea18b6e3385e8aa0216d21268474f273#path:/clients/typescript": true
+  esbuild: true # tsx's
 minimumReleaseAge: 1440

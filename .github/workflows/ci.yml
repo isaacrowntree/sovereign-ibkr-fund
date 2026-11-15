@@ -17,8 +17,8 @@ jobs:
       # bezant-client dep (pnpm syntax) until npm 11.13 — so every CI run since
       # this repo was created died here, before a single test executed.
       - uses: pnpm/action-setup@v4
-        with:
-          version: 10.33.0 # = the laptop. 9 rejects a settings-only pnpm-workspace.yaml; >=10.34 and 11 want a different allowBuilds key for the git-hosted bezant-client
+        # No `version:` — the action reads `packageManager` from package.json,
+        # so CI, the laptop and the Pi (corepack) all run the same pnpm.
 
       # Node 22, not 20: store.ts imports `node:sqlite`, which does not exist in
       # Node 20. Under the old pin every store test failed with

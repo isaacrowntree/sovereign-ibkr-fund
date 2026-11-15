@@ -40,7 +40,7 @@ Includes a backtest engine (HRP, risk-parity, Black-Litterman, Ledoit-Wolf covar
 ## Requirements
 
 - Node 22.13+ (state is SQLite via the built-in `node:sqlite`, which doesn't exist before 22.5 and is unflagged from 22.13)
-- [pnpm](https://pnpm.io) 9+ (`corepack enable pnpm`) — `pnpm-lock.yaml` is the committed lockfile
+- [pnpm](https://pnpm.io) 12 (`corepack enable pnpm` picks the exact version from `packageManager`) — `pnpm-lock.yaml` is the committed lockfile
 - A running [bezant](https://github.com/isaacrowntree/bezant) gateway (default `http://localhost:8080`)
 - An Interactive Brokers account (**start on paper**)
 

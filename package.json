@@ -1,6 +1,7 @@
 {
   "name": "sovereign-ibkr-fund",
   "version": "0.1.0",
+  "packageManager": "pnpm@12.21.0",
   "description": "Sovereign — an autonomous, multi-agent IBKR fund. A companion to bezant.",
   "license": "(Apache-2.0 OR MIT)",
   "private": true,
